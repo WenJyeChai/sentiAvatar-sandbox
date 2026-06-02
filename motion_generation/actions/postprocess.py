@@ -465,7 +465,34 @@ class MotionPostprocesser:
         self.anim.positions = current_pos
         
         # 写入文件
-        BVH.save(save_path, self.anim, names=self.anim.names, frametime=1/20, order='zyx', quater=True)
+        bvh_fps = 30.0
+        bvh_duration = num_frames / bvh_fps
+        print(
+            f"  [BVH timing] frames={num_frames}, fps={bvh_fps:.1f}, "
+            f"duration={bvh_duration:.3f}s, frametime={1 / bvh_fps:.6f}"
+        )
+        print(
+            f"  [BVH timing check] duration_if_20fps={num_frames / 20.0:.3f}s, "
+            f"duration_if_25fps={num_frames / 25.0:.3f}s, "
+            f"duration_if_30fps={num_frames / 30.0:.3f}s"
+        )
+        BVH.save(save_path, self.anim, names=self.anim.names, frametime=1 / bvh_fps, order='zyx', quater=True)
+        try:
+            with open(save_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith("Frames:") or stripped.startswith("Frame Time:"):
+                        print(f"  [BVH header] {stripped}")
+                    if stripped.startswith("Frame Time:"):
+                        header_frametime = float(stripped.split(":", 1)[1].strip())
+                        header_fps = 1.0 / header_frametime if header_frametime > 0 else 0.0
+                        print(
+                            f"  [BVH header] fps={header_fps:.3f}, "
+                            f"duration={num_frames * header_frametime:.3f}s"
+                        )
+                        break
+        except Exception as exc:
+            print(f"  [BVH header] failed to read saved timing: {exc}")
         return self.anim
     
     def convert_quat_motion_to_ue(
