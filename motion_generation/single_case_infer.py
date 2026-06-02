@@ -221,6 +221,10 @@ def main():
     parser.add_argument("--generate_steps", type=int, default=6,
                         help="Mask Transformer 生成步数")
     
+    parser.add_argument("--infill_mode", type=str, default="parallel",
+                        choices=["parallel", "ar_frame"],
+                        help="Infill schedule: parallel keeps the original path; ar_frame predicts one full middle frame per forward pass")
+
     args = parser.parse_args()
     
     # ---- 默认路径 ----
@@ -275,6 +279,7 @@ def main():
         temperature=args.temperature,
         top_p=args.top_p,
         generate_steps=args.generate_steps,
+        infill_mode=args.infill_mode,
     )
     
     if result is None:

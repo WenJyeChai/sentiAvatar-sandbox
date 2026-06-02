@@ -25,3 +25,6 @@ Thumbs.db
 
 # Hydra outputs
 outputs/
+
+SuSuInterActs/
+checkpoints/

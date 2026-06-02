@@ -50,6 +50,7 @@ import random
 # 确保能导入本地模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models.audio_motion_model import AudioMotionTransformer, AudioMotionConfig
+from ar_infill import interpolate_sequence_ar_framewise
 
 
 # ======================================================================
@@ -500,6 +501,7 @@ def run_pipeline_single(
     temperature=0.5,
     top_p=0.4,
     generate_steps=6,
+    infill_mode="parallel",
     template="Human: {prompt}<|im_end|>\nAssistant:",
 ):
     """
@@ -566,10 +568,26 @@ def run_pipeline_single(
         f"关键帧: {num_keyframes}, audio 特征: {audio_features.shape}"
     )
 
+    print(f"  [Infill mode] {infill_mode}")
+
     t2 = time.time()
-    dense_tokens = interpolate_sequence(
-        mask_model, keyframes, audio_features, generate_steps=generate_steps
-    )
+    if infill_mode == "parallel":
+        dense_tokens = interpolate_sequence(
+            mask_model, keyframes, audio_features, generate_steps=generate_steps
+        )
+    elif infill_mode == "ar_frame":
+        def log_ar_frame(frame_idx, frame_tokens, status):
+            print(f"    [AR frame] frame {frame_idx:04d} {status}: {frame_tokens}")
+
+        dense_tokens = interpolate_sequence_ar_framewise(
+            mask_model,
+            keyframes,
+            audio_features,
+            generate_steps=generate_steps,
+            on_frame=log_ar_frame,
+        )
+    else:
+        raise ValueError(f"Unsupported infill_mode: {infill_mode}")
     t3 = time.time()
 
     # ---- Step 5: 长度对齐 —— 确保 motion tokens 与音频帧数严格一致 ----
@@ -601,6 +619,7 @@ def run_pipeline_single(
         "num_keyframes": num_keyframes,
         "num_dense_frames": len(dense_tokens),
         "num_audio_frames": target_length,
+        "infill_mode": infill_mode,
         "length_adjusted": raw_length != target_length,
         "length_adjustment": target_length - raw_length,
         "llm_raw_output": llm_result.get("raw_output", ""),
@@ -679,6 +698,7 @@ def demo_mode(args, vllm_client, mask_model, name_to_action,
         temperature=args.temperature,
         top_p=args.top_p,
         generate_steps=args.generate_steps,
+        infill_mode=args.infill_mode,
     )
 
     if result is None:
@@ -761,6 +781,7 @@ def batch_mode(args, vllm_client, mask_model, name_to_action,
             temperature=args.temperature,
             top_p=args.top_p,
             generate_steps=args.generate_steps,
+            infill_mode=args.infill_mode,
         )
 
         if result is not None:
@@ -831,6 +852,9 @@ def main():
                         help="Mask Transformer 生成步数 (默认: 6)")
 
     # 数据路径
+    parser.add_argument("--infill_mode", type=str, default="parallel",
+                        choices=["parallel", "ar_frame"],
+                        help="Infill schedule: parallel keeps the original path; ar_frame predicts one full middle frame per forward pass")
     parser.add_argument("--motion_token_dir", type=str, default=None,
                         help="motion token JSON 文件目录")
     parser.add_argument("--audio_token_dir", type=str, default=None,

@@ -200,7 +200,7 @@ class AudioMotionTransformer(PreTrainedModel):
 
         return token_embeddings + audio_emb
 
-    def forward(self, input_ids, labels=None, audio_features=None):
+    def forward(self, input_ids, labels=None, audio_features=None, attention_mask=None):
         """
         Args:
             input_ids: (batch_size, seq_len) - Motion token IDs (with offset)
@@ -224,7 +224,7 @@ class AudioMotionTransformer(PreTrainedModel):
 
         # Normalize and encode
         x = self.norm(x)
-        output = self.encoder(x)  # (B, seq_len, hidden_size)
+        output = self.encoder(x, mask=attention_mask)  # (B, seq_len, hidden_size)
 
         # Get logits
         logits = self.out_head(output)  # (B, seq_len, vocab_size)
@@ -247,7 +247,7 @@ class AudioMotionTransformer(PreTrainedModel):
 
         return loss, preds, acc
 
-    def generate_sbs(self, input_ids, audio_features, generate_steps=1):
+    def generate_sbs(self, input_ids, audio_features, generate_steps=1, attention_mask=None):
         """
         Step-by-step generation: 逐步填充mask token。
         按照预测概率从高到低依次填充。
@@ -289,7 +289,11 @@ class AudioMotionTransformer(PreTrainedModel):
         masks_per_step = max(1, total_masks // generate_steps)
 
         for step in range(generate_steps):
-            logits = self.forward(step_out, audio_features=audio_features)
+            logits = self.forward(
+                step_out,
+                audio_features=audio_features,
+                attention_mask=attention_mask,
+            )
             # logits: (B, seq_len, vocab_size)
             preds_probs, preds_index = logits.max(dim=-1)
 
