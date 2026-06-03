@@ -7,9 +7,20 @@
 # ============================================================
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-MODEL_PATH=${1:-"$PROJECT_DIR/checkpoints/llm"}
+MODEL_PATH_INPUT=${1:-"$PROJECT_DIR/checkpoints/llm"}
 PORT=${2:-8095}
 GPU_ID=${3:-0}
+
+if [[ "$MODEL_PATH_INPUT" = /* ]]; then
+    MODEL_PATH="$MODEL_PATH_INPUT"
+else
+    MODEL_PATH="$(realpath -m "$PWD/$MODEL_PATH_INPUT")"
+fi
+
+if [ ! -d "$MODEL_PATH" ]; then
+    echo "Error: model path does not exist: $MODEL_PATH" >&2
+    exit 1
+fi
 
 echo "============================================"
 echo "  启动 vLLM 服务"
@@ -25,4 +36,4 @@ cd "$PROJECT_DIR/motion_generation"
 
 python -u vllm_server.py \
     --port ${PORT} \
-    --model_path ${MODEL_PATH}
+    --model_path "${MODEL_PATH}"
