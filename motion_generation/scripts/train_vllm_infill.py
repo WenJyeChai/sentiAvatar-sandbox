@@ -55,6 +55,14 @@ from models.vllm_infill_model import (  # noqa: E402
 )
 
 
+def format_fps_for_dir(fps: float) -> str:
+    """Match preprocess_data.py folder names such as fps10 or fps50."""
+
+    if float(fps).is_integer():
+        return str(int(fps))
+    return str(fps).replace(".", "p")
+
+
 def read_split_file(path: Optional[str]) -> Optional[List[str]]:
     """Read a split file containing one sample name per line."""
 
@@ -68,12 +76,12 @@ def read_split_file(path: Optional[str]) -> Optional[List[str]]:
     return [Path(name).stem for name in names]
 
 
-def load_token_json(path: Path) -> Optional[List[Any]]:
+def load_token_json(path: Path) -> Optional[Dict[str, Any]]:
     """
     Load token JSON files from existing preprocessing outputs.
 
     Expected format:
-        {"tokens": ...}
+        {"tokens": ..., "fps": ...}
 
     A plain list is also accepted for convenience while experimenting.
     """
@@ -85,9 +93,9 @@ def load_token_json(path: Path) -> Optional[List[Any]]:
         data = json.load(f)
 
     if isinstance(data, dict):
-        return data.get("tokens")
-    if isinstance(data, list):
         return data
+    if isinstance(data, list):
+        return {"tokens": data}
 
     raise ValueError(f"Unsupported token JSON format: {path}")
 
@@ -187,8 +195,14 @@ def load_sequences(
         if max_samples is not None and len(sequences) >= max_samples:
             break
 
-        motion_tokens = load_token_json(motion_token_dir / f"{name}.json")
-        audio_tokens = load_token_json(audio_token_dir / f"{name}.json")
+        motion_payload = load_token_json(motion_token_dir / f"{name}.json")
+        audio_payload = load_token_json(audio_token_dir / f"{name}.json")
+
+        if not motion_payload or not audio_payload:
+            continue
+
+        motion_tokens = motion_payload.get("tokens")
+        audio_tokens = audio_payload.get("tokens")
 
         if not motion_tokens or not audio_tokens:
             continue
@@ -198,6 +212,8 @@ def load_sequences(
                 "name": name,
                 "motion_tokens": motion_tokens,
                 "audio_tokens": audio_tokens,
+                "motion_fps": motion_payload.get("fps"),
+                "audio_fps": audio_payload.get("fps"),
                 "action_text": action_text_map.get(name),
             }
         )
@@ -278,6 +294,18 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Sparse keyframe spacing; step=4 predicts 3 middle frames",
     )
+    parser.add_argument(
+        "--audio_fps",
+        type=float,
+        default=None,
+        help="Override audio token fps if JSON metadata is missing",
+    )
+    parser.add_argument(
+        "--motion_fps",
+        type=float,
+        default=None,
+        help="Override motion token fps if JSON metadata is missing",
+    )
     parser.add_argument("--max_length", type=int, default=2048)
 
     # Training.
@@ -317,8 +345,10 @@ def main() -> None:
 
     data_dir = Path(args.data_dir)
     motion_token_dir = Path(args.motion_token_dir or data_dir / "motion_token_data")
+    default_audio_fps = args.audio_fps if args.audio_fps is not None else 10.0
+    audio_fps_tag = format_fps_for_dir(default_audio_fps)
     audio_token_dir = Path(
-        args.audio_token_dir or data_dir / "audio_tokens_hubert_layer9_fps10"
+        args.audio_token_dir or data_dir / f"audio_tokens_hubert_layer9_fps{audio_fps_tag}"
     )
     motion2text_json = args.motion2text_json or str(
         data_dir / "text_data/motion2text.json"
@@ -357,6 +387,8 @@ def main() -> None:
     train_dataset = MotionInfillSFTDataset(
         train_sequences,
         step=args.step,
+        audio_fps=args.audio_fps,
+        motion_fps=args.motion_fps,
         max_windows_per_sequence=args.max_windows_per_sequence,
     )
     eval_dataset = None
@@ -364,6 +396,8 @@ def main() -> None:
         eval_dataset = MotionInfillSFTDataset(
             eval_sequences,
             step=args.step,
+            audio_fps=args.audio_fps,
+            motion_fps=args.motion_fps,
             max_windows_per_sequence=args.max_windows_per_sequence,
         )
 
@@ -463,4 +497,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

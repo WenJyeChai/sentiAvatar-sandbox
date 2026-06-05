@@ -195,6 +195,8 @@ class MotionInfillSFTDataset(Dataset):
         sequences: Sequence[Dict[str, Any]],
         *,
         step: int = 4,
+        audio_fps: Optional[float] = None,
+        motion_fps: Optional[float] = None,
         max_windows_per_sequence: Optional[int] = None,
     ):
         if step < 2:
@@ -206,23 +208,34 @@ class MotionInfillSFTDataset(Dataset):
             motion_tokens = item["motion_tokens"]
             audio_tokens = item["audio_tokens"]
             action_text = item.get("action_text")
+            item_audio_fps = item.get("audio_fps", audio_fps)
+            item_motion_fps = item.get("motion_fps", motion_fps)
 
-            # Keep motion/audio aligned if one side has a slightly different
-            # length after preprocessing.
-            num_frames = min(len(motion_tokens), len(audio_tokens))
+            # If audio_fps and motion_fps are known, audio and motion do not
+            # need to have the same number of tokens. For example, Step 2 can
+            # use 50fps audio tokens while motion tokens are 20fps.
+            if item_audio_fps is None or item_motion_fps is None:
+                num_frames = min(len(motion_tokens), len(audio_tokens))
+            else:
+                num_frames = len(motion_tokens)
             made_for_this_sequence = 0
 
             for left_idx in range(0, num_frames - step, step):
                 right_idx = left_idx + step
                 middle_slice = slice(left_idx + 1, right_idx)
+                middle_audio_tokens = self._slice_middle_audio(
+                    audio_tokens,
+                    left_idx=left_idx,
+                    right_idx=right_idx,
+                    audio_fps=item_audio_fps,
+                    motion_fps=item_motion_fps,
+                )
 
                 self.examples.append(
                     MotionInfillExample(
                         left_anchor=list(motion_tokens[left_idx]),
                         right_anchor=list(motion_tokens[right_idx]),
-                        middle_audio_tokens=[
-                            _as_int_audio_token(t) for t in audio_tokens[middle_slice]
-                        ],
+                        middle_audio_tokens=middle_audio_tokens,
                         middle_motion=[
                             list(frame) for frame in motion_tokens[middle_slice]
                         ],
@@ -242,6 +255,52 @@ class MotionInfillSFTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> MotionInfillExample:
         return self.examples[idx]
+
+    @staticmethod
+    def _slice_middle_audio(
+        audio_tokens: Sequence[Any],
+        *,
+        left_idx: int,
+        right_idx: int,
+        audio_fps: Optional[float],
+        motion_fps: Optional[float],
+    ) -> List[int]:
+        """
+        Select the audio-token interval between two motion anchors.
+
+        Old aligned path:
+            audio token i corresponds to motion frame i.
+
+        High-detail Step 2 path:
+            audio_fps may be larger than motion_fps. We convert motion-frame
+            indices into time, then into audio-token indices, so every infill
+            window receives all audio tokens between the anchors.
+
+        Example:
+            motion_fps = 20, audio_fps = 50, left_idx=0, right_idx=4
+            middle interval is time [1/20, 4/20), so audio indices [2, 10).
+        """
+
+        if audio_fps is None or motion_fps is None:
+            return [
+                _as_int_audio_token(t)
+                for t in audio_tokens[left_idx + 1 : right_idx]
+            ]
+
+        start = int(round((left_idx + 1) * float(audio_fps) / float(motion_fps)))
+        end = int(round(right_idx * float(audio_fps) / float(motion_fps)))
+        start = max(0, min(start, len(audio_tokens)))
+        end = max(start, min(end, len(audio_tokens)))
+
+        selected = [_as_int_audio_token(t) for t in audio_tokens[start:end]]
+
+        # Very short clips or rounding can produce an empty interval. Add the
+        # closest available token so the prompt still contains audio context.
+        if not selected and audio_tokens:
+            fallback_idx = min(start, len(audio_tokens) - 1)
+            selected = [_as_int_audio_token(audio_tokens[fallback_idx])]
+
+        return selected
 
 
 class MotionInfillCollator:
@@ -509,4 +568,3 @@ def training_step(
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     return float(loss.detach().cpu())
-

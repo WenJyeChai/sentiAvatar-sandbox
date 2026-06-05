@@ -37,8 +37,33 @@ import soundfile as sf
 from tqdm import tqdm
 
 # 确保能导入本地模块
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# __file__ is motion_generation/scripts/preprocess_data.py.
+# Go up three levels so PROJECT_DIR is the repo root, e.g.
+# /mnt/sda/wenjye/sentiAvatar-sandbox.
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(PROJECT_DIR, "motion_generation"))
+
+
+def apply_shard(name_list, num_shards=1, shard_id=0):
+    """
+    Split the file list for multi-GPU preprocessing.
+
+    Example for 4 GPUs:
+        process 0 uses items 0, 4, 8, ...
+        process 1 uses items 1, 5, 9, ...
+        process 2 uses items 2, 6, 10, ...
+        process 3 uses items 3, 7, 11, ...
+
+    This avoids launching four workers that all try to preprocess the same
+    sample at the same time.
+    """
+    if num_shards < 1:
+        raise ValueError("--num_shards must be >= 1")
+    if shard_id < 0 or shard_id >= num_shards:
+        raise ValueError("--shard_id must satisfy 0 <= shard_id < num_shards")
+    if num_shards == 1:
+        return name_list
+    return name_list[shard_id::num_shards]
 
 
 # ======================================================================
@@ -81,8 +106,15 @@ class ApplyKmeans(object):
             return np.argmin(dist, axis=1).tolist()
 
 
+def _format_fps_for_dir(fps):
+    """Format fps values for stable output folder names."""
+    if float(fps).is_integer():
+        return str(int(fps))
+    return str(fps).replace(".", "p")
+
+
 def process_audio(args):
-    """处理音频: 提取 HuBERT 特征 → 下采样 → K-means 量化"""
+    """处理音频: 提取 HuBERT 特征 → 可选重采样 → K-means 量化"""
     from transformers import Wav2Vec2FeatureExtractor, HubertModel
 
     device = torch.device(args.device)
@@ -90,8 +122,13 @@ def process_audio(args):
     kmeans_path = os.path.join(PROJECT_DIR, "checkpoints", "hubert_kmeans", "model.mdl")
 
     wav_dir = os.path.join(args.data_dir, "wav_data")
-    feat_output_dir = os.path.join(args.data_dir, "audio_features_hubert_layer9_fps10")
-    token_output_dir = os.path.join(args.data_dir, "audio_tokens_hubert_layer9_fps10")
+    audio_fps_tag = _format_fps_for_dir(args.audio_fps)
+    feat_output_dir = os.path.join(
+        args.data_dir, f"audio_features_hubert_layer9_fps{audio_fps_tag}"
+    )
+    token_output_dir = os.path.join(
+        args.data_dir, f"audio_tokens_hubert_layer9_fps{audio_fps_tag}"
+    )
 
     # 加载模型
     print(f"[Audio] 加载 Chinese HuBERT: {hubert_path}")
@@ -105,8 +142,12 @@ def process_audio(args):
     split_file = os.path.join(args.data_dir, "split", "all_file_list.txt")
     with open(split_file, "r") as f:
         name_list = [line.strip() for line in f if line.strip()]
+    name_list = apply_shard(name_list, args.num_shards, args.shard_id)
 
-    print(f"[Audio] 共 {len(name_list)} 个文件待处理")
+    print(
+        f"[Audio] 共 {len(name_list)} 个文件待处理 "
+        f"(shard {args.shard_id + 1}/{args.num_shards})"
+    )
 
     success, skip, fail = 0, 0, 0
     for name in tqdm(name_list, desc="处理音频特征"):
@@ -141,22 +182,30 @@ def process_audio(args):
                 outputs = audio_encoder(input_values, output_hidden_states=True)
                 audio_9layer = outputs.hidden_states[8].squeeze(0).cpu().numpy()  # (T_50fps, 768)
 
-            # 3. 下采样 50fps → 10fps
-            audio_feat_10fps = resample_fps_1d(audio_9layer, src_fps=50.0, tgt_fps=10.0)
+            # 3. Resample HuBERT features.
+            #
+            # Planner LLM usually uses 10fps tokens to keep the prompt compact.
+            # Infill LLM can use 50fps tokens to preserve local speech detail.
+            if abs(args.audio_fps - 50.0) < 1e-6:
+                audio_feat = audio_9layer
+            else:
+                audio_feat = resample_fps_1d(
+                    audio_9layer, src_fps=50.0, tgt_fps=args.audio_fps
+                )
 
             # 4. 保存特征
             os.makedirs(os.path.dirname(feat_path), exist_ok=True)
-            np.save(feat_path, audio_feat_10fps.astype(np.float32))
+            np.save(feat_path, audio_feat.astype(np.float32))
 
             # 5. K-means 量化
-            feats_tensor = torch.tensor(audio_feat_10fps, dtype=torch.float32).to(device)
+            feats_tensor = torch.tensor(audio_feat, dtype=torch.float32).to(device)
             tokens = kmeans.feat2token(feats_tensor)
 
             # 6. 保存 token
             os.makedirs(os.path.dirname(token_path), exist_ok=True)
             with open(token_path, "w") as f:
                 json.dump({
-                    "fps": 10,
+                    "fps": args.audio_fps,
                     "num_tokens": len(tokens),
                     "tokens": tokens,
                     "name": name,
@@ -199,8 +248,12 @@ def process_motion(args):
     split_file = os.path.join(args.data_dir, "split", "all_file_list.txt")
     with open(split_file, "r") as f:
         name_list = [line.strip() for line in f if line.strip()]
+    name_list = apply_shard(name_list, args.num_shards, args.shard_id)
 
-    print(f"[Motion] 共 {len(name_list)} 个文件待处理")
+    print(
+        f"[Motion] 共 {len(name_list)} 个文件待处理 "
+        f"(shard {args.shard_id + 1}/{args.num_shards})"
+    )
 
     success, skip, fail = 0, 0, 0
     for name in tqdm(name_list, desc="编码动作 token"):
@@ -286,6 +339,12 @@ def main():
                         default=os.path.join(PROJECT_DIR, "data"),
                         help="数据集根目录 (默认: ./data)")
     parser.add_argument("--device", type=str, default="cuda:0", help="推理设备")
+    parser.add_argument("--audio_fps", type=float, default=10.0,
+                        help="输出音频 token 帧率。Step 1 通常用 10；Step 2 可用 50 保留细节")
+    parser.add_argument("--num_shards", type=int, default=1,
+                        help="并行预处理分片总数，例如 4 张 GPU 则设为 4")
+    parser.add_argument("--shard_id", type=int, default=0,
+                        help="当前分片编号，从 0 开始，例如 0/1/2/3")
 
     args = parser.parse_args()
 
