@@ -222,8 +222,8 @@ def main():
                         help="Mask Transformer 生成步数")
     
     parser.add_argument("--infill_mode", type=str, default="parallel",
-                        choices=["parallel", "ar_frame"],
-                        help="Infill schedule: parallel keeps the original path; ar_frame predicts one full middle frame per forward pass")
+                        choices=["parallel", "ar_frame", "ar_frame_cached"],
+                        help="Infill schedule: parallel keeps the original path; ar_frame predicts one full middle frame per forward pass; ar_frame_cached reuses causal context states")
 
     args = parser.parse_args()
     

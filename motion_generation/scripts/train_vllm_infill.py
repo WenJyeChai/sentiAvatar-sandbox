@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+# -*- encoding: utf-8 -*-
+"""
+Train Step 2 autoregressive motion infill LLM.
+
+This trainer fine-tunes a separate checkpoint from the Step 1 planner LLM:
+
+    input:
+        left motion anchor + right motion anchor + middle audio tokens
+
+    target:
+        missing middle motion tokens
+
+After training, the output checkpoint can be served with vllm_server.py on a
+second port and used as the infill model.
+
+Example:
+    python scripts/train_vllm_infill.py \
+        --base_model_path ../checkpoints/llm \
+        --output_dir ../checkpoints/llm_infill \
+        --data_dir ../data \
+        --use_lora \
+        --num_train_epochs 3 \
+        --per_device_train_batch_size 2 \
+        --gradient_accumulation_steps 8
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+import torch
+from transformers import Trainer, TrainingArguments, set_seed
+
+
+# Allow running from either repo root or motion_generation/.
+THIS_DIR = Path(__file__).resolve().parent
+MOTION_GENERATION_DIR = THIS_DIR.parent
+PROJECT_DIR = MOTION_GENERATION_DIR.parent
+sys.path.insert(0, str(MOTION_GENERATION_DIR))
+
+from models.vllm_infill_model import (  # noqa: E402
+    MotionInfillCausalLM,
+    MotionInfillCollator,
+    MotionInfillSFTDataset,
+    load_tokenizer_for_infill,
+    maybe_enable_lora,
+)
+
+
+def read_split_file(path: Optional[str]) -> Optional[List[str]]:
+    """Read a split file containing one sample name per line."""
+
+    if path is None:
+        return None
+
+    with open(path, "r", encoding="utf-8") as f:
+        names = [line.strip() for line in f if line.strip()]
+
+    # Some split files may include extensions. The token loaders expect the stem.
+    return [Path(name).stem for name in names]
+
+
+def load_token_json(path: Path) -> Optional[List[Any]]:
+    """
+    Load token JSON files from existing preprocessing outputs.
+
+    Expected format:
+        {"tokens": ...}
+
+    A plain list is also accepted for convenience while experimenting.
+    """
+
+    if not path.exists():
+        return None
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict):
+        return data.get("tokens")
+    if isinstance(data, list):
+        return data
+
+    raise ValueError(f"Unsupported token JSON format: {path}")
+
+
+def extract_action_text(raw_text: str) -> Optional[str]:
+    """
+    Extract the action/expression tag from motion2text.json.
+
+    The dataset text often looks like:
+        【表情：认真聆听】【动作：缓慢点头】...
+
+    For infilling, action_text is optional context. If parsing fails, returning
+    None is fine; the model can still train from anchors and audio.
+    """
+
+    tags = re.findall(r"【(.+?)】", raw_text)
+    if not tags:
+        return None
+
+    last_tag = tags[-1]
+
+    # If motion says "no action", use an expression tag when available. This
+    # follows the same idea as pipeline_infer.py.
+    if last_tag == "动作：无动作":
+        for tag in tags:
+            if tag.startswith("表情：") and tag != "表情：无表情":
+                expression = tag.replace("表情：", "")
+                return expression if "动作" in expression else f"动作：{expression}"
+
+    return last_tag
+
+
+def load_action_text_map(path: Optional[str]) -> Dict[str, str]:
+    """Load optional name -> action_text metadata."""
+
+    if path is None or not Path(path).exists():
+        return {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        motion2text = json.load(f)
+
+    result: Dict[str, str] = {}
+    for name, raw_text in motion2text.items():
+        action_text = extract_action_text(raw_text)
+        if action_text:
+            result[Path(name).stem] = action_text
+
+    return result
+
+
+def discover_names(
+    motion_token_dir: Path,
+    audio_token_dir: Path,
+    split_names: Optional[Sequence[str]],
+) -> List[str]:
+    """
+    Find sample names that have both motion-token and audio-token files.
+
+    If split_names is provided, preserve that order and filter missing files.
+    Otherwise, use the intersection of both directories.
+    """
+
+    if split_names is not None:
+        names = list(split_names)
+    else:
+        motion_names = {path.stem for path in motion_token_dir.glob("*.json")}
+        audio_names = {path.stem for path in audio_token_dir.glob("*.json")}
+        names = sorted(motion_names & audio_names)
+
+    available = []
+    for name in names:
+        if (motion_token_dir / f"{name}.json").exists() and (
+            audio_token_dir / f"{name}.json"
+        ).exists():
+            available.append(name)
+
+    return available
+
+
+def load_sequences(
+    names: Sequence[str],
+    motion_token_dir: Path,
+    audio_token_dir: Path,
+    action_text_map: Dict[str, str],
+    *,
+    max_samples: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Load raw sequences before converting them into infill windows.
+
+    Each returned item is consumed by MotionInfillSFTDataset.
+    """
+
+    sequences: List[Dict[str, Any]] = []
+
+    for name in names:
+        if max_samples is not None and len(sequences) >= max_samples:
+            break
+
+        motion_tokens = load_token_json(motion_token_dir / f"{name}.json")
+        audio_tokens = load_token_json(audio_token_dir / f"{name}.json")
+
+        if not motion_tokens or not audio_tokens:
+            continue
+
+        sequences.append(
+            {
+                "name": name,
+                "motion_tokens": motion_tokens,
+                "audio_tokens": audio_tokens,
+                "action_text": action_text_map.get(name),
+            }
+        )
+
+    return sequences
+
+
+def split_train_eval(
+    sequences: List[Dict[str, Any]],
+    *,
+    eval_ratio: float,
+    seed: int,
+) -> tuple[List[Dict[str, Any]], Optional[List[Dict[str, Any]]]]:
+    """Create an eval split when the user did not provide one."""
+
+    if eval_ratio <= 0 or len(sequences) < 2:
+        return sequences, None
+
+    rng = random.Random(seed)
+    shuffled = sequences[:]
+    rng.shuffle(shuffled)
+
+    eval_size = max(1, int(len(shuffled) * eval_ratio))
+    eval_sequences = shuffled[:eval_size]
+    train_sequences = shuffled[eval_size:]
+    return train_sequences, eval_sequences
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fine-tune Step 2 autoregressive vLLM-compatible infill LLM"
+    )
+
+    # Model paths.
+    parser.add_argument(
+        "--base_model_path",
+        type=str,
+        default=str(PROJECT_DIR / "checkpoints/llm"),
+        help="Step 1 planner LLM checkpoint used to initialize Step 2",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=str(PROJECT_DIR / "checkpoints/llm_infill"),
+        help="Where to save the separately fine-tuned Step 2 infill checkpoint",
+    )
+
+    # Data paths.
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=str(PROJECT_DIR / "data"),
+        help="Dataset root containing motion/audio token folders",
+    )
+    parser.add_argument("--motion_token_dir", type=str, default=None)
+    parser.add_argument("--audio_token_dir", type=str, default=None)
+    parser.add_argument("--motion2text_json", type=str, default=None)
+    parser.add_argument("--train_split_file", type=str, default=None)
+    parser.add_argument("--eval_split_file", type=str, default=None)
+    parser.add_argument(
+        "--eval_ratio",
+        type=float,
+        default=0.05,
+        help="Used only when --eval_split_file is not provided",
+    )
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument(
+        "--max_windows_per_sequence",
+        type=int,
+        default=None,
+        help="Limit windows per clip for quick debugging",
+    )
+
+    # Task format.
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=4,
+        help="Sparse keyframe spacing; step=4 predicts 3 middle frames",
+    )
+    parser.add_argument("--max_length", type=int, default=2048)
+
+    # Training.
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_train_epochs", type=float, default=3.0)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--logging_steps", type=int, default=20)
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--eval_steps", type=int, default=500)
+    parser.add_argument("--save_total_limit", type=int, default=3)
+    parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument(
+        "--full_finetune",
+        action="store_true",
+        help="Train all weights. By default, use LoRA if --use_lora is set.",
+    )
+
+    # LoRA.
+    parser.add_argument("--use_lora", action="store_true")
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+
+    data_dir = Path(args.data_dir)
+    motion_token_dir = Path(args.motion_token_dir or data_dir / "motion_token_data")
+    audio_token_dir = Path(
+        args.audio_token_dir or data_dir / "audio_tokens_hubert_layer9_fps10"
+    )
+    motion2text_json = args.motion2text_json or str(
+        data_dir / "text_data/motion2text.json"
+    )
+
+    action_text_map = load_action_text_map(motion2text_json)
+
+    train_split_names = read_split_file(args.train_split_file)
+    train_names = discover_names(motion_token_dir, audio_token_dir, train_split_names)
+    train_sequences = load_sequences(
+        train_names,
+        motion_token_dir,
+        audio_token_dir,
+        action_text_map,
+        max_samples=args.max_samples,
+    )
+
+    eval_sequences = None
+    eval_split_names = read_split_file(args.eval_split_file)
+    if eval_split_names is not None:
+        eval_names = discover_names(motion_token_dir, audio_token_dir, eval_split_names)
+        eval_sequences = load_sequences(
+            eval_names,
+            motion_token_dir,
+            audio_token_dir,
+            action_text_map,
+            max_samples=args.max_samples,
+        )
+    else:
+        train_sequences, eval_sequences = split_train_eval(
+            train_sequences,
+            eval_ratio=args.eval_ratio,
+            seed=args.seed,
+        )
+
+    train_dataset = MotionInfillSFTDataset(
+        train_sequences,
+        step=args.step,
+        max_windows_per_sequence=args.max_windows_per_sequence,
+    )
+    eval_dataset = None
+    if eval_sequences:
+        eval_dataset = MotionInfillSFTDataset(
+            eval_sequences,
+            step=args.step,
+            max_windows_per_sequence=args.max_windows_per_sequence,
+        )
+
+    if len(train_dataset) == 0:
+        raise RuntimeError("No training windows were built. Check data paths/splits.")
+
+    print("=" * 70)
+    print("Step 2 vLLM-compatible infill training")
+    print(f"Base model:       {args.base_model_path}")
+    print(f"Output dir:       {args.output_dir}")
+    print(f"Motion tokens:    {motion_token_dir}")
+    print(f"Audio tokens:     {audio_token_dir}")
+    print(f"Train sequences:  {len(train_sequences)}")
+    print(f"Train windows:    {len(train_dataset)}")
+    if eval_dataset is not None:
+        print(f"Eval windows:     {len(eval_dataset)}")
+    print(f"LoRA:             {args.use_lora}")
+    print("=" * 70)
+
+    tokenizer = load_tokenizer_for_infill(args.base_model_path)
+    collator = MotionInfillCollator(tokenizer, max_length=args.max_length)
+
+    torch_dtype = None
+    if args.bf16:
+        torch_dtype = torch.bfloat16
+    elif args.fp16:
+        torch_dtype = torch.float16
+
+    model = MotionInfillCausalLM.from_step1_checkpoint(
+        args.base_model_path,
+        torch_dtype=torch_dtype,
+        device_map=None,
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
+
+    if args.use_lora:
+        model = maybe_enable_lora(
+            model,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+        )
+        # Print PEFT trainable parameter count when available.
+        if hasattr(model.lm, "print_trainable_parameters"):
+            model.lm.print_trainable_parameters()
+    elif not args.full_finetune:
+        print(
+            "[WARN] Neither --use_lora nor --full_finetune was set. "
+            "Proceeding with full fine-tuning because no adapter was requested."
+        )
+
+    training_args_kwargs = {
+        "output_dir": args.output_dir,
+        "num_train_epochs": args.num_train_epochs,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "warmup_ratio": args.warmup_ratio,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "per_device_eval_batch_size": args.per_device_eval_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "save_total_limit": args.save_total_limit,
+        "bf16": args.bf16,
+        "fp16": args.fp16,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "remove_unused_columns": False,
+        "report_to": "none",
+    }
+
+    if eval_dataset is not None and len(eval_dataset) > 0:
+        training_args_kwargs.update(
+            {
+                "eval_strategy": "steps",
+                "eval_steps": args.eval_steps,
+            }
+        )
+
+    training_args = TrainingArguments(**training_args_kwargs)
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=collator,
+        tokenizer=tokenizer,
+    )
+
+    trainer.train()
+
+    # Save model and tokenizer together so vllm_server.py can load this path.
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print(f"Saved Step 2 infill checkpoint to: {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
+

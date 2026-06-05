@@ -575,7 +575,7 @@ def run_pipeline_single(
         dense_tokens = interpolate_sequence(
             mask_model, keyframes, audio_features, generate_steps=generate_steps
         )
-    elif infill_mode == "ar_frame":
+    elif infill_mode in ("ar_frame", "ar_frame_cached"):
         def log_ar_frame(frame_idx, frame_tokens, status):
             print(f"    [AR frame] frame {frame_idx:04d} {status}: {frame_tokens}")
 
@@ -585,6 +585,7 @@ def run_pipeline_single(
             audio_features,
             generate_steps=generate_steps,
             on_frame=log_ar_frame,
+            use_cache=infill_mode == "ar_frame_cached",
         )
     else:
         raise ValueError(f"Unsupported infill_mode: {infill_mode}")
@@ -853,8 +854,8 @@ def main():
 
     # 数据路径
     parser.add_argument("--infill_mode", type=str, default="parallel",
-                        choices=["parallel", "ar_frame"],
-                        help="Infill schedule: parallel keeps the original path; ar_frame predicts one full middle frame per forward pass")
+                        choices=["parallel", "ar_frame", "ar_frame_cached"],
+                        help="Infill schedule: parallel keeps the original path; ar_frame predicts one full middle frame per forward pass; ar_frame_cached reuses causal context states")
     parser.add_argument("--motion_token_dir", type=str, default=None,
                         help="motion token JSON 文件目录")
     parser.add_argument("--audio_token_dir", type=str, default=None,

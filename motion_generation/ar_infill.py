@@ -119,9 +119,20 @@ def generate_framewise_infill_window(
 
         frame_tokens = []
         for token_idx in range(ntpf):
+            # Position of this RVQ token inside the flattened 5-frame window.
+            # Example: frame 1 token 0 -> pos 4, frame 1 token 1 -> pos 5, etc.
             target_pos = target_frame_idx * ntpf + token_idx
+
+            # Pick the highest-scoring vocabulary token predicted by the model
+            # for this position.
             pred_token_id = logits[0, target_pos].argmax(dim=-1)
+
+            # Write the predicted global token ID back into the input sequence so
+            # later AR steps can condition on this generated token.
             input_ids[0, target_pos] = pred_token_id
+
+            # Convert from global vocab ID back to the raw RVQ codebook ID by
+            # removing this quantizer's offset, then store it in the output frame.
             frame_tokens.append(int(pred_token_id.item() - offsets[token_idx]))
 
         generated_frames.append(frame_tokens)
