@@ -400,15 +400,83 @@ class MotionInfillCollator:
         *,
         max_length: int = 2048,
         pad_to_multiple_of: Optional[int] = 8,
+        debug_examples: int = 0,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.pad_to_multiple_of = pad_to_multiple_of
+        self.debug_examples = debug_examples
+        self._debug_examples_printed = 0
 
         if self.tokenizer.pad_token_id is None:
             # Qwen checkpoints often use eos/endoftext as padding. This keeps
             # batching simple without changing the vocabulary.
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def _token_count(self, text: str) -> int:
+        return len(
+            self.tokenizer(
+                text,
+                add_special_tokens=False,
+                truncation=False,
+            )["input_ids"]
+        )
+
+    def _debug_tokenization(
+        self,
+        example: MotionInfillExample,
+        *,
+        prompt: str,
+        completion: str,
+        prompt_ids: List[int],
+        completion_ids: List[int],
+        input_ids: List[int],
+        labels: List[int],
+        was_truncated: bool,
+    ) -> None:
+        if self._debug_examples_printed >= self.debug_examples:
+            return
+
+        action_prefix = f"Action: {example.action_text}\n" if example.action_text else ""
+        gap_length = len(example.middle_motion)
+        sections = [
+            ("action_text", action_prefix),
+            ("[infill][len_N]", f"[infill][len_{gap_length}]"),
+            ("[history]", "[history]"),
+            ("history_motion", format_history(example.history_motion)),
+            ("[left_anchor]", "[left_anchor]"),
+            ("left_anchor", format_motion_frame(example.left_anchor)),
+            ("[right_anchor]", "[right_anchor]"),
+            ("right_anchor", format_motion_frame(example.right_anchor)),
+            ("[middle_audio]", "[middle_audio]"),
+            ("middle_audio", format_audio_tokens(example.middle_audio_tokens)),
+            ("[middle_motion]", "[middle_motion]"),
+            ("template_prefix/suffix", "Human: <task><|im_end|>\nAssistant:"),
+            ("completion_motion", format_motion_sequence(example.middle_motion)),
+            ("completion_stop", "<|im_end|>"),
+        ]
+
+        supervised = sum(1 for label in labels if label != IGNORE_INDEX)
+        print("=" * 70)
+        print(f"[Tokenization debug #{self._debug_examples_printed + 1}]")
+        print(f"history frames:      {len(example.history_motion)}")
+        print(f"middle audio tokens: {len(example.middle_audio_tokens)}")
+        print(f"middle motion frames:{len(example.middle_motion)}")
+        print(f"prompt tokens:       {len(prompt_ids)}")
+        print(f"completion tokens:   {len(completion_ids)}")
+        print(f"input tokens:        {len(input_ids)}")
+        print(f"supervised labels:   {supervised}")
+        print(f"truncated:           {was_truncated}")
+        print("section token counts:")
+        for name, text in sections:
+            if text:
+                print(f"  {name:22s} {self._token_count(text):4d}")
+        print("prompt preview:")
+        print(prompt[:1000])
+        print("completion preview:")
+        print(completion[:1000])
+        print("=" * 70)
+        self._debug_examples_printed += 1
 
     def _encode_one(self, example: MotionInfillExample) -> Dict[str, List[int]]:
         prompt = build_infill_prompt(example)
@@ -429,6 +497,7 @@ class MotionInfillCollator:
 
         input_ids = prompt_ids + completion_ids
         labels = [IGNORE_INDEX] * len(prompt_ids) + completion_ids[:]
+        was_truncated = False
 
         # Keep the target end if the example is too long. For this task, losing
         # part of the prompt is usually worse than losing examples entirely, so
@@ -436,6 +505,18 @@ class MotionInfillCollator:
         if len(input_ids) > self.max_length:
             input_ids = input_ids[-self.max_length :]
             labels = labels[-self.max_length :]
+            was_truncated = True
+
+        self._debug_tokenization(
+            example,
+            prompt=prompt,
+            completion=completion,
+            prompt_ids=prompt_ids,
+            completion_ids=completion_ids,
+            input_ids=input_ids,
+            labels=labels,
+            was_truncated=was_truncated,
+        )
 
         return {
             "input_ids": input_ids,

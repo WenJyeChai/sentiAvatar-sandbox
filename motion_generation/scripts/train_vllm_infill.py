@@ -351,6 +351,12 @@ def parse_args() -> argparse.Namespace:
         help="Override motion token fps if JSON metadata is missing",
     )
     parser.add_argument("--max_length", type=int, default=2048)
+    parser.add_argument(
+        "--debug_tokenization_examples",
+        type=int,
+        default=0,
+        help="Print token-count breakdowns for the first N collated examples.",
+    )
 
     # Training.
     parser.add_argument("--seed", type=int, default=42)
@@ -480,7 +486,11 @@ def main() -> None:
     print("=" * 70)
 
     tokenizer = load_tokenizer_for_infill(args.base_model_path)
-    collator = MotionInfillCollator(tokenizer, max_length=args.max_length)
+    collator = MotionInfillCollator(
+        tokenizer,
+        max_length=args.max_length,
+        debug_examples=args.debug_tokenization_examples,
+    )
 
     torch_dtype = None
     if args.bf16:
