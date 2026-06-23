@@ -32,12 +32,13 @@ import json
 import os
 import random
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import torch
-from transformers import Trainer, TrainingArguments, set_seed
+from transformers import AutoModelForCausalLM, Trainer, TrainingArguments, set_seed
 
 
 # Allow running from either repo root or motion_generation/.
@@ -49,7 +50,6 @@ sys.path.insert(0, str(MOTION_GENERATION_DIR))
 from models.vllm_infill_model import (  # noqa: E402
     ensure_infill_special_tokens,
     INFILL_ROLE_TOKENS,
-    MotionInfillCausalLM,
     MotionInfillCollator,
     MotionInfillSFTDataset,
     load_tokenizer_for_infill,
@@ -267,6 +267,26 @@ def split_train_eval(
     return train_sequences, eval_sequences
 
 
+def save_lora_adapter_preflight(model, output_dir: str) -> None:
+    """
+    Verify PEFT adapter checkpointing before spending time training.
+
+    This catches tied-weight/safetensors issues at setup time. It intentionally
+    exercises the same model.save_pretrained path Trainer uses for PEFT
+    checkpointing, without mutating the model.
+    """
+
+    preflight_dir = Path(output_dir) / "_lora_save_preflight"
+    if preflight_dir.exists():
+        shutil.rmtree(preflight_dir)
+
+    try:
+        model.save_pretrained(preflight_dir, safe_serialization=True)
+    finally:
+        if preflight_dir.exists():
+            shutil.rmtree(preflight_dir)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fine-tune Step 2 autoregressive vLLM-compatible infill LLM"
@@ -394,6 +414,11 @@ def parse_args() -> argparse.Namespace:
             "by vllm_server.py."
         ),
     )
+    parser.add_argument(
+        "--skip_lora_save_preflight",
+        action="store_true",
+        help="Skip the small PEFT adapter save check before LoRA training.",
+    )
 
     return parser.parse_args()
 
@@ -498,12 +523,17 @@ def main() -> None:
     elif args.fp16:
         torch_dtype = torch.float16
 
-    model = MotionInfillCausalLM.from_step1_checkpoint(
+    model = AutoModelForCausalLM.from_pretrained(
         args.base_model_path,
         torch_dtype=torch_dtype,
         device_map=None,
-        gradient_checkpointing=args.gradient_checkpointing,
+        trust_remote_code=True,
+        local_files_only=True,
     )
+    model.config.use_cache = False
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
     added_role_tokens = ensure_infill_special_tokens(tokenizer, model)
     if added_role_tokens:
         print(f"Added Step 2 role tokens to tokenizer: {added_role_tokens}")
@@ -527,8 +557,12 @@ def main() -> None:
             trainable_token_indices=infill_role_token_ids,
         )
         # Print PEFT trainable parameter count when available.
-        if hasattr(model.lm, "print_trainable_parameters"):
-            model.lm.print_trainable_parameters()
+        if hasattr(model, "print_trainable_parameters"):
+            model.print_trainable_parameters()
+
+        if not args.skip_lora_save_preflight:
+            save_lora_adapter_preflight(model, args.output_dir)
+            print("PEFT adapter save preflight passed.")
     elif not args.full_finetune:
         print(
             "[WARN] Neither --use_lora nor --full_finetune was set. "
@@ -577,13 +611,16 @@ def main() -> None:
 
     # Save model and tokenizer together so vllm_server.py can load this path.
     if args.use_lora and not args.save_adapter_only:
-        if not hasattr(model.lm, "merge_and_unload"):
+        trained_model = trainer.model
+        if not hasattr(trained_model, "merge_and_unload"):
             raise RuntimeError(
                 "LoRA model does not expose merge_and_unload(); cannot create "
                 "a standalone vLLM-ready checkpoint. Re-run with "
                 "--save_adapter_only to save the adapter instead."
             )
-        merged_lm = model.lm.merge_and_unload()
+        merged_lm = trained_model.merge_and_unload()
+        if hasattr(merged_lm, "tie_weights"):
+            merged_lm.tie_weights()
         merged_lm.save_pretrained(args.output_dir, safe_serialization=True)
         print("Merged LoRA adapter into the base model for vLLM serving.")
     else:

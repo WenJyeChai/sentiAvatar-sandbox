@@ -715,7 +715,7 @@ def ensure_infill_special_tokens(
 
 
 def maybe_enable_lora(
-    model: MotionInfillCausalLM,
+    model: nn.Module,
     *,
     r: int = 16,
     lora_alpha: int = 32,
@@ -723,7 +723,7 @@ def maybe_enable_lora(
     target_modules: Optional[List[str]] = None,
     trainable_token_indices: Optional[Sequence[int]] = None,
     modules_to_save: Optional[List[str]] = None,
-) -> MotionInfillCausalLM:
+) -> nn.Module:
     """
     Optional LoRA hook.
 
@@ -732,11 +732,9 @@ def maybe_enable_lora(
     matrices.
 
     If Step 2 role tokens were newly added to the tokenizer, pass their token
-    ids through trainable_token_indices. For Qwen-style tied embeddings, this
-    helper deliberately trains/saves embed_tokens and lm_head as full modules
-    instead of PEFT's token-index adapter. That is larger, but avoids
-    safetensors shared-memory failures when input embeddings and lm_head are
-    tied.
+    ids through trainable_token_indices. Qwen-style causal LMs tie
+    embed_tokens and lm_head, so recent PEFT versions need ensure_weight_tying
+    to keep adapter-side token updates tied and safely saveable.
 
     Requires:
         pip install peft
@@ -778,12 +776,34 @@ def maybe_enable_lora(
         else []
     )
 
+    config_fields = getattr(LoraConfig, "__dataclass_fields__", {})
+
     if token_indices:
-        saved_modules = modules_to_save or ["embed_tokens", "lm_head"]
-        config_kwargs["modules_to_save"] = saved_modules
+        if "trainable_token_indices" not in config_fields:
+            raise RuntimeError(
+                "The installed PEFT version does not support "
+                "trainable_token_indices. Install peft>=0.19.0 for Step 2 "
+                "LoRA training with newly added role tokens."
+            )
+
+        tied_embeddings = bool(
+            getattr(getattr(model, "config", None), "tie_word_embeddings", False)
+        )
+        if tied_embeddings:
+            if "ensure_weight_tying" not in config_fields:
+                raise RuntimeError(
+                    "The installed PEFT version does not support "
+                    "ensure_weight_tying, but this Qwen checkpoint ties "
+                    "embed_tokens and lm_head. Install peft>=0.19.0."
+                )
+            config_kwargs["ensure_weight_tying"] = True
+
+        config_kwargs["trainable_token_indices"] = {
+            "embed_tokens": token_indices,
+        }
         print(
-            "LoRA will train/save full modules for new Step 2 token embeddings: "
-            f"{saved_modules}"
+            "LoRA will train Step 2 role-token rows via PEFT "
+            f"trainable_token_indices: {token_indices}"
         )
     elif modules_to_save:
         config_kwargs["modules_to_save"] = modules_to_save
