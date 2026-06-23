@@ -810,8 +810,7 @@ def maybe_enable_lora(
 
     peft_config = LoraConfig(**config_kwargs)
 
-    model.lm = get_peft_model(model.lm, peft_config)
-    return model
+    return get_peft_model(model, peft_config)
 
 
 def training_step(
