@@ -25,6 +25,7 @@ training script, distributed setup, and LoRA choices can be added separately.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -38,6 +39,16 @@ IGNORE_INDEX = -100
 
 FrameTokens = List[int]       # One motion frame: [res_1, res_2, res_3, res_4]
 MotionSequence = List[FrameTokens]
+
+
+INFILL_ROLE_TOKENS = [
+    "[infill]",
+    "[history]",
+    "[left_anchor]",
+    "[right_anchor]",
+    "[middle_audio]",
+    "[middle_motion]",
+]
 
 
 @dataclass
@@ -59,7 +70,9 @@ class MotionInfillExample:
     right_anchor: FrameTokens
     middle_audio_tokens: List[int]
     middle_motion: MotionSequence
+    history_motion: MotionSequence
     action_text: Optional[str] = None
+    history_source: str = "gt"
 
 
 @dataclass
@@ -131,32 +144,42 @@ def format_motion_sequence(frames: Iterable[Sequence[int]]) -> str:
     return "".join(format_motion_frame(frame) for frame in frames)
 
 
+def format_history(frames: Iterable[Sequence[int]]) -> str:
+    """
+    Serialize rolling dense-motion history.
+
+    Empty history is allowed. The [history] role token is still emitted, so the
+    model sees a stable prompt schema even for the first block of a clip.
+    """
+
+    return format_motion_sequence(frames)
+
+
 def build_infill_prompt(example: MotionInfillExample) -> str:
     """
     Prompt used for Step 2 training.
 
-    I use plain text task labels here because the current checkpoint already
-    understands text and already has the motion/audio special tokens. Later, you
-    can add compact special tokens like [infill], [left_motion], [right_motion],
-    etc. if you want a cleaner tokenizer vocabulary.
+    This is a rolling-context infill prompt. During the baseline training stage,
+    history_motion is sampled from ground-truth dense motion. During later
+    scheduled-sampling/self-forcing stages, the same field can be filled with
+    model-generated history without changing the prompt schema.
     """
 
-    action_line = ""
-    if example.action_text:
-        action_line = f"Action: {example.action_text}\n"
-
-    gap_length = len(example.middle_audio_tokens)
+    # gap_length is the number of motion frames to predict, not the number of
+    # 50fps audio tokens. With step=4 this is usually 3.
+    gap_length = len(example.middle_motion)
+    action_text = example.action_text or ""
     task_text = (
-        "Task: audio-conditioned motion infilling.\n"
-        "Given the left motion anchor, right motion anchor, and middle audio, "
-        "predict the missing middle motion frames.\n"
-        f"{action_line}"
-        f"Gap length: [len_{gap_length}]\n"
-        f"Left anchor: {format_motion_frame(example.left_anchor)}\n"
-        f"Right anchor: {format_motion_frame(example.right_anchor)}\n"
-        f"Middle audio: {format_audio_tokens(example.middle_audio_tokens)}\n"
-        "Middle motion:"
+        f"[infill][len_{gap_length}]"
+        f"[history]{format_history(example.history_motion)}"
+        f"[left_anchor]{format_motion_frame(example.left_anchor)}"
+        f"[right_anchor]{format_motion_frame(example.right_anchor)}"
+        f"[middle_audio]{format_audio_tokens(example.middle_audio_tokens)}"
+        f"[middle_motion]"
     )
+    if action_text:
+        # Keep semantic text optional and outside the compact role-token core.
+        task_text = f"Action: {action_text}\n" + task_text
 
     # Match the repo's current vllm_server.py style instead of using Qwen's
     # chat template. This keeps training and inference formatting aligned.
@@ -197,19 +220,34 @@ class MotionInfillSFTDataset(Dataset):
         step: int = 4,
         audio_fps: Optional[float] = None,
         motion_fps: Optional[float] = None,
+        min_history_frames: int = 0,
+        max_history_frames: int = 8,
+        history_source: str = "gt",
         max_windows_per_sequence: Optional[int] = None,
+        seed: Optional[int] = None,
     ):
         if step < 2:
             raise ValueError("step must be >= 2")
+        if min_history_frames < 0 or max_history_frames < min_history_frames:
+            raise ValueError(
+                "history window must satisfy 0 <= min_history_frames <= max_history_frames"
+            )
+        if history_source != "gt":
+            raise NotImplementedError(
+                "Only ground-truth history is implemented now. Use this argument "
+                "later for mixed/generated scheduled-sampling history."
+            )
 
         self.examples: List[MotionInfillExample] = []
+        self.history_source = history_source
+        self.rng = random.Random(seed)
 
         for item in sequences:
             motion_tokens = item["motion_tokens"]
             audio_tokens = item["audio_tokens"]
             action_text = item.get("action_text")
-            item_audio_fps = item.get("audio_fps", audio_fps)
-            item_motion_fps = item.get("motion_fps", motion_fps)
+            item_audio_fps = item.get("audio_fps") or audio_fps
+            item_motion_fps = item.get("motion_fps") or motion_fps
 
             # If audio_fps and motion_fps are known, audio and motion do not
             # need to have the same number of tokens. For example, Step 2 can
@@ -223,6 +261,12 @@ class MotionInfillSFTDataset(Dataset):
             for left_idx in range(0, num_frames - step, step):
                 right_idx = left_idx + step
                 middle_slice = slice(left_idx + 1, right_idx)
+                history_motion = self._sample_gt_history(
+                    motion_tokens,
+                    left_idx=left_idx,
+                    min_history_frames=min_history_frames,
+                    max_history_frames=max_history_frames,
+                )
                 middle_audio_tokens = self._slice_middle_audio(
                     audio_tokens,
                     left_idx=left_idx,
@@ -239,7 +283,9 @@ class MotionInfillSFTDataset(Dataset):
                         middle_motion=[
                             list(frame) for frame in motion_tokens[middle_slice]
                         ],
+                        history_motion=history_motion,
                         action_text=action_text,
+                        history_source=history_source,
                     )
                 )
 
@@ -255,6 +301,38 @@ class MotionInfillSFTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> MotionInfillExample:
         return self.examples[idx]
+
+    def _sample_gt_history(
+        self,
+        motion_tokens: MotionSequence,
+        *,
+        left_idx: int,
+        min_history_frames: int,
+        max_history_frames: int,
+    ) -> MotionSequence:
+        """
+        Sample a bounded rolling history from ground-truth dense motion.
+
+        Baseline:
+            use 0..K previous GT frames before the current left anchor.
+
+        Later scheduled sampling can replace this function or pre-fill
+        history_motion with model-generated frames while preserving the same
+        prompt structure.
+        """
+
+        available = left_idx + 1
+        if available <= 0:
+            return []
+
+        low = min(min_history_frames, available)
+        high = min(max_history_frames, available)
+        history_len = self.rng.randint(low, high) if high > 0 else 0
+        if history_len == 0:
+            return []
+
+        start = left_idx + 1 - history_len
+        return [list(frame) for frame in motion_tokens[start : left_idx + 1]]
 
     @staticmethod
     def _slice_middle_audio(
@@ -495,6 +573,39 @@ def load_tokenizer_for_infill(
     return tokenizer
 
 
+def ensure_infill_special_tokens(
+    tokenizer,
+    model: Optional[nn.Module] = None,
+    *,
+    role_tokens: Optional[Sequence[str]] = None,
+) -> int:
+    """
+    Ensure Step 2 role tokens are single tokenizer tokens.
+
+    If tokens are missing, this adds them as non-special added tokens and resizes
+    the model embeddings. They are role delimiters like [history], not EOS/PAD
+    control tokens, so they should not go into special_tokens_map.json.
+    """
+
+    if role_tokens is None:
+        role_tokens = INFILL_ROLE_TOKENS
+
+    missing = [
+        token for token in role_tokens
+        if tokenizer.convert_tokens_to_ids(token) == tokenizer.unk_token_id
+    ]
+
+    if not missing:
+        return 0
+
+    added = tokenizer.add_tokens(list(missing), special_tokens=False)
+    if model is not None and added > 0:
+        target = model.lm if isinstance(model, MotionInfillCausalLM) else model
+        target.resize_token_embeddings(len(tokenizer))
+
+    return added
+
+
 def maybe_enable_lora(
     model: MotionInfillCausalLM,
     *,
@@ -502,13 +613,21 @@ def maybe_enable_lora(
     lora_alpha: int = 32,
     lora_dropout: float = 0.05,
     target_modules: Optional[List[str]] = None,
+    trainable_token_indices: Optional[Sequence[int]] = None,
+    modules_to_save: Optional[List[str]] = None,
 ) -> MotionInfillCausalLM:
     """
     Optional LoRA hook.
 
     Use this if you want Step 2 to be a lightweight adapter initialized from the
-    Step 1 checkpoint. This keeps the base weights frozen and trains only small
-    low-rank matrices.
+    Step 1 checkpoint. This keeps most base weights frozen and trains low-rank
+    matrices.
+
+    If Step 2 role tokens were newly added to the tokenizer, pass their token
+    ids through trainable_token_indices. Recent PEFT versions can train only
+    those embedding rows. Older PEFT versions fall back to modules_to_save for
+    embed_tokens/lm_head so the new token embeddings are still trainable and
+    saved with the adapter.
 
     Requires:
         pip install peft
@@ -535,14 +654,37 @@ def maybe_enable_lora(
             "down_proj",
         ]
 
-    peft_config = LoraConfig(
-        r=r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=target_modules,
+    config_kwargs = {
+        "r": r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "bias": "none",
+        "task_type": "CAUSAL_LM",
+        "target_modules": target_modules,
+    }
+
+    config_fields = getattr(LoraConfig, "__dataclass_fields__", {})
+    token_indices = (
+        sorted({int(token_id) for token_id in trainable_token_indices})
+        if trainable_token_indices
+        else []
     )
+
+    if token_indices:
+        if "trainable_token_indices" in config_fields:
+            config_kwargs["trainable_token_indices"] = token_indices
+        else:
+            fallback_modules = modules_to_save or ["embed_tokens", "lm_head"]
+            config_kwargs["modules_to_save"] = fallback_modules
+            print(
+                "[WARN] This PEFT version does not support "
+                "trainable_token_indices; training/saving full "
+                f"{fallback_modules} modules instead."
+            )
+    elif modules_to_save:
+        config_kwargs["modules_to_save"] = modules_to_save
+
+    peft_config = LoraConfig(**config_kwargs)
 
     model.lm = get_peft_model(model.lm, peft_config)
     return model

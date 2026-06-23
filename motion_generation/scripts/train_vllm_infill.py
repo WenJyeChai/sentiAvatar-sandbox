@@ -47,6 +47,8 @@ PROJECT_DIR = MOTION_GENERATION_DIR.parent
 sys.path.insert(0, str(MOTION_GENERATION_DIR))
 
 from models.vllm_infill_model import (  # noqa: E402
+    ensure_infill_special_tokens,
+    INFILL_ROLE_TOKENS,
     MotionInfillCausalLM,
     MotionInfillCollator,
     MotionInfillSFTDataset,
@@ -72,8 +74,21 @@ def read_split_file(path: Optional[str]) -> Optional[List[str]]:
     with open(path, "r", encoding="utf-8") as f:
         names = [line.strip() for line in f if line.strip()]
 
-    # Some split files may include extensions. The token loaders expect the stem.
-    return [Path(name).stem for name in names]
+    # Preserve nested relative paths from the dataset split, e.g.
+    #   fbx_to_json_data_susu_chonglu/20260115/Human_4_73_02_A
+    #
+    # Do not use Path(name).stem here: it would drop the parent folders and turn
+    # the example above into only "Human_4_73_02_A", which cannot match nested
+    # token files under motion_token_data/ or audio_tokens_*/.
+    normalized = []
+    for name in names:
+        name = name.replace("\\", "/").strip().strip("/")
+        suffix = Path(name).suffix
+        if suffix in {".wav", ".npy", ".json"}:
+            name = name[: -len(suffix)]
+        normalized.append(name)
+
+    return normalized
 
 
 def load_token_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -141,7 +156,11 @@ def load_action_text_map(path: Optional[str]) -> Dict[str, str]:
     for name, raw_text in motion2text.items():
         action_text = extract_action_text(raw_text)
         if action_text:
-            result[Path(name).stem] = action_text
+            normalized = name.replace("\\", "/").strip().strip("/")
+            suffix = Path(normalized).suffix
+            if suffix in {".wav", ".npy", ".json"}:
+                normalized = normalized[: -len(suffix)]
+            result[normalized] = action_text
 
     return result
 
@@ -161,8 +180,14 @@ def discover_names(
     if split_names is not None:
         names = list(split_names)
     else:
-        motion_names = {path.stem for path in motion_token_dir.glob("*.json")}
-        audio_names = {path.stem for path in audio_token_dir.glob("*.json")}
+        motion_names = {
+            path.relative_to(motion_token_dir).with_suffix("").as_posix()
+            for path in motion_token_dir.rglob("*.json")
+        }
+        audio_names = {
+            path.relative_to(audio_token_dir).with_suffix("").as_posix()
+            for path in audio_token_dir.rglob("*.json")
+        }
         names = sorted(motion_names & audio_names)
 
     available = []
@@ -295,6 +320,25 @@ def parse_args() -> argparse.Namespace:
         help="Sparse keyframe spacing; step=4 predicts 3 middle frames",
     )
     parser.add_argument(
+        "--min_history_frames",
+        type=int,
+        default=0,
+        help="Minimum number of GT history frames in each rolling-context prompt",
+    )
+    parser.add_argument(
+        "--max_history_frames",
+        type=int,
+        default=8,
+        help="Maximum number of GT history frames in each rolling-context prompt",
+    )
+    parser.add_argument(
+        "--history_source",
+        type=str,
+        default="gt",
+        choices=["gt"],
+        help="History source for baseline training. Later: mixed/generated.",
+    )
+    parser.add_argument(
         "--audio_fps",
         type=float,
         default=None,
@@ -335,6 +379,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--save_adapter_only",
+        action="store_true",
+        help=(
+            "With --use_lora, save only the PEFT adapter. By default LoRA is "
+            "merged into the base model so output_dir can be served directly "
+            "by vllm_server.py."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -389,7 +442,11 @@ def main() -> None:
         step=args.step,
         audio_fps=args.audio_fps,
         motion_fps=args.motion_fps,
+        min_history_frames=args.min_history_frames,
+        max_history_frames=args.max_history_frames,
+        history_source=args.history_source,
         max_windows_per_sequence=args.max_windows_per_sequence,
+        seed=args.seed,
     )
     eval_dataset = None
     if eval_sequences:
@@ -398,7 +455,11 @@ def main() -> None:
             step=args.step,
             audio_fps=args.audio_fps,
             motion_fps=args.motion_fps,
+            min_history_frames=args.min_history_frames,
+            max_history_frames=args.max_history_frames,
+            history_source=args.history_source,
             max_windows_per_sequence=args.max_windows_per_sequence,
+            seed=args.seed + 1,
         )
 
     if len(train_dataset) == 0:
@@ -414,6 +475,7 @@ def main() -> None:
     print(f"Train windows:    {len(train_dataset)}")
     if eval_dataset is not None:
         print(f"Eval windows:     {len(eval_dataset)}")
+    print(f"History frames:   {args.min_history_frames}-{args.max_history_frames} ({args.history_source})")
     print(f"LoRA:             {args.use_lora}")
     print("=" * 70)
 
@@ -432,13 +494,27 @@ def main() -> None:
         device_map=None,
         gradient_checkpointing=args.gradient_checkpointing,
     )
+    added_role_tokens = ensure_infill_special_tokens(tokenizer, model)
+    if added_role_tokens:
+        print(f"Added Step 2 role tokens to tokenizer: {added_role_tokens}")
 
     if args.use_lora:
+        infill_role_token_ids = [
+            tokenizer.convert_tokens_to_ids(token)
+            for token in INFILL_ROLE_TOKENS
+        ]
+        if any(token_id is None or token_id < 0 for token_id in infill_role_token_ids):
+            raise RuntimeError(
+                "Failed to resolve one or more Step 2 role-token ids after "
+                "adding them to the tokenizer."
+            )
+
         model = maybe_enable_lora(
             model,
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
+            trainable_token_indices=infill_role_token_ids,
         )
         # Print PEFT trainable parameter count when available.
         if hasattr(model.lm, "print_trainable_parameters"):
@@ -490,7 +566,19 @@ def main() -> None:
     trainer.train()
 
     # Save model and tokenizer together so vllm_server.py can load this path.
-    trainer.save_model(args.output_dir)
+    if args.use_lora and not args.save_adapter_only:
+        if not hasattr(model.lm, "merge_and_unload"):
+            raise RuntimeError(
+                "LoRA model does not expose merge_and_unload(); cannot create "
+                "a standalone vLLM-ready checkpoint. Re-run with "
+                "--save_adapter_only to save the adapter instead."
+            )
+        merged_lm = model.lm.merge_and_unload()
+        merged_lm.save_pretrained(args.output_dir, safe_serialization=True)
+        print("Merged LoRA adapter into the base model for vLLM serving.")
+    else:
+        trainer.save_model(args.output_dir)
+
     tokenizer.save_pretrained(args.output_dir)
     print(f"Saved Step 2 infill checkpoint to: {args.output_dir}")
 

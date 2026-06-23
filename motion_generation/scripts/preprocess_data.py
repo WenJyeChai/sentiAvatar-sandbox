@@ -367,9 +367,12 @@ def main():
 
     print(f"\n{'=' * 60}")
     print(f"  预处理完成! 生成的中间数据:")
-    print(f"    - {args.data_dir}/audio_features_hubert_layer9_fps10/")
-    print(f"    - {args.data_dir}/audio_tokens_hubert_layer9_fps10/")
-    print(f"    - {args.data_dir}/motion_token_data/")
+    if args.all or args.audio:
+        audio_fps_tag = _format_fps_for_dir(args.audio_fps)
+        print(f"    - {args.data_dir}/audio_features_hubert_layer9_fps{audio_fps_tag}/")
+        print(f"    - {args.data_dir}/audio_tokens_hubert_layer9_fps{audio_fps_tag}/")
+    if args.all or args.motion:
+        print(f"    - {args.data_dir}/motion_token_data/")
     print(f"{'=' * 60}")
 
 

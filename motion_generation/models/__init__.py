@@ -6,6 +6,7 @@ except ModuleNotFoundError:
 
 try:
     from .vllm_infill_model import (
+        ensure_infill_special_tokens,
         MotionInfillCausalLM,
         MotionInfillCollator,
         MotionInfillSFTDataset,
@@ -13,6 +14,7 @@ try:
         maybe_enable_lora,
     )
 except ModuleNotFoundError:
+    ensure_infill_special_tokens = None
     MotionInfillCausalLM = None
     MotionInfillCollator = None
     MotionInfillSFTDataset = None

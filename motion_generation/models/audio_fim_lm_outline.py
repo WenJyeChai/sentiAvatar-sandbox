@@ -7,6 +7,10 @@ each segment should do.  Fill in the actual tensor operations, modules, and loss
 logic when you are ready to build the model.
 """
 
+import torch
+import torch.nn as nn
+import math
+
 
 class AudioFIMConfig:
     """
@@ -175,6 +179,7 @@ class AudioFIMEmbeddings:
         audio_frame_ids=None,
         gap_ids=None,
     ):
+    
         # Sum or combine token, position, segment, gap, and audio embeddings.
         pass
 
@@ -205,22 +210,42 @@ class CachedSelfAttention:
 
     def forward(
         self,
-        hidden_states,
+        x,
         attention_mask=None,
         kv_cache=None,
         layer_idx=None,
-        cache_mode="full",
+        cache_start=None,
+        current_start=0,
+        updating_cache=False,
     ):
+
         # Route to full attention or cache-aware incremental attention.
+        r"""
+        if cache_start is None:
+            cache_start = current_start
+
+        def qkv_fn(x):
+            q = 
+            k =
+            v = 
+            return q, k, v
+
+        q, k, v = qkv_fn(x)
+
+        if kv_cache is None:
+
+        else:
+
+        """
         pass
 
-    def _forward_full(self, hidden_states, attention_mask=None):
-        # Training/no-cache path over the full transformed FIM sequence.
-        pass
+    # def _forward_full(self, hidden_states, attention_mask=None):
+    #     # Training/no-cache path over the full transformed FIM sequence.
+    #     pass
 
-    def _forward_cached(self, hidden_states, kv_cache, layer_idx, cache_mode):
-        # Inference path using cached K/V from prefix/suffix/audio/history.
-        pass
+    # def _forward_cached(self, hidden_states, kv_cache, layer_idx, cache_mode):
+    #     # Inference path using cached K/V from prefix/suffix/audio/history.
+    #     pass
 
 
 class AudioFIMBlock:
