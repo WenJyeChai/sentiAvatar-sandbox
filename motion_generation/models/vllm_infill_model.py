@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import random
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -401,12 +402,15 @@ class MotionInfillCollator:
         max_length: int = 2048,
         pad_to_multiple_of: Optional[int] = 8,
         debug_examples: int = 0,
+        profile_batches: int = 0,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.pad_to_multiple_of = pad_to_multiple_of
         self.debug_examples = debug_examples
         self._debug_examples_printed = 0
+        self.profile_batches = profile_batches
+        self._profile_batches_seen = 0
 
         if self.tokenizer.pad_token_id is None:
             # Qwen checkpoints often use eos/endoftext as padding. This keeps
@@ -525,7 +529,13 @@ class MotionInfillCollator:
         }
 
     def __call__(self, examples: Sequence[MotionInfillExample]) -> Dict[str, torch.Tensor]:
+        profile = (
+            self.profile_batches > 0
+            and self._profile_batches_seen < self.profile_batches
+        )
+        t0 = time.perf_counter() if profile else None
         encoded = [self._encode_one(example) for example in examples]
+        t_encoded = time.perf_counter() if profile else None
         max_len = max(len(item["input_ids"]) for item in encoded)
 
         if self.pad_to_multiple_of is not None:
@@ -543,11 +553,34 @@ class MotionInfillCollator:
             batch_attention_mask.append(item["attention_mask"] + [0] * pad_len)
             batch_labels.append(item["labels"] + [IGNORE_INDEX] * pad_len)
 
-        return {
+        batch = {
             "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(batch_attention_mask, dtype=torch.long),
             "labels": torch.tensor(batch_labels, dtype=torch.long),
         }
+
+        if profile:
+            t_done = time.perf_counter()
+            lengths = [len(item["input_ids"]) for item in encoded]
+            supervised = [
+                sum(1 for label in item["labels"] if label != IGNORE_INDEX)
+                for item in encoded
+            ]
+            print(
+                "[Collator profile] "
+                f"batch={self._profile_batches_seen + 1} "
+                f"examples={len(examples)} "
+                f"seq_len={max_len} "
+                f"raw_len_min/avg/max={min(lengths)}/"
+                f"{sum(lengths) / len(lengths):.1f}/{max(lengths)} "
+                f"labels_avg={sum(supervised) / len(supervised):.1f} "
+                f"encode_s={t_encoded - t0:.4f} "
+                f"pad_tensor_s={t_done - t_encoded:.4f} "
+                f"total_s={t_done - t0:.4f}"
+            )
+            self._profile_batches_seen += 1
+
+        return batch
 
 
 class MotionInfillCausalLM(nn.Module):

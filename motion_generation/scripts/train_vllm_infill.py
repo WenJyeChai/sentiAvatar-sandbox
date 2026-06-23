@@ -34,6 +34,8 @@ import random
 import re
 import shutil
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -63,6 +65,23 @@ def format_fps_for_dir(fps: float) -> str:
     if float(fps).is_integer():
         return str(int(fps))
     return str(fps).replace(".", "p")
+
+
+@contextmanager
+def timed_stage(name: str, enabled: bool = True):
+    """Print wall-clock timing for a coarse training setup stage."""
+
+    if not enabled:
+        yield
+        return
+
+    start = time.perf_counter()
+    print(f"[Timing] {name} ...")
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        print(f"[Timing] {name}: {elapsed:.3f}s")
 
 
 def read_split_file(path: Optional[str]) -> Optional[List[str]]:
@@ -377,6 +396,17 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Print token-count breakdowns for the first N collated examples.",
     )
+    parser.add_argument(
+        "--profile_startup",
+        action="store_true",
+        help="Print wall-clock timings for data/model/trainer setup stages.",
+    )
+    parser.add_argument(
+        "--profile_collator_batches",
+        type=int,
+        default=0,
+        help="Print tokenization/padding timing for the first N collator batches.",
+    )
 
     # Training.
     parser.add_argument("--seed", type=int, default=42)
@@ -426,6 +456,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    run_start = time.perf_counter()
 
     data_dir = Path(args.data_dir)
     motion_token_dir = Path(args.motion_token_dir or data_dir / "motion_token_data")
@@ -438,51 +469,48 @@ def main() -> None:
         data_dir / "text_data/motion2text.json"
     )
 
-    action_text_map = load_action_text_map(motion2text_json)
+    with timed_stage("load action text map", args.profile_startup):
+        action_text_map = load_action_text_map(motion2text_json)
 
-    train_split_names = read_split_file(args.train_split_file)
-    train_names = discover_names(motion_token_dir, audio_token_dir, train_split_names)
-    train_sequences = load_sequences(
-        train_names,
-        motion_token_dir,
-        audio_token_dir,
-        action_text_map,
-        max_samples=args.max_samples,
-    )
+    with timed_stage("read/discover train split", args.profile_startup):
+        train_split_names = read_split_file(args.train_split_file)
+        train_names = discover_names(
+            motion_token_dir, audio_token_dir, train_split_names
+        )
 
-    eval_sequences = None
-    eval_split_names = read_split_file(args.eval_split_file)
-    if eval_split_names is not None:
-        eval_names = discover_names(motion_token_dir, audio_token_dir, eval_split_names)
-        eval_sequences = load_sequences(
-            eval_names,
+    with timed_stage("load train token JSON sequences", args.profile_startup):
+        train_sequences = load_sequences(
+            train_names,
             motion_token_dir,
             audio_token_dir,
             action_text_map,
             max_samples=args.max_samples,
         )
-    else:
-        train_sequences, eval_sequences = split_train_eval(
-            train_sequences,
-            eval_ratio=args.eval_ratio,
-            seed=args.seed,
-        )
 
-    train_dataset = MotionInfillSFTDataset(
-        train_sequences,
-        step=args.step,
-        audio_fps=args.audio_fps,
-        motion_fps=args.motion_fps,
-        min_history_frames=args.min_history_frames,
-        max_history_frames=args.max_history_frames,
-        history_source=args.history_source,
-        max_windows_per_sequence=args.max_windows_per_sequence,
-        seed=args.seed,
-    )
-    eval_dataset = None
-    if eval_sequences:
-        eval_dataset = MotionInfillSFTDataset(
-            eval_sequences,
+    eval_sequences = None
+    with timed_stage("read/load eval split", args.profile_startup):
+        eval_split_names = read_split_file(args.eval_split_file)
+        if eval_split_names is not None:
+            eval_names = discover_names(
+                motion_token_dir, audio_token_dir, eval_split_names
+            )
+            eval_sequences = load_sequences(
+                eval_names,
+                motion_token_dir,
+                audio_token_dir,
+                action_text_map,
+                max_samples=args.max_samples,
+            )
+        else:
+            train_sequences, eval_sequences = split_train_eval(
+                train_sequences,
+                eval_ratio=args.eval_ratio,
+                seed=args.seed,
+            )
+
+    with timed_stage("build train infill windows", args.profile_startup):
+        train_dataset = MotionInfillSFTDataset(
+            train_sequences,
             step=args.step,
             audio_fps=args.audio_fps,
             motion_fps=args.motion_fps,
@@ -490,8 +518,22 @@ def main() -> None:
             max_history_frames=args.max_history_frames,
             history_source=args.history_source,
             max_windows_per_sequence=args.max_windows_per_sequence,
-            seed=args.seed + 1,
+            seed=args.seed,
         )
+    eval_dataset = None
+    if eval_sequences:
+        with timed_stage("build eval infill windows", args.profile_startup):
+            eval_dataset = MotionInfillSFTDataset(
+                eval_sequences,
+                step=args.step,
+                audio_fps=args.audio_fps,
+                motion_fps=args.motion_fps,
+                min_history_frames=args.min_history_frames,
+                max_history_frames=args.max_history_frames,
+                history_source=args.history_source,
+                max_windows_per_sequence=args.max_windows_per_sequence,
+                seed=args.seed + 1,
+            )
 
     if len(train_dataset) == 0:
         raise RuntimeError("No training windows were built. Check data paths/splits.")
@@ -510,11 +552,14 @@ def main() -> None:
     print(f"LoRA:             {args.use_lora}")
     print("=" * 70)
 
-    tokenizer = load_tokenizer_for_infill(args.base_model_path)
+    with timed_stage("load tokenizer", args.profile_startup):
+        tokenizer = load_tokenizer_for_infill(args.base_model_path)
+
     collator = MotionInfillCollator(
         tokenizer,
         max_length=args.max_length,
         debug_examples=args.debug_tokenization_examples,
+        profile_batches=args.profile_collator_batches,
     )
 
     torch_dtype = None
@@ -523,45 +568,52 @@ def main() -> None:
     elif args.fp16:
         torch_dtype = torch.float16
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model_path,
-        torch_dtype=torch_dtype,
-        device_map=None,
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    model.config.use_cache = False
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+    with timed_stage("load base model", args.profile_startup):
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model_path,
+            torch_dtype=torch_dtype,
+            device_map=None,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        model.config.use_cache = False
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
 
-    added_role_tokens = ensure_infill_special_tokens(tokenizer, model)
+    with timed_stage("ensure infill role tokens", args.profile_startup):
+        added_role_tokens = ensure_infill_special_tokens(tokenizer, model)
     if added_role_tokens:
         print(f"Added Step 2 role tokens to tokenizer: {added_role_tokens}")
 
     if args.use_lora:
-        infill_role_token_ids = [
-            tokenizer.convert_tokens_to_ids(token)
-            for token in INFILL_ROLE_TOKENS
-        ]
-        if any(token_id is None or token_id < 0 for token_id in infill_role_token_ids):
-            raise RuntimeError(
-                "Failed to resolve one or more Step 2 role-token ids after "
-                "adding them to the tokenizer."
-            )
+        with timed_stage("configure LoRA", args.profile_startup):
+            infill_role_token_ids = [
+                tokenizer.convert_tokens_to_ids(token)
+                for token in INFILL_ROLE_TOKENS
+            ]
+            if any(
+                token_id is None or token_id < 0
+                for token_id in infill_role_token_ids
+            ):
+                raise RuntimeError(
+                    "Failed to resolve one or more Step 2 role-token ids after "
+                    "adding them to the tokenizer."
+                )
 
-        model = maybe_enable_lora(
-            model,
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            trainable_token_indices=infill_role_token_ids,
-        )
+            model = maybe_enable_lora(
+                model,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                trainable_token_indices=infill_role_token_ids,
+            )
         # Print PEFT trainable parameter count when available.
         if hasattr(model, "print_trainable_parameters"):
             model.print_trainable_parameters()
 
         if not args.skip_lora_save_preflight:
-            save_lora_adapter_preflight(model, args.output_dir)
+            with timed_stage("PEFT adapter save preflight", args.profile_startup):
+                save_lora_adapter_preflight(model, args.output_dir)
             print("PEFT adapter save preflight passed.")
     elif not args.full_finetune:
         print(
@@ -596,38 +648,43 @@ def main() -> None:
             }
         )
 
-    training_args = TrainingArguments(**training_args_kwargs)
+    with timed_stage("create TrainingArguments", args.profile_startup):
+        training_args = TrainingArguments(**training_args_kwargs)
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=collator,
-        tokenizer=tokenizer,
-    )
+    with timed_stage("create Trainer", args.profile_startup):
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=collator,
+            tokenizer=tokenizer,
+        )
 
-    trainer.train()
+    with timed_stage("trainer.train", True):
+        trainer.train()
 
     # Save model and tokenizer together so vllm_server.py can load this path.
-    if args.use_lora and not args.save_adapter_only:
-        trained_model = trainer.model
-        if not hasattr(trained_model, "merge_and_unload"):
-            raise RuntimeError(
-                "LoRA model does not expose merge_and_unload(); cannot create "
-                "a standalone vLLM-ready checkpoint. Re-run with "
-                "--save_adapter_only to save the adapter instead."
-            )
-        merged_lm = trained_model.merge_and_unload()
-        if hasattr(merged_lm, "tie_weights"):
-            merged_lm.tie_weights()
-        merged_lm.save_pretrained(args.output_dir, safe_serialization=True)
-        print("Merged LoRA adapter into the base model for vLLM serving.")
-    else:
-        trainer.save_model(args.output_dir)
+    with timed_stage("save model/tokenizer", True):
+        if args.use_lora and not args.save_adapter_only:
+            trained_model = trainer.model
+            if not hasattr(trained_model, "merge_and_unload"):
+                raise RuntimeError(
+                    "LoRA model does not expose merge_and_unload(); cannot "
+                    "create a standalone vLLM-ready checkpoint. Re-run with "
+                    "--save_adapter_only to save the adapter instead."
+                )
+            merged_lm = trained_model.merge_and_unload()
+            if hasattr(merged_lm, "tie_weights"):
+                merged_lm.tie_weights()
+            merged_lm.save_pretrained(args.output_dir, safe_serialization=True)
+            print("Merged LoRA adapter into the base model for vLLM serving.")
+        else:
+            trainer.save_model(args.output_dir)
 
-    tokenizer.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
     print(f"Saved Step 2 infill checkpoint to: {args.output_dir}")
+    print(f"[Timing] total script runtime: {time.perf_counter() - run_start:.3f}s")
 
 
 if __name__ == "__main__":
