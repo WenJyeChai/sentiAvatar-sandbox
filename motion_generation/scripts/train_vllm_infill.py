@@ -306,6 +306,115 @@ def save_lora_adapter_preflight(model, output_dir: str) -> None:
             shutil.rmtree(preflight_dir)
 
 
+class ProfiledTrainer(Trainer):
+    """
+    Trainer with opt-in micro-batch timing for forward/loss vs backward.
+
+    HuggingFace's progress bar step is an optimizer update, which may contain
+    many gradient-accumulation micro-batches. This profiles the first N
+    micro-batches so slow forward/backward behavior is easier to localize.
+    """
+
+    def __init__(self, *args, profile_training_steps: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.profile_training_steps = max(0, int(profile_training_steps))
+        self._profile_microstep = 0
+        self._profile_active = False
+        self._profile_forward_loss_s = 0.0
+
+    @staticmethod
+    def _sync_cuda() -> None:
+        if not torch.cuda.is_available():
+            return
+
+        for device_idx in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(device_idx)
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        if not self._profile_active:
+            return self._compute_loss_compat(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                **kwargs,
+            )
+
+        self._sync_cuda()
+        start = time.perf_counter()
+        result = self._compute_loss_compat(
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            **kwargs,
+        )
+        self._sync_cuda()
+        self._profile_forward_loss_s += time.perf_counter() - start
+        return result
+
+    def _compute_loss_compat(self, model, inputs, return_outputs=False, **kwargs):
+        try:
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                **kwargs,
+            )
+        except TypeError:
+            # Older Transformers versions do not accept num_items_in_batch.
+            if "num_items_in_batch" not in kwargs:
+                raise
+            kwargs = dict(kwargs)
+            kwargs.pop("num_items_in_batch", None)
+            return super().compute_loss(
+                model,
+                inputs,
+                return_outputs=return_outputs,
+                **kwargs,
+            )
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        profile = self._profile_microstep < self.profile_training_steps
+        if not profile:
+            return super().training_step(model, inputs, *args, **kwargs)
+
+        input_ids = inputs.get("input_ids")
+        labels = inputs.get("labels")
+        batch_size = int(input_ids.shape[0]) if input_ids is not None else -1
+        seq_len = int(input_ids.shape[1]) if input_ids is not None else -1
+        supervised = None
+        if labels is not None:
+            supervised = int((labels != -100).sum().item())
+
+        self._profile_active = True
+        self._profile_forward_loss_s = 0.0
+        self._sync_cuda()
+        start = time.perf_counter()
+        try:
+            loss = super().training_step(model, inputs, *args, **kwargs)
+            self._sync_cuda()
+            total_s = time.perf_counter() - start
+        finally:
+            self._profile_active = False
+
+        forward_loss_s = self._profile_forward_loss_s
+        backward_overhead_s = max(0.0, total_s - forward_loss_s)
+        accum_steps = max(1, int(self.args.gradient_accumulation_steps))
+        accum_idx = (self._profile_microstep % accum_steps) + 1
+        print(
+            "[Training profile] "
+            f"micro_step={self._profile_microstep + 1} "
+            f"accum={accum_idx}/{accum_steps} "
+            f"batch={batch_size} "
+            f"seq_len={seq_len} "
+            f"labels={supervised if supervised is not None else 'n/a'} "
+            f"forward_loss_s={forward_loss_s:.4f} "
+            f"backward_overhead_s={backward_overhead_s:.4f} "
+            f"total_training_step_s={total_s:.4f}"
+        )
+        self._profile_microstep += 1
+        return loss
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fine-tune Step 2 autoregressive vLLM-compatible infill LLM"
@@ -406,6 +515,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Print tokenization/padding timing for the first N collator batches.",
+    )
+    parser.add_argument(
+        "--profile_training_steps",
+        type=int,
+        default=0,
+        help=(
+            "Print forward/loss and backward timing for the first N training "
+            "micro-batches."
+        ),
     )
 
     # Training.
@@ -652,13 +770,14 @@ def main() -> None:
         training_args = TrainingArguments(**training_args_kwargs)
 
     with timed_stage("create Trainer", args.profile_startup):
-        trainer = Trainer(
+        trainer = ProfiledTrainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             data_collator=collator,
             tokenizer=tokenizer,
+            profile_training_steps=args.profile_training_steps,
         )
 
     with timed_stage("trainer.train", True):
