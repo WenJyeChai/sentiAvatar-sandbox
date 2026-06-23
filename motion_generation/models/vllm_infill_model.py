@@ -732,10 +732,11 @@ def maybe_enable_lora(
     matrices.
 
     If Step 2 role tokens were newly added to the tokenizer, pass their token
-    ids through trainable_token_indices. Recent PEFT versions can train only
-    those embedding rows. Older PEFT versions fall back to modules_to_save for
-    embed_tokens/lm_head so the new token embeddings are still trainable and
-    saved with the adapter.
+    ids through trainable_token_indices. For Qwen-style tied embeddings, this
+    helper deliberately trains/saves embed_tokens and lm_head as full modules
+    instead of PEFT's token-index adapter. That is larger, but avoids
+    safetensors shared-memory failures when input embeddings and lm_head are
+    tied.
 
     Requires:
         pip install peft
@@ -771,7 +772,6 @@ def maybe_enable_lora(
         "target_modules": target_modules,
     }
 
-    config_fields = getattr(LoraConfig, "__dataclass_fields__", {})
     token_indices = (
         sorted({int(token_id) for token_id in trainable_token_indices})
         if trainable_token_indices
@@ -779,16 +779,12 @@ def maybe_enable_lora(
     )
 
     if token_indices:
-        if "trainable_token_indices" in config_fields:
-            config_kwargs["trainable_token_indices"] = token_indices
-        else:
-            fallback_modules = modules_to_save or ["embed_tokens", "lm_head"]
-            config_kwargs["modules_to_save"] = fallback_modules
-            print(
-                "[WARN] This PEFT version does not support "
-                "trainable_token_indices; training/saving full "
-                f"{fallback_modules} modules instead."
-            )
+        saved_modules = modules_to_save or ["embed_tokens", "lm_head"]
+        config_kwargs["modules_to_save"] = saved_modules
+        print(
+            "LoRA will train/save full modules for new Step 2 token embeddings: "
+            f"{saved_modules}"
+        )
     elif modules_to_save:
         config_kwargs["modules_to_save"] = modules_to_save
 
