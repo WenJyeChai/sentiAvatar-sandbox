@@ -321,7 +321,7 @@ class MotionInfillSFTDataset(Dataset):
         prompt structure.
         """
 
-        available = left_idx + 1
+        available = left_idx
         if available <= 0:
             return []
 
@@ -331,8 +331,8 @@ class MotionInfillSFTDataset(Dataset):
         if history_len == 0:
             return []
 
-        start = left_idx + 1 - history_len
-        return [list(frame) for frame in motion_tokens[start : left_idx + 1]]
+        start = left_idx - history_len
+        return [list(frame) for frame in motion_tokens[start:left_idx]]
 
     @staticmethod
     def _slice_middle_audio(
