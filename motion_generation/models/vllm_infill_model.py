@@ -542,6 +542,33 @@ class MotionInfillCausalLM(nn.Module):
             **kwargs,
         )
 
+    def gradient_checkpointing_enable(
+        self,
+        gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Delegate HuggingFace Trainer's gradient-checkpointing hook.
+
+        Trainer calls this method on the outer model. The actual implementation
+        lives on the wrapped causal LM, and older Transformers versions do not
+        accept gradient_checkpointing_kwargs.
+        """
+
+        if gradient_checkpointing_kwargs is None:
+            gradient_checkpointing_kwargs = {}
+
+        try:
+            self.lm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs=gradient_checkpointing_kwargs
+            )
+        except TypeError:
+            self.lm.gradient_checkpointing_enable()
+
+    def gradient_checkpointing_disable(self) -> None:
+        """Delegate HuggingFace Trainer's disable hook to the wrapped LM."""
+
+        self.lm.gradient_checkpointing_disable()
+
     def save_pretrained(self, output_dir: str, **kwargs) -> None:
         """Save the Step 2 infill checkpoint in HuggingFace format."""
 
