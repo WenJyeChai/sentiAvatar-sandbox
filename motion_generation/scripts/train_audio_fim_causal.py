@@ -56,7 +56,6 @@ from configs.default_config import Config  # noqa: E402
 from models.rvqvae import RVQVAE  # noqa: E402
 from utils.constants import (  # noqa: E402
     BODY_JOINTS_ID,
-    KINEMATIC_CHAIN,
     LEFT_HAND_JOINTS_ID,
     RIGHT_HAND_JOINTS_ID,
 )
@@ -694,6 +693,8 @@ def render_decoded_motion_comparison_video(
     *,
     gt_positions: np.ndarray,
     pred_positions: np.ndarray,
+    skeleton_edges: Sequence[tuple[int, int]],
+    joint_names: Sequence[str],
     title: str,
     fps: int,
     source_frames: int,
@@ -734,21 +735,38 @@ def render_decoded_motion_comparison_video(
     gt_screen = to_screen(gt_2d, left_origin)
     pred_screen = to_screen(pred_2d, right_origin)
     frame_images: List[np.ndarray] = []
+    joint_count = max(
+        int(gt_screen.shape[1]) if gt_screen.ndim >= 2 else 0,
+        int(pred_screen.shape[1]) if pred_screen.ndim >= 2 else 0,
+        1,
+    )
+    valid_edges = [
+        (int(parent), int(child))
+        for parent, child in skeleton_edges
+        if 0 <= int(parent) < joint_count and 0 <= int(child) < joint_count
+    ]
+    name_to_idx = {name: idx for idx, name in enumerate(joint_names)}
+    marker_indices = [
+        name_to_idx[name]
+        for name in ("pelvis", "head", "hand_l", "hand_r", "foot_l", "foot_r")
+        if name in name_to_idx and name_to_idx[name] < joint_count
+    ]
+    if not marker_indices:
+        marker_indices = [0]
 
     def frame_at(seq: np.ndarray, idx: int) -> np.ndarray:
         if len(seq) == 0:
-            return np.zeros((63, 2), dtype=np.float32)
+            return np.zeros((joint_count, 2), dtype=np.float32)
         return seq[min(idx, len(seq) - 1)]
 
     def draw_skeleton(draw: ImageDraw.ImageDraw, points: np.ndarray, color: tuple[int, int, int]) -> None:
-        for chain in KINEMATIC_CHAIN:
-            for a, b in zip(chain, chain[1:]):
-                if a >= len(points) or b >= len(points):
-                    continue
-                ax, ay = points[a]
-                bx, by = points[b]
-                draw.line([(float(ax), float(ay)), (float(bx), float(by))], fill=color, width=4)
-        for joint_idx in (0, 3, 7, 16, 23, 24):
+        for parent, child in valid_edges:
+            if parent >= len(points) or child >= len(points):
+                continue
+            ax, ay = points[parent]
+            bx, by = points[child]
+            draw.line([(float(ax), float(ay)), (float(bx), float(by))], fill=color, width=4)
+        for joint_idx in marker_indices:
             if joint_idx >= len(points):
                 continue
             x, y = points[joint_idx]
@@ -1109,9 +1127,17 @@ class WandbEvalMotionVideoCallback(TrainerCallback):
                 token_acc = motion_token_accuracy(example.middle_motion, pred_middle)
                 middle_start = len(example.history_motion) + 1
                 middle_end = middle_start + len(example.middle_motion)
+                joint_names = list(getattr(self._postprocesser.anim, "names", []))
+                skeleton_edges = [
+                    (int(parent), int(child))
+                    for child, parent in enumerate(self._postprocesser.anim.parents)
+                    if int(parent) >= 0
+                ]
                 video = render_decoded_motion_comparison_video(
                     gt_positions=gt_positions,
                     pred_positions=pred_positions,
+                    skeleton_edges=skeleton_edges,
+                    joint_names=joint_names,
                     title=(
                         f"{example.name} | step {state.global_step} | "
                         f"middle token acc {token_acc:.3f}"
