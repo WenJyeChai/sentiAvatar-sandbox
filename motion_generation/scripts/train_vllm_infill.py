@@ -84,6 +84,34 @@ def timed_stage(name: str, enabled: bool = True):
         print(f"[Timing] {name}: {elapsed:.3f}s")
 
 
+def configure_wandb(args: argparse.Namespace, default_run_name: str) -> Optional[str]:
+    """Configure optional Weights & Biases logging for HuggingFace Trainer."""
+
+    if args.report_to != "wandb":
+        return None
+
+    try:
+        import wandb  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "W&B logging requested with --report_to wandb, but wandb is not "
+            "installed. Install wandb or run with --report_to none."
+        ) from exc
+
+    if args.wandb_project:
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+    if args.wandb_entity:
+        os.environ["WANDB_ENTITY"] = args.wandb_entity
+    if args.wandb_run_name:
+        os.environ["WANDB_NAME"] = args.wandb_run_name
+    if args.wandb_tags:
+        os.environ["WANDB_TAGS"] = args.wandb_tags
+    if args.wandb_mode:
+        os.environ["WANDB_MODE"] = args.wandb_mode
+
+    return args.wandb_run_name or default_run_name
+
+
 def read_split_file(path: Optional[str]) -> Optional[List[str]]:
     """Read a split file containing one sample name per line."""
 
@@ -539,6 +567,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--save_total_limit", type=int, default=3)
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="none",
+        choices=["none", "wandb"],
+        help="Trainer reporting backend. Use 'wandb' to enable W&B logging.",
+    )
+    parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        default=None,
+        help="Comma-separated W&B tags, e.g. vllm_infill,lora,step2.",
+    )
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default=None,
+        choices=["online", "offline", "disabled"],
+        help="Optional W&B mode. Use offline when the server has no network.",
+    )
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--gradient_checkpointing", action="store_true")
@@ -656,6 +707,14 @@ def main() -> None:
     if len(train_dataset) == 0:
         raise RuntimeError("No training windows were built. Check data paths/splits.")
 
+    finetune_mode = "lora" if args.use_lora else "full"
+    default_run_name = (
+        f"vllm_infill_{finetune_mode}_"
+        f"step{args.step}_"
+        f"afps{format_fps_for_dir(args.audio_fps or 10.0)}"
+    )
+    wandb_run_name = configure_wandb(args, default_run_name)
+
     print("=" * 70)
     print("Step 2 vLLM-compatible infill training")
     print(f"Base model:       {args.base_model_path}")
@@ -668,6 +727,9 @@ def main() -> None:
         print(f"Eval windows:     {len(eval_dataset)}")
     print(f"History frames:   {args.min_history_frames}-{args.max_history_frames} ({args.history_source})")
     print(f"LoRA:             {args.use_lora}")
+    print(f"Report to:        {args.report_to}")
+    if wandb_run_name:
+        print(f"W&B run:          {wandb_run_name}")
     print("=" * 70)
 
     with timed_stage("load tokenizer", args.profile_startup):
@@ -755,8 +817,10 @@ def main() -> None:
         "fp16": args.fp16,
         "gradient_checkpointing": args.gradient_checkpointing,
         "remove_unused_columns": False,
-        "report_to": "none",
+        "report_to": args.report_to,
     }
+    if wandb_run_name:
+        training_args_kwargs["run_name"] = wandb_run_name
 
     if eval_dataset is not None and len(eval_dataset) > 0:
         training_args_kwargs.update(
