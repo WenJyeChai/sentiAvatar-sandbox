@@ -51,6 +51,7 @@ from models.audio_fim_causal_model import (  # noqa: E402
     AudioFIMCausalDataset,
     AudioFIMCausalLM,
     AudioFIMTokenMapper,
+    IGNORE_INDEX,
 )
 from configs.default_config import Config  # noqa: E402
 from models.rvqvae import RVQVAE  # noqa: E402
@@ -855,6 +856,282 @@ def motion_token_accuracy(
     return matches / max(1, total)
 
 
+def safe_div(numerator: int | float, denominator: int | float) -> float:
+    return float(numerator) / float(denominator) if denominator else 0.0
+
+
+def evenly_spaced_indices(length: int, count: int) -> List[int]:
+    length = int(length)
+    count = max(0, int(count))
+    if length <= 0 or count <= 0:
+        return []
+    if count >= length:
+        return list(range(length))
+    return np.linspace(0, length - 1, count, dtype=np.int64).tolist()
+
+
+class AudioFIMEvalMetricsCallback(TrainerCallback):
+    """Log stronger Step 2 eval metrics without materializing full eval logits."""
+
+    def __init__(
+        self,
+        *,
+        eval_dataset: AudioFIMCausalDataset,
+        collator: AudioFIMCausalCollator,
+        config: AudioFIMCausalConfig,
+        teacher_forced_examples: int,
+        teacher_forced_batch_size: int,
+        teacher_forced_every_n_evals: int,
+        generation_examples: int,
+        generation_every_n_evals: int,
+    ):
+        self.eval_dataset = eval_dataset
+        self.collator = collator
+        self.config = config
+        self.teacher_forced_indices = evenly_spaced_indices(
+            len(eval_dataset),
+            teacher_forced_examples,
+        )
+        self.teacher_forced_batch_size = max(1, int(teacher_forced_batch_size))
+        self.teacher_forced_every_n_evals = max(1, int(teacher_forced_every_n_evals))
+        self.generation_indices = evenly_spaced_indices(
+            len(eval_dataset),
+            generation_examples,
+        )
+        self.generation_every_n_evals = max(1, int(generation_every_n_evals))
+        self._eval_calls = 0
+
+    def _world_process_zero(self, state) -> bool:
+        return not hasattr(state, "is_world_process_zero") or state.is_world_process_zero
+
+    def _log(self, payload: Dict[str, float], step: int) -> None:
+        if not payload:
+            return
+
+        try:
+            import wandb
+        except ImportError:
+            wandb = None
+        if wandb is not None and wandb.run is not None:
+            wandb.log(payload, step=step)
+
+        preview_keys = [
+            "eval_metrics/teacher_token_acc",
+            "eval_metrics/teacher_top5_acc",
+            "eval_gen/token_acc_mean",
+            "eval_gen/exact_frame_acc",
+        ]
+        preview = ", ".join(
+            f"{key}={payload[key]:.4f}" for key in preview_keys if key in payload
+        )
+        if preview:
+            print(f"[AudioFIM eval metrics] step={step} {preview}")
+
+    @torch.no_grad()
+    def _teacher_forced_metrics(self, forward_model, device: torch.device) -> Dict[str, float]:
+        totals: Dict[str, int] = {
+            "tokens": 0,
+            "correct": 0,
+            "top5": 0,
+            "top10": 0,
+            "motion_tokens": 0,
+            "motion_correct": 0,
+            "eos": 0,
+            "eos_correct": 0,
+        }
+        for q_idx in range(self.config.num_quantizers):
+            totals[f"q{q_idx + 1}"] = 0
+            totals[f"q{q_idx + 1}_correct"] = 0
+
+        for start in range(0, len(self.teacher_forced_indices), self.teacher_forced_batch_size):
+            batch_indices = self.teacher_forced_indices[
+                start : start + self.teacher_forced_batch_size
+            ]
+            examples = [self.eval_dataset[idx] for idx in batch_indices]
+            batch = self.collator(examples)
+            batch = {
+                key: value.to(device)
+                for key, value in batch.items()
+                if isinstance(value, torch.Tensor)
+            }
+
+            outputs = forward_model(**batch)
+            logits = outputs.logits.detach()
+            labels = batch["labels"]
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            valid = shift_labels != IGNORE_INDEX
+            valid_count = int(valid.sum().item())
+            if valid_count == 0:
+                continue
+
+            pred_ids = shift_logits.argmax(dim=-1)
+            totals["tokens"] += valid_count
+            totals["correct"] += int((pred_ids[valid] == shift_labels[valid]).sum().item())
+
+            valid_logits = shift_logits[valid]
+            valid_labels = shift_labels[valid]
+            top_k = min(10, int(valid_logits.shape[-1]))
+            top_ids = valid_logits.topk(k=top_k, dim=-1).indices
+            totals["top5"] += int(
+                (top_ids[:, : min(5, top_k)] == valid_labels.unsqueeze(-1))
+                .any(dim=-1)
+                .sum()
+                .item()
+            )
+            totals["top10"] += int(
+                (top_ids == valid_labels.unsqueeze(-1)).any(dim=-1).sum().item()
+            )
+
+            motion_mask = valid & (
+                (shift_labels >= 0) & (shift_labels < self.config.motion_vocab_size)
+            )
+            motion_total = int(motion_mask.sum().item())
+            totals["motion_tokens"] += motion_total
+            if motion_total:
+                totals["motion_correct"] += int(
+                    (pred_ids[motion_mask] == shift_labels[motion_mask]).sum().item()
+                )
+
+            eos_mask = valid & (shift_labels == self.config.eos_token_id)
+            eos_total = int(eos_mask.sum().item())
+            totals["eos"] += eos_total
+            if eos_total:
+                totals["eos_correct"] += int(
+                    (pred_ids[eos_mask] == shift_labels[eos_mask]).sum().item()
+                )
+
+            for q_idx in range(self.config.num_quantizers):
+                start_id = q_idx * self.config.codebook_size
+                end_id = start_id + self.config.codebook_size
+                q_mask = valid & ((shift_labels >= start_id) & (shift_labels < end_id))
+                q_total = int(q_mask.sum().item())
+                totals[f"q{q_idx + 1}"] += q_total
+                if q_total:
+                    totals[f"q{q_idx + 1}_correct"] += int(
+                        (pred_ids[q_mask] == shift_labels[q_mask]).sum().item()
+                    )
+
+        metrics = {
+            "eval_metrics/teacher_examples": float(len(self.teacher_forced_indices)),
+            "eval_metrics/teacher_token_acc": safe_div(totals["correct"], totals["tokens"]),
+            "eval_metrics/teacher_motion_token_acc": safe_div(
+                totals["motion_correct"],
+                totals["motion_tokens"],
+            ),
+            "eval_metrics/teacher_top5_acc": safe_div(totals["top5"], totals["tokens"]),
+            "eval_metrics/teacher_top10_acc": safe_div(totals["top10"], totals["tokens"]),
+            "eval_metrics/teacher_eos_acc": safe_div(totals["eos_correct"], totals["eos"]),
+        }
+        for q_idx in range(self.config.num_quantizers):
+            metrics[f"eval_metrics/teacher_q{q_idx + 1}_acc"] = safe_div(
+                totals[f"q{q_idx + 1}_correct"],
+                totals[f"q{q_idx + 1}"],
+            )
+        return metrics
+
+    @torch.no_grad()
+    def _generation_metrics(self, base_model) -> Dict[str, float]:
+        totals: Dict[str, int] = {
+            "tokens": 0,
+            "correct": 0,
+            "frames": 0,
+            "exact_frames": 0,
+            "gaps": 0,
+            "exact_gaps": 0,
+        }
+        for q_idx in range(self.config.num_quantizers):
+            totals[f"q{q_idx + 1}"] = 0
+            totals[f"q{q_idx + 1}_correct"] = 0
+
+        for dataset_idx in self.generation_indices:
+            example = self.eval_dataset[dataset_idx]
+            pred_motion = base_model.generate_infill(
+                history_motion=example.history_motion,
+                left_anchor=example.left_anchor,
+                right_anchor=example.right_anchor,
+                middle_audio_features=example.middle_audio_features,
+                left_audio_feature=example.left_audio_feature,
+                right_audio_feature=example.right_audio_feature,
+                history_audio_features=example.history_audio_features,
+                temperature=0.0,
+            )
+            gap_exact = True
+            for frame_idx, gt_frame in enumerate(example.middle_motion):
+                pred_frame = pred_motion[frame_idx] if frame_idx < len(pred_motion) else []
+                frame_exact = len(gt_frame) == len(pred_frame)
+                for q_idx, gt_token in enumerate(gt_frame):
+                    if q_idx >= len(pred_frame):
+                        totals["tokens"] += 1
+                        totals[f"q{q_idx + 1}"] += 1
+                        frame_exact = False
+                        gap_exact = False
+                        continue
+                    match = int(gt_token) == int(pred_frame[q_idx])
+                    totals["tokens"] += 1
+                    totals["correct"] += int(match)
+                    totals[f"q{q_idx + 1}"] += 1
+                    totals[f"q{q_idx + 1}_correct"] += int(match)
+                    frame_exact = frame_exact and match
+                    gap_exact = gap_exact and match
+                totals["frames"] += 1
+                totals["exact_frames"] += int(frame_exact)
+            totals["gaps"] += 1
+            totals["exact_gaps"] += int(gap_exact)
+
+        metrics = {
+            "eval_gen/examples": float(len(self.generation_indices)),
+            "eval_gen/token_acc_mean": safe_div(totals["correct"], totals["tokens"]),
+            "eval_gen/exact_frame_acc": safe_div(
+                totals["exact_frames"],
+                totals["frames"],
+            ),
+            "eval_gen/exact_gap_acc": safe_div(totals["exact_gaps"], totals["gaps"]),
+        }
+        for q_idx in range(self.config.num_quantizers):
+            metrics[f"eval_gen/q{q_idx + 1}_acc"] = safe_div(
+                totals[f"q{q_idx + 1}_correct"],
+                totals[f"q{q_idx + 1}"],
+            )
+        return metrics
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        del args, control
+
+        if not self._world_process_zero(state):
+            return
+        if not self.teacher_forced_indices and not self.generation_indices:
+            return
+
+        self._eval_calls += 1
+        model = kwargs.get("model")
+        if model is None:
+            return
+
+        base_model = model.module if hasattr(model, "module") else model
+        device = next(base_model.parameters()).device
+        was_training = model.training
+        model.eval()
+        payload: Dict[str, float] = {}
+
+        if (
+            self.teacher_forced_indices
+            and self._eval_calls % self.teacher_forced_every_n_evals == 0
+        ):
+            payload.update(self._teacher_forced_metrics(base_model, device))
+
+        if (
+            self.generation_indices
+            and self._eval_calls % self.generation_every_n_evals == 0
+            and hasattr(base_model, "generate_infill")
+        ):
+            payload.update(self._generation_metrics(base_model))
+
+        self._log(payload, step=state.global_step)
+        if was_training:
+            model.train()
+
+
 class WandbEvalVideoCallback(TrainerCallback):
     """Log cheap GT-vs-pred token videos for fixed eval examples."""
 
@@ -1335,6 +1612,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--save_total_limit", type=int, default=3)
     parser.add_argument(
+        "--eval_metric_examples",
+        type=int,
+        default=0,
+        help=(
+            "Number of evenly-spaced eval windows for batched teacher-forced "
+            "token/top-k accuracy metrics. Set >0 to enable."
+        ),
+    )
+    parser.add_argument("--eval_metric_batch_size", type=int, default=256)
+    parser.add_argument(
+        "--eval_metric_every_n_evals",
+        type=int,
+        default=1,
+        help="Run teacher-forced eval metrics every N evaluation calls.",
+    )
+    parser.add_argument(
+        "--eval_gen_metric_examples",
+        type=int,
+        default=0,
+        help=(
+            "Number of evenly-spaced eval windows for greedy free-running "
+            "generation accuracy metrics. Set >0 to enable."
+        ),
+    )
+    parser.add_argument(
+        "--eval_gen_metric_every_n_evals",
+        type=int,
+        default=1,
+        help="Run free-running generation metrics every N evaluation calls.",
+    )
+    parser.add_argument(
         "--report_to",
         type=str,
         default="none",
@@ -1588,6 +1896,14 @@ def main() -> None:
             f"{args.wandb_motion_video_fps} fps, "
             f"every {args.wandb_motion_video_every_n_evals} eval(s)"
         )
+    if eval_dataset is not None and (
+        args.eval_metric_examples > 0 or args.eval_gen_metric_examples > 0
+    ):
+        print(
+            "Eval metrics:     "
+            f"teacher={args.eval_metric_examples} window(s), "
+            f"gen={args.eval_gen_metric_examples} window(s)"
+        )
     print("=" * 70)
 
     collator = AudioFIMCausalCollator(
@@ -1640,6 +1956,21 @@ def main() -> None:
         training_args = TrainingArguments(**training_args_kwargs)
 
     callbacks = []
+    if eval_dataset is not None and len(eval_dataset) > 0 and (
+        args.eval_metric_examples > 0 or args.eval_gen_metric_examples > 0
+    ):
+        callbacks.append(
+            AudioFIMEvalMetricsCallback(
+                eval_dataset=eval_dataset,
+                collator=collator,
+                config=config,
+                teacher_forced_examples=args.eval_metric_examples,
+                teacher_forced_batch_size=args.eval_metric_batch_size,
+                teacher_forced_every_n_evals=args.eval_metric_every_n_evals,
+                generation_examples=args.eval_gen_metric_examples,
+                generation_every_n_evals=args.eval_gen_metric_every_n_evals,
+            )
+        )
     if (
         args.report_to == "wandb"
         and args.wandb_log_eval_videos

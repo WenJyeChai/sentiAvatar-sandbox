@@ -93,7 +93,8 @@ Important note:
   - `res_2`
   - `res_3`
   - `res_4`
-- [ ] Add frame-level exact-match metric for the 3 generated middle frames.
+- [x] Add teacher-forced eval token/top-k/per-quantizer metrics.
+- [x] Add free-running eval token/per-quantizer/frame/gap metrics.
 - [ ] Consider masking logits by quantizer during training loss.
   - Current training predicts over the whole compact vocab.
   - Inference already restricts each generated token to the expected quantizer range.
