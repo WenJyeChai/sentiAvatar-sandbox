@@ -5,6 +5,21 @@ except ModuleNotFoundError:
     AudioMotionConfig = None
 
 try:
+    from .audio_fim_causal_model import (
+        AudioFIMCausalCollator,
+        AudioFIMCausalConfig,
+        AudioFIMCausalDataset,
+        AudioFIMCausalLM,
+        AudioFIMTokenMapper,
+    )
+except ModuleNotFoundError:
+    AudioFIMCausalCollator = None
+    AudioFIMCausalConfig = None
+    AudioFIMCausalDataset = None
+    AudioFIMCausalLM = None
+    AudioFIMTokenMapper = None
+
+try:
     from .vllm_infill_model import (
         ensure_infill_special_tokens,
         MotionInfillCausalLM,
