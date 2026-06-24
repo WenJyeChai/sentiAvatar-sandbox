@@ -657,6 +657,7 @@ def quat_motion_to_joint_positions(
 ) -> np.ndarray:
     from actions.postprocess import process_batch_data
     from utils.visualization_torch.Animation import positions_global
+    from utils.visualization_torch.Quaternions import Quaternions
 
     input_quat = torch.as_tensor(motion["quat"], dtype=torch.float32, device=device)
     input_offset = torch.as_tensor(motion["offset"], dtype=torch.float32, device=device)
@@ -681,7 +682,7 @@ def quat_motion_to_joint_positions(
     if final_root_pos is not None:
         current_pos[:, 0, :] = final_root_pos[0]
 
-    postprocesser.anim.rotations.qs = final_quats[0]
+    postprocesser.anim.rotations = Quaternions(final_quats[0])
     postprocesser.anim.positions = current_pos
     positions = positions_global(postprocesser.anim)
     if isinstance(positions, torch.Tensor):
