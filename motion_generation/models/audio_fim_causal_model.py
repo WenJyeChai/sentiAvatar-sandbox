@@ -127,11 +127,13 @@ class AudioFIMCausalConfig(PretrainedConfig):
         kwargs.pop("pad_token_id", None)
         kwargs.pop("bos_token_id", None)
         kwargs.pop("eos_token_id", None)
+        kwargs.pop("tie_word_embeddings", None)
 
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
+            tie_word_embeddings=False,
             **kwargs,
         )
 
