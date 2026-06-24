@@ -451,6 +451,10 @@ class AudioFIMCausalLM(PreTrainedModel):
         if audio_features.numel() == 0:
             return hidden_states
 
+        audio_features = audio_features.to(
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
         encoded_audio = self.audio_encoder(audio_features)
         valid = audio_frame_ids >= 0
         safe_ids = audio_frame_ids.clamp(min=0)
