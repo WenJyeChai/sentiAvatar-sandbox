@@ -800,7 +800,7 @@ class AudioFIMCausalDataset(Dataset):
         *,
         step: int = 4,
         audio_fps: float = 10.0,
-        motion_fps: float = 10.0,
+        motion_fps: float = 20.0,
         min_history_frames: int = 0,
         max_history_frames: int = 8,
         max_windows_per_sequence: Optional[int] = None,

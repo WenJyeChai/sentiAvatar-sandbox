@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
 import sys
@@ -171,7 +172,7 @@ def load_sequences(
     *,
     max_samples: Optional[int] = None,
     audio_fps: float = 10.0,
-    motion_fps: float = 10.0,
+    motion_fps: float = 20.0,
 ) -> List[Dict[str, Any]]:
     sequences: List[Dict[str, Any]] = []
 
@@ -231,6 +232,96 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     return total, trainable
 
 
+@torch.no_grad()
+def run_loss_sanity_check(
+    model: AudioFIMCausalLM,
+    dataset: AudioFIMCausalDataset,
+    collator: AudioFIMCausalCollator,
+    *,
+    num_examples: int,
+    use_bf16: bool,
+    use_fp16: bool,
+) -> None:
+    """
+    Print a first-batch CE/logit sanity check before Trainer takes over.
+
+    For vocab_size=2075, all-zero logits should give CE ~= log(2075)=7.637.
+    If zero-logit loss is normal but model loss is huge, inspect logit scale.
+    If zero-logit loss is huge, labels/shift/vocab are wrong.
+    """
+
+    was_training = model.training
+    model.eval()
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    dtype = None
+    if device.type == "cuda" and use_bf16:
+        dtype = torch.bfloat16
+    elif device.type == "cuda" and use_fp16:
+        dtype = torch.float16
+
+    if dtype is None:
+        model.to(device)
+    else:
+        model.to(device=device, dtype=dtype)
+
+    examples = [dataset[i] for i in range(min(num_examples, len(dataset)))]
+    batch = collator(examples)
+    batch = {
+        key: value.to(device)
+        for key, value in batch.items()
+        if isinstance(value, torch.Tensor)
+    }
+
+    outputs = model(**batch)
+    logits = outputs.logits.detach().float()
+    labels = batch["labels"]
+    shift_labels = labels[:, 1:].contiguous()
+    valid = shift_labels != -100
+    supervised = int(valid.sum().item())
+
+    zero_logits = torch.zeros(
+        logits[:, :-1, :].shape,
+        dtype=torch.float32,
+        device=device,
+    )
+    zero_loss = torch.nn.functional.cross_entropy(
+        zero_logits.view(-1, zero_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
+
+    target_ids = shift_labels[valid]
+    shared_embed_head = (
+        model.embed_tokens.weight.data_ptr() == model.out_head.weight.data_ptr()
+    )
+
+    print("=" * 70)
+    print("[AudioFIM loss sanity]")
+    print(f"examples:                    {len(examples)}")
+    print(f"seq_len:                     {batch['input_ids'].shape[1]}")
+    print(f"audio_bank_len:              {batch['audio_features'].shape[1]}")
+    print(f"supervised labels:           {supervised}")
+    print(f"target id min/max:           {int(target_ids.min())}/{int(target_ids.max())}")
+    print(f"vocab_size:                  {model.config.vocab_size}")
+    print(f"expected uniform CE:         {math.log(model.config.vocab_size):.4f}")
+    print(f"zero-logit CE:               {float(zero_loss.detach().cpu()):.4f}")
+    print(f"model CE:                    {float(outputs.loss.detach().float().cpu()):.4f}")
+    print(
+        "logits mean/std/min/max:     "
+        f"{float(logits.mean().cpu()):.4f}/"
+        f"{float(logits.std().cpu()):.4f}/"
+        f"{float(logits.min().cpu()):.4f}/"
+        f"{float(logits.max().cpu()):.4f}"
+    )
+    print(f"tie_word_embeddings config:  {model.config.tie_word_embeddings}")
+    print(f"embed/out_head share memory: {shared_embed_head}")
+    print("=" * 70)
+
+    if was_training:
+        model.train()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train compact Step 2 audio-aware causal FIM transformer"
@@ -264,11 +355,20 @@ def parse_args() -> argparse.Namespace:
         help="Classic gap uses step=4, predicting 3 middle frames.",
     )
     parser.add_argument("--audio_fps", type=float, default=10.0)
-    parser.add_argument("--motion_fps", type=float, default=10.0)
+    parser.add_argument("--motion_fps", type=float, default=20.0)
     parser.add_argument("--min_history_frames", type=int, default=0)
     parser.add_argument("--max_history_frames", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--debug_examples", type=int, default=0)
+    parser.add_argument(
+        "--debug_loss_sanity",
+        type=int,
+        default=0,
+        help=(
+            "Run a first-batch CE/logit sanity check on this many examples "
+            "before training. Use this when loss scale looks suspicious."
+        ),
+    )
     parser.add_argument("--profile_startup", action="store_true")
     parser.add_argument("--profile_collator_batches", type=int, default=0)
 
@@ -438,6 +538,11 @@ def main() -> None:
         f"vocab={config.vocab_size}"
     )
     print(f"Parameters:       {total_params:,} total / {trainable_params:,} trainable")
+    print(f"Tie embeddings:   {config.tie_word_embeddings}")
+    print(
+        "Shared emb/head:  "
+        f"{model.embed_tokens.weight.data_ptr() == model.out_head.weight.data_ptr()}"
+    )
     print("=" * 70)
 
     collator = AudioFIMCausalCollator(
@@ -446,6 +551,16 @@ def main() -> None:
         debug_examples=args.debug_examples,
         profile_batches=args.profile_collator_batches,
     )
+
+    if args.debug_loss_sanity > 0:
+        run_loss_sanity_check(
+            model,
+            train_dataset,
+            collator,
+            num_examples=args.debug_loss_sanity,
+            use_bf16=args.bf16,
+            use_fp16=args.fp16,
+        )
 
     training_args_kwargs = {
         "output_dir": args.output_dir,
