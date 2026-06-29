@@ -9,9 +9,10 @@ This model is intentionally separate from:
 
 Design target:
     Keep the original Step 2 transformer capacity roughly intact, but change
-    the training/inference direction to causal FIM:
+    the training/inference direction to causal FIM. The prompt uses masked
+    middle motion placeholders as audio carriers:
 
-        history + left anchor + right anchor + middle audio -> middle motion
+        history + left + masked middle slots + right -> middle motion
 
 Motion tokens use the old compact integer mapping. HuBERT audio remains a
 continuous feature stream and is projected into the transformer hidden space.
@@ -67,7 +68,8 @@ class AudioFIMCausalConfig(PretrainedConfig):
         hidden_size=512, num_layers=8, num_heads=16, intermediate_size=1536.
 
     The total parameter count is not forced to be bit-identical because this
-    model reserves extra special/length tokens for causal FIM prompts.
+    model reserves extra special/length tokens for causal FIM prompts. Some
+    special tokens are retained for compatibility with earlier prompt layouts.
     """
 
     model_type = "audio_fim_causal"
@@ -721,7 +723,7 @@ class AudioFIMSequenceBuilder:
             ),
         )
 
-        def add_history():
+        def add_history_left_context():
             append(self.config.history_token_id)
             for frame_idx, frame in enumerate(example.history_motion):
                 audio_id = (
@@ -732,14 +734,17 @@ class AudioFIMSequenceBuilder:
                 for token_id in self.mapper.motion_frame_to_ids(frame):
                     append(token_id, audio_id=audio_id)
 
-        section("history", add_history)
-
-        def add_left_anchor():
-            append(self.config.left_anchor_token_id)
             for token_id in self.mapper.motion_frame_to_ids(example.left_anchor):
                 append(token_id, audio_id=left_audio_id)
 
-        section("left_anchor", add_left_anchor)
+        section("history_left_context", add_history_left_context)
+
+        def add_middle_mask_placeholders():
+            for audio_id in middle_audio_local_ids:
+                for _ in range(self.config.num_quantizers):
+                    append(self.config.mask_token_id, audio_id=audio_id)
+
+        section("middle_mask_placeholders", add_middle_mask_placeholders)
 
         def add_right_anchor():
             append(self.config.right_anchor_token_id)
@@ -747,13 +752,6 @@ class AudioFIMSequenceBuilder:
                 append(token_id, audio_id=right_audio_id)
 
         section("right_anchor", add_right_anchor)
-
-        def add_middle_audio():
-            append(self.config.middle_audio_token_id)
-            for audio_id in middle_audio_local_ids:
-                append(self.config.audio_frame_token_id, audio_id=audio_id)
-
-        section("middle_audio", add_middle_audio)
 
         section("middle_motion_marker", lambda: append(self.config.middle_motion_token_id))
 
