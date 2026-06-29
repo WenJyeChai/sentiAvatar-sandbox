@@ -186,8 +186,14 @@ def load_sequences(
     max_samples: Optional[int] = None,
     audio_fps: float = 10.0,
     motion_fps: float = 20.0,
+    motion_token_fps: Optional[float] = None,
+    motion_token_unit_length: float = 2.0,
 ) -> List[Dict[str, Any]]:
     sequences: List[Dict[str, Any]] = []
+    if motion_token_unit_length <= 0:
+        raise ValueError("motion_token_unit_length must be > 0")
+    if motion_token_fps is not None and motion_token_fps <= 0:
+        raise ValueError("motion_token_fps must be > 0")
 
     for name in names:
         if max_samples is not None and len(sequences) >= max_samples:
@@ -209,12 +215,25 @@ def load_sequences(
         if audio_features.ndim != 2 or audio_features.shape[0] == 0:
             continue
 
+        source_motion_fps = float(motion_payload.get("fps") or motion_fps)
+        if source_motion_fps <= 0:
+            continue
+
+        token_motion_fps = (
+            float(motion_token_fps)
+            if motion_token_fps is not None
+            else source_motion_fps / float(motion_token_unit_length)
+        )
+
         sequences.append(
             {
                 "name": name,
                 "motion_tokens": motion_tokens,
                 "audio_features": audio_features,
-                "motion_fps": motion_payload.get("fps") or motion_fps,
+                "source_motion_fps": source_motion_fps,
+                "motion_token_unit_length": float(motion_token_unit_length),
+                "motion_token_fps": token_motion_fps,
+                "motion_fps": token_motion_fps,
                 "audio_fps": audio_fps,
                 "action_text": action_text_map.get(name),
             }
@@ -478,6 +497,31 @@ def load_rvqvae_config_from_checkpoint(checkpoint_path: Path) -> Config:
     config.eval_dir = os.path.join(config.save_root, "animation")
     config.log_path = os.path.join(config.log_dir, config.dataset_name, config.name)
     return config
+
+
+def resolve_motion_token_unit_length(
+    requested_unit_length: Optional[float],
+    rvqvae_ckpt: Path,
+) -> tuple[float, str]:
+    if requested_unit_length is not None:
+        if requested_unit_length <= 0:
+            raise ValueError("--motion_token_unit_length must be > 0")
+        return float(requested_unit_length), "cli"
+
+    try:
+        rvq_config = load_rvqvae_config_from_checkpoint(rvqvae_ckpt)
+        unit_length = float(getattr(rvq_config, "unit_length", 0) or 0)
+        if unit_length <= 0:
+            unit_length = float(rvq_config.model.down_t * 2)
+        if unit_length <= 0:
+            raise ValueError(f"invalid RVQVAE unit_length={unit_length}")
+        return unit_length, "rvqvae_config"
+    except Exception as exc:
+        print(
+            "[Motion token timing] Could not read RVQVAE unit length from "
+            f"{rvqvae_ckpt}: {exc}. Falling back to 2."
+        )
+        return 2.0, "fallback"
 
 
 def load_rvqvae_model_for_eval(
@@ -1566,7 +1610,33 @@ def parse_args() -> argparse.Namespace:
         help="Classic gap uses step=4, predicting 3 middle frames.",
     )
     parser.add_argument("--audio_fps", type=float, default=10.0)
-    parser.add_argument("--motion_fps", type=float, default=20.0)
+    parser.add_argument(
+        "--motion_fps",
+        type=float,
+        default=20.0,
+        help=(
+            "Source/raw motion FPS fallback when motion token JSON has no fps. "
+            "Do not use this as codec-token FPS."
+        ),
+    )
+    parser.add_argument(
+        "--motion_token_fps",
+        type=float,
+        default=None,
+        help=(
+            "Explicit FPS of RVQVAE motion-token timesteps. If omitted, derive "
+            "from source motion FPS divided by --motion_token_unit_length."
+        ),
+    )
+    parser.add_argument(
+        "--motion_token_unit_length",
+        type=float,
+        default=None,
+        help=(
+            "Raw motion frames represented by one RVQVAE token timestep. If "
+            "omitted, read from the RVQVAE config when available, otherwise use 2."
+        ),
+    )
     parser.add_argument("--min_history_frames", type=int, default=0)
     parser.add_argument("--max_history_frames", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=512)
@@ -1727,6 +1797,10 @@ def main() -> None:
 
     if args.step - 1 > args.max_gap_frames:
         raise ValueError("--max_gap_frames must be >= --step - 1")
+    if args.audio_fps <= 0:
+        raise ValueError("--audio_fps must be > 0")
+    if args.motion_fps <= 0:
+        raise ValueError("--motion_fps must be > 0")
 
     data_dir = Path(args.data_dir)
     motion_token_dir = Path(args.motion_token_dir or data_dir / "motion_token_data")
@@ -1736,6 +1810,21 @@ def main() -> None:
         args.audio_feat_dir
         or data_dir / f"audio_features_hubert_layer9_fps{audio_fps_tag}"
     )
+    motion_token_unit_length, motion_token_unit_length_source = (
+        resolve_motion_token_unit_length(
+            args.motion_token_unit_length,
+            Path(args.rvqvae_ckpt),
+        )
+    )
+    if args.motion_token_fps is not None and args.motion_token_fps <= 0:
+        raise ValueError("--motion_token_fps must be > 0")
+    default_motion_token_fps = (
+        float(args.motion_token_fps)
+        if args.motion_token_fps is not None
+        else float(args.motion_fps) / float(motion_token_unit_length)
+    )
+    if default_motion_token_fps <= 0:
+        raise ValueError("Derived motion token FPS must be > 0")
     motion2text_json = args.motion2text_json or str(
         data_dir / "text_data/motion2text.json"
     )
@@ -1778,6 +1867,8 @@ def main() -> None:
             max_samples=args.max_samples,
             audio_fps=args.audio_fps,
             motion_fps=args.motion_fps,
+            motion_token_fps=args.motion_token_fps,
+            motion_token_unit_length=motion_token_unit_length,
         )
 
     eval_sequences = None
@@ -1797,6 +1888,8 @@ def main() -> None:
                 max_samples=args.max_samples,
                 audio_fps=args.audio_fps,
                 motion_fps=args.motion_fps,
+                motion_token_fps=args.motion_token_fps,
+                motion_token_unit_length=motion_token_unit_length,
             )
         else:
             train_sequences, eval_sequences = split_train_eval(
@@ -1810,7 +1903,7 @@ def main() -> None:
             train_sequences,
             step=args.step,
             audio_fps=args.audio_fps,
-            motion_fps=args.motion_fps,
+            motion_fps=default_motion_token_fps,
             min_history_frames=args.min_history_frames,
             max_history_frames=args.max_history_frames,
             max_windows_per_sequence=args.max_windows_per_sequence,
@@ -1824,7 +1917,7 @@ def main() -> None:
                 eval_sequences,
                 step=args.step,
                 audio_fps=args.audio_fps,
-                motion_fps=args.motion_fps,
+                motion_fps=default_motion_token_fps,
                 min_history_frames=args.min_history_frames,
                 max_history_frames=args.max_history_frames,
                 max_windows_per_sequence=args.max_windows_per_sequence,
@@ -1854,7 +1947,7 @@ def main() -> None:
     default_run_name = (
         f"audio_fim_causal_step{args.step}_"
         f"afps{format_fps_for_dir(args.audio_fps)}_"
-        f"mfps{format_fps_for_dir(args.motion_fps)}"
+        f"mtokfps{format_fps_for_dir(default_motion_token_fps)}"
     )
     wandb_run_name = configure_wandb(args, default_run_name)
 
@@ -1866,6 +1959,24 @@ def main() -> None:
         print(f"Motion data:      {motion_data_dir}")
         print(f"RVQVAE decode:    {args.rvqvae_ckpt}")
     print(f"Audio features:   {audio_feat_dir}")
+    print(f"Audio FPS:        {args.audio_fps:g}")
+    print(f"Source motion FPS fallback: {args.motion_fps:g}")
+    print(
+        "Motion token unit length: "
+        f"{motion_token_unit_length:g} ({motion_token_unit_length_source})"
+    )
+    if args.motion_token_fps is None:
+        print(
+            "Motion token FPS: "
+            f"derived per sequence from json/source fps / {motion_token_unit_length:g} "
+            f"(fallback {default_motion_token_fps:g})"
+        )
+    else:
+        print(f"Motion token FPS: {default_motion_token_fps:g} (cli override)")
+    print(
+        "Audio/token ratio fallback: "
+        f"{float(args.audio_fps) / float(default_motion_token_fps):.4g}"
+    )
     print(f"Train sequences:  {len(train_sequences)}")
     print(f"Train windows:    {len(train_dataset)}")
     if eval_dataset is not None:
