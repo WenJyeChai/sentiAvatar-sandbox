@@ -611,8 +611,11 @@ class AudioFIMCausalLM(PreTrainedModel):
             input_ids = torch.cat([input_ids, next_id], dim=1)
             attention_mask = torch.ones_like(input_ids)
 
-            middle_frame_idx = token_idx // self.config.num_quantizers
-            next_audio_id = encoded.middle_audio_local_ids[middle_frame_idx]
+            next_predict_idx = token_idx + 1
+            next_audio_id = -1
+            if next_predict_idx < total_motion_tokens:
+                middle_frame_idx = next_predict_idx // self.config.num_quantizers
+                next_audio_id = encoded.middle_audio_local_ids[middle_frame_idx]
             next_audio = torch.tensor(
                 [[next_audio_id]], dtype=torch.long, device=device
             )
@@ -753,18 +756,32 @@ class AudioFIMSequenceBuilder:
 
         section("right_anchor", add_right_anchor)
 
-        section("middle_motion_marker", lambda: append(self.config.middle_motion_token_id))
+        # Labels are next-token shifted, so each generation position carries
+        # audio for the token it is about to predict rather than its own token.
+        first_target_audio_id = middle_audio_local_ids[0] if middle_audio_local_ids else -1
+        section(
+            "middle_motion_marker",
+            lambda: append(
+                self.config.middle_motion_token_id,
+                audio_id=first_target_audio_id,
+            ),
+        )
 
         if include_targets:
             def add_targets():
+                flat_targets: List[Tuple[int, int]] = []
                 for frame_idx, frame in enumerate(example.middle_motion):
-                    audio_id = (
-                        middle_audio_local_ids[frame_idx]
-                        if frame_idx < len(middle_audio_local_ids)
-                        else -1
-                    )
                     for token_id in self.mapper.motion_frame_to_ids(frame):
-                        append(token_id, label=token_id, audio_id=audio_id)
+                        flat_targets.append((int(token_id), frame_idx))
+
+                for target_idx, (token_id, _) in enumerate(flat_targets):
+                    next_idx = target_idx + 1
+                    next_audio_id = -1
+                    if next_idx < len(flat_targets):
+                        next_frame_idx = flat_targets[next_idx][1]
+                        if next_frame_idx < len(middle_audio_local_ids):
+                            next_audio_id = middle_audio_local_ids[next_frame_idx]
+                    append(token_id, label=token_id, audio_id=next_audio_id)
                 append(self.config.eos_token_id, label=self.config.eos_token_id)
 
             section("target_motion", add_targets)

@@ -960,6 +960,9 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
             wandb.log(payload, step=step)
 
         preview_keys = [
+            "eval_metrics/teacher_ce",
+            "eval_metrics/teacher_zero_audio_ce",
+            "eval_metrics/teacher_audio_ce_delta",
             "eval_metrics/teacher_token_acc",
             "eval_metrics/teacher_top5_acc",
             "eval_gen/token_acc_mean",
@@ -980,12 +983,20 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
             "top10": 0,
             "motion_tokens": 0,
             "motion_correct": 0,
+            "zero_audio_correct": 0,
+            "zero_audio_motion_correct": 0,
             "eos": 0,
             "eos_correct": 0,
+        }
+        loss_sums: Dict[str, float] = {
+            "ce": 0.0,
+            "motion_ce": 0.0,
+            "zero_audio_ce": 0.0,
         }
         for q_idx in range(self.config.num_quantizers):
             totals[f"q{q_idx + 1}"] = 0
             totals[f"q{q_idx + 1}_correct"] = 0
+            loss_sums[f"q{q_idx + 1}_ce"] = 0.0
 
         for start in range(0, len(self.teacher_forced_indices), self.teacher_forced_batch_size):
             batch_indices = self.teacher_forced_indices[
@@ -1008,6 +1019,14 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
             valid_count = int(valid.sum().item())
             if valid_count == 0:
                 continue
+
+            token_losses = F.cross_entropy(
+                shift_logits.float().view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="none",
+            ).view_as(shift_labels)
+            loss_sums["ce"] += float(token_losses[valid].sum().item())
 
             pred_ids = shift_logits.argmax(dim=-1)
             totals["tokens"] += valid_count
@@ -1036,6 +1055,9 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
                 totals["motion_correct"] += int(
                     (pred_ids[motion_mask] == shift_labels[motion_mask]).sum().item()
                 )
+                loss_sums["motion_ce"] += float(
+                    token_losses[motion_mask].sum().item()
+                )
 
             eos_mask = valid & (shift_labels == self.config.eos_token_id)
             eos_total = int(eos_mask.sum().item())
@@ -1055,12 +1077,60 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
                     totals[f"q{q_idx + 1}_correct"] += int(
                         (pred_ids[q_mask] == shift_labels[q_mask]).sum().item()
                     )
+                    loss_sums[f"q{q_idx + 1}_ce"] += float(
+                        token_losses[q_mask].sum().item()
+                    )
+
+            zero_audio_batch = dict(batch)
+            zero_audio_batch["audio_features"] = torch.zeros_like(
+                batch["audio_features"]
+            )
+            zero_outputs = forward_model(**zero_audio_batch)
+            zero_shift_logits = zero_outputs.logits.detach()[:, :-1, :].contiguous()
+            zero_token_losses = F.cross_entropy(
+                zero_shift_logits.float().view(-1, zero_shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="none",
+            ).view_as(shift_labels)
+            loss_sums["zero_audio_ce"] += float(
+                zero_token_losses[valid].sum().item()
+            )
+
+            zero_pred_ids = zero_shift_logits.argmax(dim=-1)
+            totals["zero_audio_correct"] += int(
+                (zero_pred_ids[valid] == shift_labels[valid]).sum().item()
+            )
+            if motion_total:
+                totals["zero_audio_motion_correct"] += int(
+                    (zero_pred_ids[motion_mask] == shift_labels[motion_mask])
+                    .sum()
+                    .item()
+                )
+
+        teacher_ce = safe_div(loss_sums["ce"], totals["tokens"])
+        zero_audio_ce = safe_div(loss_sums["zero_audio_ce"], totals["tokens"])
+        teacher_acc = safe_div(totals["correct"], totals["tokens"])
+        zero_audio_acc = safe_div(totals["zero_audio_correct"], totals["tokens"])
 
         metrics = {
             "eval_metrics/teacher_examples": float(len(self.teacher_forced_indices)),
-            "eval_metrics/teacher_token_acc": safe_div(totals["correct"], totals["tokens"]),
+            "eval_metrics/teacher_ce": teacher_ce,
+            "eval_metrics/teacher_motion_ce": safe_div(
+                loss_sums["motion_ce"],
+                totals["motion_tokens"],
+            ),
+            "eval_metrics/teacher_zero_audio_ce": zero_audio_ce,
+            "eval_metrics/teacher_audio_ce_delta": zero_audio_ce - teacher_ce,
+            "eval_metrics/teacher_token_acc": teacher_acc,
+            "eval_metrics/teacher_zero_audio_token_acc": zero_audio_acc,
+            "eval_metrics/teacher_audio_acc_delta": teacher_acc - zero_audio_acc,
             "eval_metrics/teacher_motion_token_acc": safe_div(
                 totals["motion_correct"],
+                totals["motion_tokens"],
+            ),
+            "eval_metrics/teacher_zero_audio_motion_token_acc": safe_div(
+                totals["zero_audio_motion_correct"],
                 totals["motion_tokens"],
             ),
             "eval_metrics/teacher_top5_acc": safe_div(totals["top5"], totals["tokens"]),
@@ -1070,6 +1140,10 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
         for q_idx in range(self.config.num_quantizers):
             metrics[f"eval_metrics/teacher_q{q_idx + 1}_acc"] = safe_div(
                 totals[f"q{q_idx + 1}_correct"],
+                totals[f"q{q_idx + 1}"],
+            )
+            metrics[f"eval_metrics/teacher_q{q_idx + 1}_ce"] = safe_div(
+                loss_sums[f"q{q_idx + 1}_ce"],
                 totals[f"q{q_idx + 1}"],
             )
         return metrics
