@@ -412,24 +412,146 @@ def format_self_forcing_schedule(phases: Sequence[SelfForcingPhase]) -> str:
     return ";".join(chunks)
 
 
+@dataclass(frozen=True)
+class RVQCurriculumPhase:
+    start_value: float
+    start_is_percent: bool
+    active_quantizers: int
+
+
+def parse_rvq_curriculum_schedule(schedule: str) -> List[RVQCurriculumPhase]:
+    """
+    Parse an RVQ coarse-to-fine schedule.
+
+    Format:
+        start_step:active_quantizers;...
+
+    Example:
+        0%:1;20%:2;45%:3;70%:4
+
+    `active_quantizers` means how many RVQ levels contribute to the training
+    loss. For the default 4-level RVQ, 1 supervises only res_1 and 4 restores
+    the normal full loss.
+    """
+
+    if schedule is None:
+        schedule = ""
+    schedule = schedule.strip()
+    if schedule.lower() in {"", "off", "none", "full"}:
+        return []
+
+    phases: List[RVQCurriculumPhase] = []
+    for raw_phase in schedule.split(";"):
+        raw_phase = raw_phase.strip()
+        if not raw_phase:
+            continue
+        parts = raw_phase.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                "Invalid --rvq_curriculum_schedule phase "
+                f"{raw_phase!r}. Expected start:active_quantizers."
+            )
+
+        raw_start = parts[0].strip()
+        if raw_start.endswith("%"):
+            start_is_percent = True
+            start_value = float(raw_start[:-1].strip()) / 100.0
+            if not 0.0 <= start_value <= 1.0:
+                raise ValueError(
+                    "RVQ curriculum percentage phase starts must be in [0%, 100%]"
+                )
+        else:
+            start_is_percent = False
+            start_value = float(int(raw_start))
+            if start_value < 0:
+                raise ValueError("RVQ curriculum phase start_step must be >= 0")
+
+        active_quantizers = int(parts[1].strip())
+        if active_quantizers < 1:
+            raise ValueError("RVQ curriculum active_quantizers must be >= 1")
+
+        phases.append(
+            RVQCurriculumPhase(start_value, start_is_percent, active_quantizers)
+        )
+
+    if not phases:
+        return []
+
+    seen_starts = set()
+    for phase in phases:
+        start_key = (phase.start_is_percent, phase.start_value)
+        if start_key in seen_starts:
+            raise ValueError(
+                "Duplicate RVQ curriculum phase start "
+                f"{format_rvq_curriculum_phase_start(phase)}"
+            )
+        seen_starts.add(start_key)
+
+    has_zero_start = any(
+        (not phase.start_is_percent and phase.start_value == 0)
+        or (phase.start_is_percent and phase.start_value == 0.0)
+        for phase in phases
+    )
+    if not has_zero_start:
+        first = phases[0]
+        phases.insert(
+            0,
+            RVQCurriculumPhase(0.0, False, first.active_quantizers),
+        )
+
+    return phases
+
+
+def format_rvq_curriculum_phase_start(phase: RVQCurriculumPhase) -> str:
+    if phase.start_is_percent:
+        percent = phase.start_value * 100.0
+        if float(percent).is_integer():
+            return f"{int(percent)}%"
+        return f"{percent:g}%"
+    return str(int(phase.start_value))
+
+
+def format_rvq_curriculum_schedule(phases: Sequence[RVQCurriculumPhase]) -> str:
+    if not phases:
+        return "off/full"
+
+    chunks = []
+    for phase in phases:
+        chunks.append(
+            f"{format_rvq_curriculum_phase_start(phase)}:"
+            f"{phase.active_quantizers}"
+        )
+    return ";".join(chunks)
+
+
 class AudioFIMSelfForcingTrainer(Trainer):
-    """Trainer that can switch from teacher forcing to scheduled self-forcing."""
+    """Trainer with optional scheduled self-forcing and RVQ loss curriculum."""
 
     def __init__(
         self,
         *args,
         self_forcing_schedule: Optional[Sequence[SelfForcingPhase]] = None,
+        rvq_curriculum_schedule: Optional[Sequence[RVQCurriculumPhase]] = None,
+        rvq_curriculum_mask_inactive_inputs: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.self_forcing_schedule = list(
             self_forcing_schedule or [SelfForcingPhase(0.0, False, 0.0, ())]
         )
+        self.rvq_curriculum_schedule = list(rvq_curriculum_schedule or [])
+        self.rvq_curriculum_mask_inactive_inputs = bool(
+            rvq_curriculum_mask_inactive_inputs
+        )
         self._last_forcing_state: Dict[str, float] = {
             "active": 0.0,
             "prefix_len": -1.0,
             "phase_prob": 0.0,
             "phase_max_prefix": -1.0,
+        }
+        self._last_rvq_curriculum_state: Dict[str, float] = {
+            "active_quantizers": -1.0,
+            "masked_labels": 0.0,
         }
 
     def _phase_for_step(self, step: int) -> SelfForcingPhase:
@@ -457,12 +579,108 @@ class AudioFIMSelfForcingTrainer(Trainer):
             return 0 if phase.start_value <= 0 else 10**12
         return int(math.floor(float(total_steps) * float(phase.start_value)))
 
+    def _rvq_phase_for_step(self, step: int) -> Optional[RVQCurriculumPhase]:
+        if not self.rvq_curriculum_schedule:
+            return None
+
+        current = self.rvq_curriculum_schedule[0]
+        current_start = -1
+        for phase in self.rvq_curriculum_schedule:
+            start_step = self._rvq_phase_start_step(phase)
+            if int(step) >= start_step and start_step >= current_start:
+                current = phase
+                current_start = start_step
+        return current
+
+    def _rvq_phase_start_step(self, phase: RVQCurriculumPhase) -> int:
+        if not phase.start_is_percent:
+            return int(phase.start_value)
+
+        total_steps = self._total_training_steps()
+        if total_steps <= 0:
+            return 0 if phase.start_value <= 0 else 10**12
+        return int(math.floor(float(total_steps) * float(phase.start_value)))
+
     def _unwrap_config(self, model) -> AudioFIMCausalConfig:
         try:
             base_model = self.accelerator.unwrap_model(model)
         except Exception:
             base_model = getattr(model, "module", model)
         return base_model.config
+
+    def _active_quantizers_for_step(
+        self,
+        step: int,
+        config: AudioFIMCausalConfig,
+    ) -> int:
+        phase = self._rvq_phase_for_step(step)
+        if phase is None:
+            return int(config.num_quantizers)
+
+        active_quantizers = int(phase.active_quantizers)
+        if active_quantizers < 1 or active_quantizers > int(config.num_quantizers):
+            raise ValueError(
+                "RVQ curriculum active_quantizers must be in "
+                f"1..{config.num_quantizers}, got {active_quantizers}"
+            )
+        return active_quantizers
+
+    def _apply_rvq_curriculum_to_tensors(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        config: AudioFIMCausalConfig,
+        active_quantizers: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        if int(active_quantizers) >= int(config.num_quantizers):
+            return input_ids, labels, 0
+
+        motion_label_mask = (labels >= 0) & (labels < int(config.motion_vocab_size))
+        if not bool(motion_label_mask.any().item()):
+            return input_ids, labels, 0
+
+        quantizer_ids = torch.div(
+            labels.clamp_min(0),
+            int(config.codebook_size),
+            rounding_mode="floor",
+        )
+        inactive_mask = motion_label_mask & (
+            quantizer_ids >= int(active_quantizers)
+        )
+        masked_count = int(inactive_mask.sum().item())
+        if masked_count == 0:
+            return input_ids, labels, 0
+
+        labels = labels.clone()
+        labels[inactive_mask] = IGNORE_INDEX
+
+        if self.rvq_curriculum_mask_inactive_inputs:
+            input_ids = input_ids.clone()
+            input_ids[inactive_mask] = int(config.mask_token_id)
+
+        return input_ids, labels, masked_count
+
+    def _apply_rvq_curriculum_to_inputs(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        *,
+        config: AudioFIMCausalConfig,
+        active_quantizers: int,
+    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        input_ids, labels, masked_count = self._apply_rvq_curriculum_to_tensors(
+            inputs["input_ids"],
+            inputs["labels"],
+            config=config,
+            active_quantizers=active_quantizers,
+        )
+        if masked_count == 0:
+            return inputs, 0
+
+        masked_inputs = dict(inputs)
+        masked_inputs["input_ids"] = input_ids
+        masked_inputs["labels"] = labels
+        return masked_inputs, masked_count
 
     def _pad_token_sequences(
         self,
@@ -510,6 +728,7 @@ class AudioFIMSelfForcingTrainer(Trainer):
         model,
         inputs: Dict[str, torch.Tensor],
         requested_prefix_len: int,
+        active_quantizers: int,
     ):
         config = self._unwrap_config(model)
         input_ids = inputs["input_ids"]
@@ -652,6 +871,14 @@ class AudioFIMSelfForcingTrainer(Trainer):
             dtype=torch.long,
             device=device,
         )
+        train_input_ids, train_labels, masked_labels = (
+            self._apply_rvq_curriculum_to_tensors(
+                train_input_ids,
+                train_labels,
+                config=config,
+                active_quantizers=active_quantizers,
+            )
+        )
         outputs = model(
             input_ids=train_input_ids,
             attention_mask=train_attention_mask,
@@ -659,7 +886,7 @@ class AudioFIMSelfForcingTrainer(Trainer):
             audio_features=audio_features,
             audio_frame_ids=train_audio_frame_ids,
         )
-        return outputs.loss, outputs, prefix_len
+        return outputs.loss, outputs, prefix_len, masked_labels
 
     def compute_loss(
         self,
@@ -671,35 +898,56 @@ class AudioFIMSelfForcingTrainer(Trainer):
     ):
         del num_items_in_batch
         del kwargs
-        phase = self._phase_for_step(int(self.state.global_step))
+        global_step = int(self.state.global_step)
+        config = self._unwrap_config(model)
+        active_quantizers = self._active_quantizers_for_step(global_step, config)
+        phase = self._phase_for_step(global_step)
         max_prefix = max(phase.prefix_choices) if phase.prefix_choices else -1
 
         use_self_forcing = (
-            phase.self_force_prob > 0.0
+            bool(model.training)
+            and phase.self_force_prob > 0.0
             and bool(phase.prefix_choices)
             and random.random() < phase.self_force_prob
         )
         if not use_self_forcing:
-            outputs = model(**inputs)
+            active_for_loss = (
+                active_quantizers if bool(model.training) else int(config.num_quantizers)
+            )
+            loss_inputs, masked_labels = self._apply_rvq_curriculum_to_inputs(
+                inputs,
+                config=config,
+                active_quantizers=active_for_loss,
+            )
+            outputs = model(**loss_inputs)
             self._last_forcing_state = {
                 "active": 0.0,
                 "prefix_len": -1.0,
                 "phase_prob": float(phase.self_force_prob),
                 "phase_max_prefix": float(max_prefix),
             }
+            self._last_rvq_curriculum_state = {
+                "active_quantizers": float(active_for_loss),
+                "masked_labels": float(masked_labels),
+            }
             return (outputs.loss, outputs) if return_outputs else outputs.loss
 
         requested_prefix_len = random.choice(list(phase.prefix_choices))
-        loss, outputs, actual_prefix_len = self._compute_self_forcing_loss(
+        loss, outputs, actual_prefix_len, masked_labels = self._compute_self_forcing_loss(
             model,
             inputs,
             requested_prefix_len=requested_prefix_len,
+            active_quantizers=active_quantizers,
         )
         self._last_forcing_state = {
             "active": 1.0,
             "prefix_len": float(actual_prefix_len),
             "phase_prob": float(phase.self_force_prob),
             "phase_max_prefix": float(max_prefix),
+        }
+        self._last_rvq_curriculum_state = {
+            "active_quantizers": float(active_quantizers),
+            "masked_labels": float(masked_labels),
         }
         return (loss, outputs) if return_outputs else loss
 
@@ -708,6 +956,14 @@ class AudioFIMSelfForcingTrainer(Trainer):
         phase = self._phase_for_step(int(self.state.global_step))
         max_prefix = max(phase.prefix_choices) if phase.prefix_choices else -1
         phase_start_step = self._phase_start_step(phase)
+        config = self._unwrap_config(self.model)
+        rvq_phase = self._rvq_phase_for_step(int(self.state.global_step))
+        if rvq_phase is None:
+            rvq_phase_start_step = 0
+            active_quantizers = int(config.num_quantizers)
+        else:
+            rvq_phase_start_step = self._rvq_phase_start_step(rvq_phase)
+            active_quantizers = int(rvq_phase.active_quantizers)
         logs.setdefault("forcing/self_prob", float(phase.self_force_prob))
         logs.setdefault("forcing/max_prefix", float(max_prefix))
         logs.setdefault("forcing/phase_start_step", float(phase_start_step))
@@ -719,6 +975,22 @@ class AudioFIMSelfForcingTrainer(Trainer):
         logs.setdefault(
             "forcing/prefix_len",
             float(self._last_forcing_state.get("prefix_len", -1.0)),
+        )
+        logs.setdefault(
+            "rvq_curriculum/active_quantizers",
+            float(active_quantizers),
+        )
+        logs.setdefault(
+            "rvq_curriculum/phase_start_step",
+            float(rvq_phase_start_step),
+        )
+        logs.setdefault(
+            "rvq_curriculum/masked_labels",
+            float(self._last_rvq_curriculum_state.get("masked_labels", 0.0)),
+        )
+        logs.setdefault(
+            "rvq_curriculum/mask_inactive_inputs",
+            float(self.rvq_curriculum_mask_inactive_inputs),
         )
         return super().log(logs, *args, **kwargs)
 
@@ -2200,6 +2472,27 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--rvq_curriculum_schedule",
+        type=str,
+        default="off",
+        help=(
+            "Optional coarse-to-fine RVQ loss schedule start:active_quantizers;... "
+            "Phase starts can be optimizer steps or percentages of total optimizer "
+            "steps. active_quantizers=1 trains only res_1, while 4 trains all "
+            "RVQ levels. Example: '0%:1;20%:2;45%:3;70%:4'. Use off/full to "
+            "disable."
+        ),
+    )
+    parser.add_argument(
+        "--rvq_curriculum_mask_inactive_inputs",
+        action="store_true",
+        help=(
+            "When RVQ curriculum is active, replace inactive supervised target "
+            "tokens in input_ids with [MASK] in addition to masking their loss. "
+            "Leave off for the conservative first experiment."
+        ),
+    )
+    parser.add_argument(
         "--eval_metric_examples",
         type=int,
         default=0,
@@ -2321,6 +2614,9 @@ def main() -> None:
         raise ValueError("--motion_fps must be > 0")
     self_forcing_schedule = parse_self_forcing_schedule(
         args.self_forcing_schedule
+    )
+    rvq_curriculum_schedule = parse_rvq_curriculum_schedule(
+        args.rvq_curriculum_schedule
     )
 
     data_dir = Path(args.data_dir)
@@ -2509,6 +2805,12 @@ def main() -> None:
         f"{format_self_forcing_schedule(self_forcing_schedule)}"
     )
     print(
+        "RVQ curriculum:  "
+        f"{format_rvq_curriculum_schedule(rvq_curriculum_schedule)}"
+    )
+    if args.rvq_curriculum_mask_inactive_inputs:
+        print("RVQ curr inputs: mask inactive supervised targets")
+    print(
         "Architecture:     "
         f"L={config.num_layers}, H={config.hidden_size}, "
         f"heads={config.num_heads}, ffn={config.intermediate_size}, "
@@ -2649,6 +2951,10 @@ def main() -> None:
             data_collator=collator,
             callbacks=callbacks,
             self_forcing_schedule=self_forcing_schedule,
+            rvq_curriculum_schedule=rvq_curriculum_schedule,
+            rvq_curriculum_mask_inactive_inputs=(
+                args.rvq_curriculum_mask_inactive_inputs
+            ),
         )
 
     with timed_stage("trainer.train", True):
