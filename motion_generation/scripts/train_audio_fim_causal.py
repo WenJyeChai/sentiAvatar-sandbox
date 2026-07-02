@@ -30,8 +30,9 @@ import re
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -290,6 +291,436 @@ def configure_wandb(args: argparse.Namespace, default_run_name: str) -> Optional
         os.environ["WANDB_MODE"] = args.wandb_mode
 
     return args.wandb_run_name or default_run_name
+
+
+@dataclass(frozen=True)
+class SelfForcingPhase:
+    start_value: float
+    start_is_percent: bool
+    self_force_prob: float
+    prefix_choices: Tuple[int, ...]
+
+
+def parse_self_forcing_schedule(schedule: str) -> List[SelfForcingPhase]:
+    """
+    Parse a step-based self-forcing schedule.
+
+    Format:
+        start_step:self_force_prob:prefix_choices;...
+
+    Example:
+        0:0.0:;5000:0.25:0,4;15000:0.5:0,4,8
+        0%:0.0:;20%:0.25:0,4;50%:0.5:0,4,8
+
+    `prefix_choices` are generated-prefix lengths measured in compact RVQ
+    motion tokens. With 4 RVQ tokens per frame, prefix 4 means one generated
+    middle frame is used as context before the supervised suffix.
+    """
+
+    if schedule is None:
+        schedule = ""
+    schedule = schedule.strip()
+    if schedule.lower() in {"", "off", "none", "teacher"}:
+        return [SelfForcingPhase(0.0, False, 0.0, ())]
+
+    phases: List[SelfForcingPhase] = []
+    for raw_phase in schedule.split(";"):
+        raw_phase = raw_phase.strip()
+        if not raw_phase:
+            continue
+        parts = raw_phase.split(":")
+        if len(parts) not in {2, 3}:
+            raise ValueError(
+                "Invalid --self_forcing_schedule phase "
+                f"{raw_phase!r}. Expected start:prob:prefixes."
+            )
+
+        raw_start = parts[0].strip()
+        if raw_start.endswith("%"):
+            start_is_percent = True
+            start_value = float(raw_start[:-1].strip()) / 100.0
+            if not 0.0 <= start_value <= 1.0:
+                raise ValueError(
+                    "Self-forcing percentage phase starts must be in [0%, 100%]"
+                )
+        else:
+            start_is_percent = False
+            start_value = float(int(raw_start))
+            if start_value < 0:
+                raise ValueError("Self-forcing phase start_step must be >= 0")
+
+        prob = float(parts[1])
+        if not 0.0 <= prob <= 1.0:
+            raise ValueError("Self-forcing probability must be in [0, 1]")
+
+        choices: Tuple[int, ...] = ()
+        if len(parts) == 3 and parts[2].strip():
+            parsed_choices = []
+            for value in parts[2].split(","):
+                value = value.strip()
+                if not value:
+                    continue
+                prefix_len = int(value)
+                if prefix_len < 0:
+                    raise ValueError("Self-forcing prefix choices must be >= 0")
+                parsed_choices.append(prefix_len)
+            choices = tuple(sorted(set(parsed_choices)))
+
+        phases.append(SelfForcingPhase(start_value, start_is_percent, prob, choices))
+
+    if not phases:
+        return [SelfForcingPhase(0.0, False, 0.0, ())]
+
+    seen_starts = set()
+    for phase in phases:
+        start_key = (phase.start_is_percent, phase.start_value)
+        if start_key in seen_starts:
+            raise ValueError(
+                "Duplicate self-forcing phase start "
+                f"{format_self_forcing_phase_start(phase)}"
+            )
+        seen_starts.add(start_key)
+
+    has_zero_start = any(
+        (not phase.start_is_percent and phase.start_value == 0)
+        or (phase.start_is_percent and phase.start_value == 0.0)
+        for phase in phases
+    )
+    if not has_zero_start:
+        phases.insert(0, SelfForcingPhase(0.0, False, 0.0, ()))
+
+    return phases
+
+
+def format_self_forcing_phase_start(phase: SelfForcingPhase) -> str:
+    if phase.start_is_percent:
+        percent = phase.start_value * 100.0
+        if float(percent).is_integer():
+            return f"{int(percent)}%"
+        return f"{percent:g}%"
+    return str(int(phase.start_value))
+
+
+def format_self_forcing_schedule(phases: Sequence[SelfForcingPhase]) -> str:
+    chunks = []
+    for phase in phases:
+        choices = ",".join(str(choice) for choice in phase.prefix_choices)
+        chunks.append(
+            f"{format_self_forcing_phase_start(phase)}:"
+            f"{phase.self_force_prob:g}:{choices}"
+        )
+    return ";".join(chunks)
+
+
+class AudioFIMSelfForcingTrainer(Trainer):
+    """Trainer that can switch from teacher forcing to scheduled self-forcing."""
+
+    def __init__(
+        self,
+        *args,
+        self_forcing_schedule: Optional[Sequence[SelfForcingPhase]] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.self_forcing_schedule = list(
+            self_forcing_schedule or [SelfForcingPhase(0.0, False, 0.0, ())]
+        )
+        self._last_forcing_state: Dict[str, float] = {
+            "active": 0.0,
+            "prefix_len": -1.0,
+            "phase_prob": 0.0,
+            "phase_max_prefix": -1.0,
+        }
+
+    def _phase_for_step(self, step: int) -> SelfForcingPhase:
+        current = self.self_forcing_schedule[0]
+        current_start = -1
+        for phase in self.self_forcing_schedule:
+            start_step = self._phase_start_step(phase)
+            if int(step) >= start_step and start_step >= current_start:
+                current = phase
+                current_start = start_step
+        return current
+
+    def _total_training_steps(self) -> int:
+        total_steps = int(getattr(self.state, "max_steps", 0) or 0)
+        if total_steps <= 0:
+            total_steps = int(getattr(self.args, "max_steps", 0) or 0)
+        return max(0, total_steps)
+
+    def _phase_start_step(self, phase: SelfForcingPhase) -> int:
+        if not phase.start_is_percent:
+            return int(phase.start_value)
+
+        total_steps = self._total_training_steps()
+        if total_steps <= 0:
+            return 0 if phase.start_value <= 0 else 10**12
+        return int(math.floor(float(total_steps) * float(phase.start_value)))
+
+    def _unwrap_config(self, model) -> AudioFIMCausalConfig:
+        try:
+            base_model = self.accelerator.unwrap_model(model)
+        except Exception:
+            base_model = getattr(model, "module", model)
+        return base_model.config
+
+    def _pad_token_sequences(
+        self,
+        sequences: Sequence[torch.Tensor],
+        *,
+        pad_value: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        max_len = max(int(seq.numel()) for seq in sequences)
+        batch = torch.full(
+            (len(sequences), max_len),
+            int(pad_value),
+            dtype=dtype,
+            device=device,
+        )
+        attention = torch.zeros(
+            (len(sequences), max_len),
+            dtype=torch.long,
+            device=device,
+        )
+        for idx, seq in enumerate(sequences):
+            length = int(seq.numel())
+            batch[idx, :length] = seq.to(device=device, dtype=dtype)
+            attention[idx, :length] = 1
+        return batch, attention
+
+    def _select_next_ids(
+        self,
+        logits: torch.Tensor,
+        *,
+        token_idx: int,
+        config: AudioFIMCausalConfig,
+    ) -> torch.Tensor:
+        quantizer_idx = int(token_idx) % config.num_quantizers
+        allowed_start = quantizer_idx * config.codebook_size
+        allowed_end = allowed_start + config.codebook_size
+        invalid = torch.ones_like(logits, dtype=torch.bool)
+        invalid[:, allowed_start:allowed_end] = False
+        logits = logits.masked_fill(invalid, float("-inf"))
+        return logits.argmax(dim=-1)
+
+    def _compute_self_forcing_loss(
+        self,
+        model,
+        inputs: Dict[str, torch.Tensor],
+        requested_prefix_len: int,
+    ):
+        config = self._unwrap_config(model)
+        input_ids = inputs["input_ids"]
+        labels = inputs["labels"]
+        attention_mask = inputs["attention_mask"]
+        audio_frame_ids = inputs["audio_frame_ids"]
+        audio_features = inputs["audio_features"]
+
+        device = input_ids.device
+        batch_size = int(input_ids.shape[0])
+        real_lengths = attention_mask.sum(dim=1).to(dtype=torch.long)
+
+        prompt_ids: List[torch.Tensor] = []
+        prompt_audio_ids: List[torch.Tensor] = []
+        target_ids: List[torch.Tensor] = []
+        target_audio_ids: List[torch.Tensor] = []
+        motion_target_counts: List[int] = []
+
+        for batch_idx in range(batch_size):
+            real_len = int(real_lengths[batch_idx].item())
+            item_labels = labels[batch_idx, :real_len]
+            supervised = (item_labels != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+            if supervised.numel() == 0:
+                raise ValueError("Self-forcing batch contains no supervised labels")
+
+            target_start = int(supervised[0].item())
+            item_target_ids = item_labels[target_start:real_len]
+            item_target_audio_ids = audio_frame_ids[batch_idx, target_start:real_len]
+
+            prompt_ids.append(input_ids[batch_idx, :target_start])
+            prompt_audio_ids.append(audio_frame_ids[batch_idx, :target_start])
+            target_ids.append(item_target_ids)
+            target_audio_ids.append(item_target_audio_ids)
+            motion_count = int(
+                (
+                    (item_target_ids >= 0)
+                    & (item_target_ids < config.motion_vocab_size)
+                )
+                .sum()
+                .item()
+            )
+            motion_target_counts.append(motion_count)
+
+        prefix_len = min(
+            int(requested_prefix_len),
+            min(motion_target_counts) if motion_target_counts else 0,
+        )
+        prefix_len = max(0, prefix_len)
+
+        contexts = [tokens.clone() for tokens in prompt_ids]
+        context_audio_ids = [tokens.clone() for tokens in prompt_audio_ids]
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                for token_idx in range(prefix_len):
+                    gen_input_ids, gen_attention_mask = self._pad_token_sequences(
+                        contexts,
+                        pad_value=config.pad_token_id,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    gen_audio_frame_ids, _ = self._pad_token_sequences(
+                        context_audio_ids,
+                        pad_value=-1,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    outputs = model(
+                        input_ids=gen_input_ids,
+                        attention_mask=gen_attention_mask,
+                        audio_features=audio_features,
+                        audio_frame_ids=gen_audio_frame_ids,
+                    )
+                    lengths = gen_attention_mask.sum(dim=1).to(dtype=torch.long)
+                    batch_index = torch.arange(batch_size, device=device)
+                    next_logits = outputs.logits[
+                        batch_index,
+                        lengths - 1,
+                        :,
+                    ].clone()
+                    next_ids = self._select_next_ids(
+                        next_logits,
+                        token_idx=token_idx,
+                        config=config,
+                    )
+
+                    for batch_idx in range(batch_size):
+                        contexts[batch_idx] = torch.cat(
+                            [contexts[batch_idx], next_ids[batch_idx : batch_idx + 1]]
+                        )
+                        context_audio_ids[batch_idx] = torch.cat(
+                            [
+                                context_audio_ids[batch_idx],
+                                target_audio_ids[batch_idx][
+                                    token_idx : token_idx + 1
+                                ],
+                            ]
+                        )
+        finally:
+            if was_training:
+                model.train()
+
+        new_input_ids: List[torch.Tensor] = []
+        new_audio_frame_ids: List[torch.Tensor] = []
+        new_labels: List[torch.Tensor] = []
+        for batch_idx in range(batch_size):
+            suffix_ids = target_ids[batch_idx][prefix_len:]
+            suffix_audio_ids = target_audio_ids[batch_idx][prefix_len:]
+            item_input_ids = torch.cat([contexts[batch_idx], suffix_ids])
+            item_audio_ids = torch.cat(
+                [context_audio_ids[batch_idx], suffix_audio_ids]
+            )
+            ignored = torch.full(
+                (int(contexts[batch_idx].numel()),),
+                IGNORE_INDEX,
+                dtype=torch.long,
+                device=device,
+            )
+            item_labels = torch.cat([ignored, suffix_ids])
+            new_input_ids.append(item_input_ids)
+            new_audio_frame_ids.append(item_audio_ids)
+            new_labels.append(item_labels)
+
+        train_input_ids, train_attention_mask = self._pad_token_sequences(
+            new_input_ids,
+            pad_value=config.pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        train_audio_frame_ids, _ = self._pad_token_sequences(
+            new_audio_frame_ids,
+            pad_value=-1,
+            dtype=torch.long,
+            device=device,
+        )
+        train_labels, _ = self._pad_token_sequences(
+            new_labels,
+            pad_value=IGNORE_INDEX,
+            dtype=torch.long,
+            device=device,
+        )
+        outputs = model(
+            input_ids=train_input_ids,
+            attention_mask=train_attention_mask,
+            labels=train_labels,
+            audio_features=audio_features,
+            audio_frame_ids=train_audio_frame_ids,
+        )
+        return outputs.loss, outputs, prefix_len
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch=None,
+        **kwargs,
+    ):
+        del num_items_in_batch
+        del kwargs
+        phase = self._phase_for_step(int(self.state.global_step))
+        max_prefix = max(phase.prefix_choices) if phase.prefix_choices else -1
+
+        use_self_forcing = (
+            phase.self_force_prob > 0.0
+            and bool(phase.prefix_choices)
+            and random.random() < phase.self_force_prob
+        )
+        if not use_self_forcing:
+            outputs = model(**inputs)
+            self._last_forcing_state = {
+                "active": 0.0,
+                "prefix_len": -1.0,
+                "phase_prob": float(phase.self_force_prob),
+                "phase_max_prefix": float(max_prefix),
+            }
+            return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+        requested_prefix_len = random.choice(list(phase.prefix_choices))
+        loss, outputs, actual_prefix_len = self._compute_self_forcing_loss(
+            model,
+            inputs,
+            requested_prefix_len=requested_prefix_len,
+        )
+        self._last_forcing_state = {
+            "active": 1.0,
+            "prefix_len": float(actual_prefix_len),
+            "phase_prob": float(phase.self_force_prob),
+            "phase_max_prefix": float(max_prefix),
+        }
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        logs = dict(logs)
+        phase = self._phase_for_step(int(self.state.global_step))
+        max_prefix = max(phase.prefix_choices) if phase.prefix_choices else -1
+        phase_start_step = self._phase_start_step(phase)
+        logs.setdefault("forcing/self_prob", float(phase.self_force_prob))
+        logs.setdefault("forcing/max_prefix", float(max_prefix))
+        logs.setdefault("forcing/phase_start_step", float(phase_start_step))
+        logs.setdefault("forcing/total_steps", float(self._total_training_steps()))
+        logs.setdefault(
+            "forcing/active",
+            float(self._last_forcing_state.get("active", 0.0)),
+        )
+        logs.setdefault(
+            "forcing/prefix_len",
+            float(self._last_forcing_state.get("prefix_len", -1.0)),
+        )
+        return super().log(logs, *args, **kwargs)
 
 
 def _token_color(value: int) -> tuple[int, int, int]:
@@ -1756,6 +2187,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--save_total_limit", type=int, default=3)
     parser.add_argument(
+        "--self_forcing_schedule",
+        type=str,
+        default="0:0.0:",
+        help=(
+            "Step-based schedule start:prob:prefixes;... for scheduled "
+            "self-forcing. Phase starts can be optimizer steps or percentages "
+            "of total optimizer steps, such as 5000 or 20%. Prefix lengths "
+            "count compact RVQ motion tokens. Example: "
+            "'0%:0.0:;20%:0.25:0,4;50%:0.5:0,4,8;"
+            "80%:1.0:0,1,2,3,4,5,6,7,8'."
+        ),
+    )
+    parser.add_argument(
         "--eval_metric_examples",
         type=int,
         default=0,
@@ -1875,6 +2319,9 @@ def main() -> None:
         raise ValueError("--audio_fps must be > 0")
     if args.motion_fps <= 0:
         raise ValueError("--motion_fps must be > 0")
+    self_forcing_schedule = parse_self_forcing_schedule(
+        args.self_forcing_schedule
+    )
 
     data_dir = Path(args.data_dir)
     motion_token_dir = Path(args.motion_token_dir or data_dir / "motion_token_data")
@@ -2058,6 +2505,10 @@ def main() -> None:
     print(f"Gap setup:        step={args.step}, predict={args.step - 1} frames")
     print(f"History frames:   {args.min_history_frames}-{args.max_history_frames}")
     print(
+        "Self-forcing:    "
+        f"{format_self_forcing_schedule(self_forcing_schedule)}"
+    )
+    print(
         "Architecture:     "
         f"L={config.num_layers}, H={config.hidden_size}, "
         f"heads={config.num_heads}, ffn={config.intermediate_size}, "
@@ -2190,13 +2641,14 @@ def main() -> None:
         )
 
     with timed_stage("create Trainer", args.profile_startup):
-        trainer = Trainer(
+        trainer = AudioFIMSelfForcingTrainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             data_collator=collator,
             callbacks=callbacks,
+            self_forcing_schedule=self_forcing_schedule,
         )
 
     with timed_stage("trainer.train", True):
