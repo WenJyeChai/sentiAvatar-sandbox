@@ -265,6 +265,70 @@ def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
     return total, trainable
 
 
+ARCHITECTURE_PRESETS: Dict[str, Dict[str, int]] = {
+    "base": {
+        "hidden_size": 512,
+        "num_layers": 8,
+        "num_heads": 16,
+        "intermediate_size": 1536,
+    },
+    # Cleanest half-size ablation: keep width/head dimension identical and
+    # halve only the transformer stack depth.
+    "half_depth": {
+        "hidden_size": 512,
+        "num_layers": 4,
+        "num_heads": 16,
+        "intermediate_size": 1536,
+    },
+    # Roughly half-ish parameters while preserving the 8-layer depth.
+    "half_params": {
+        "hidden_size": 384,
+        "num_layers": 8,
+        "num_heads": 12,
+        "intermediate_size": 1152,
+    },
+    # Half the hidden width. This is a more aggressive small-model ablation.
+    "half_width": {
+        "hidden_size": 256,
+        "num_layers": 8,
+        "num_heads": 8,
+        "intermediate_size": 768,
+    },
+    # Bigger-model ablations.
+    "double_depth": {
+        "hidden_size": 512,
+        "num_layers": 16,
+        "num_heads": 16,
+        "intermediate_size": 1536,
+    },
+    # Closest to 2x parameters for this causal implementation.
+    "double_params": {
+        "hidden_size": 736,
+        "num_layers": 8,
+        "num_heads": 16,
+        "intermediate_size": 2208,
+    },
+    # Rounder wide setting, slightly above 2x.
+    "double_width": {
+        "hidden_size": 768,
+        "num_layers": 8,
+        "num_heads": 16,
+        "intermediate_size": 2304,
+    },
+}
+
+
+def apply_architecture_preset(args: argparse.Namespace) -> Optional[str]:
+    preset_name = getattr(args, "architecture_preset", "custom")
+    if preset_name == "custom":
+        return None
+
+    preset = ARCHITECTURE_PRESETS[preset_name]
+    for key, value in preset.items():
+        setattr(args, key, int(value))
+    return preset_name
+
+
 def configure_wandb(args: argparse.Namespace, default_run_name: str) -> Optional[str]:
     """Configure optional Weights & Biases logging for HuggingFace Trainer."""
 
@@ -2430,6 +2494,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile_startup", action="store_true")
     parser.add_argument("--profile_collator_batches", type=int, default=0)
 
+    parser.add_argument(
+        "--architecture_preset",
+        type=str,
+        default="custom",
+        choices=[
+            "custom",
+            "base",
+            "half_depth",
+            "half_params",
+            "half_width",
+            "double_depth",
+            "double_params",
+            "double_width",
+        ],
+        help=(
+            "Optional architecture preset. custom leaves the explicit "
+            "--hidden_size/--num_layers/--num_heads/--intermediate_size args "
+            "unchanged. Presets override those four architecture args."
+        ),
+    )
     parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--num_heads", type=int, default=16)
@@ -2605,6 +2689,7 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     run_start = time.perf_counter()
+    active_architecture_preset = apply_architecture_preset(args)
 
     if args.step - 1 > args.max_gap_frames:
         raise ValueError("--max_gap_frames must be >= --step - 1")
@@ -2816,6 +2901,7 @@ def main() -> None:
         f"heads={config.num_heads}, ffn={config.intermediate_size}, "
         f"vocab={config.vocab_size}"
     )
+    print(f"Arch preset:      {active_architecture_preset or 'custom'}")
     print(f"Parameters:       {total_params:,} total / {trainable_params:,} trainable")
     print(f"Tie embeddings:   {config.tie_word_embeddings}")
     print(
