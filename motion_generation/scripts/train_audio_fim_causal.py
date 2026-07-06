@@ -597,6 +597,9 @@ class AudioFIMSelfForcingTrainer(Trainer):
         self_forcing_schedule: Optional[Sequence[SelfForcingPhase]] = None,
         rvq_curriculum_schedule: Optional[Sequence[RVQCurriculumPhase]] = None,
         rvq_curriculum_mask_inactive_inputs: bool = False,
+        audio_condition_dropout_prob: float = 0.0,
+        motion_history_dropout_prob: float = 0.0,
+        motion_anchor_token_dropout_prob: float = 0.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -607,6 +610,9 @@ class AudioFIMSelfForcingTrainer(Trainer):
         self.rvq_curriculum_mask_inactive_inputs = bool(
             rvq_curriculum_mask_inactive_inputs
         )
+        self.audio_condition_dropout_prob = float(audio_condition_dropout_prob)
+        self.motion_history_dropout_prob = float(motion_history_dropout_prob)
+        self.motion_anchor_token_dropout_prob = float(motion_anchor_token_dropout_prob)
         self._last_forcing_state: Dict[str, float] = {
             "active": 0.0,
             "prefix_len": -1.0,
@@ -616,6 +622,11 @@ class AudioFIMSelfForcingTrainer(Trainer):
         self._last_rvq_curriculum_state: Dict[str, float] = {
             "active_quantizers": -1.0,
             "masked_labels": 0.0,
+        }
+        self._last_conditioning_state: Dict[str, float] = {
+            "audio_dropped_examples": 0.0,
+            "history_masked_tokens": 0.0,
+            "anchor_masked_tokens": 0.0,
         }
 
     def _phase_for_step(self, step: int) -> SelfForcingPhase:
@@ -745,6 +756,128 @@ class AudioFIMSelfForcingTrainer(Trainer):
         masked_inputs["input_ids"] = input_ids
         masked_inputs["labels"] = labels
         return masked_inputs, masked_count
+
+    def _apply_conditioning_dropout_to_inputs(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        *,
+        config: AudioFIMCausalConfig,
+        training: bool,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+        stats = {
+            "audio_dropped_examples": 0.0,
+            "history_masked_tokens": 0.0,
+            "anchor_masked_tokens": 0.0,
+        }
+        if not training:
+            return inputs, stats
+
+        output = inputs
+        batch_size = int(inputs["input_ids"].shape[0])
+        device = inputs["input_ids"].device
+
+        if self.audio_condition_dropout_prob > 0.0:
+            drop_mask = (
+                torch.rand(batch_size, device=device)
+                < float(self.audio_condition_dropout_prob)
+            )
+            dropped = int(drop_mask.sum().item())
+            if dropped:
+                if output is inputs:
+                    output = dict(inputs)
+                audio_features = output["audio_features"].clone()
+                audio_features[drop_mask] = 0.0
+                output["audio_features"] = audio_features
+                stats["audio_dropped_examples"] = float(dropped)
+
+        if (
+            self.motion_history_dropout_prob <= 0.0
+            and self.motion_anchor_token_dropout_prob <= 0.0
+        ):
+            return output, stats
+
+        input_ids = output["input_ids"]
+        masked_ids = input_ids.clone()
+        history_masked = 0
+        anchor_masked = 0
+
+        for batch_idx in range(batch_size):
+            ids = input_ids[batch_idx]
+            real_len = int(inputs["attention_mask"][batch_idx].sum().item())
+            real_ids = ids[:real_len]
+
+            history_positions = (
+                real_ids == int(config.history_token_id)
+            ).nonzero(as_tuple=True)[0]
+            mask_positions = (
+                real_ids == int(config.mask_token_id)
+            ).nonzero(as_tuple=True)[0]
+            right_positions = (
+                real_ids == int(config.right_anchor_token_id)
+            ).nonzero(as_tuple=True)[0]
+            if (
+                history_positions.numel() == 0
+                or mask_positions.numel() == 0
+                or right_positions.numel() == 0
+            ):
+                continue
+
+            first_mask = int(mask_positions[0].item())
+            right_anchor_marker = int(right_positions[0].item())
+            left_anchor_start = first_mask - int(config.num_quantizers)
+            left_anchor_end = first_mask
+            right_anchor_start = right_anchor_marker + 1
+            right_anchor_end = right_anchor_start + int(config.num_quantizers)
+
+            if self.motion_history_dropout_prob > 0.0:
+                if random.random() < float(self.motion_history_dropout_prob):
+                    history_start = int(history_positions[0].item()) + 1
+                    history_end = max(history_start, left_anchor_start)
+                    if history_end > history_start:
+                        token_slice = ids[history_start:history_end]
+                        motion_mask = (
+                            (token_slice >= 0)
+                            & (token_slice < int(config.motion_vocab_size))
+                        )
+                        if bool(motion_mask.any().item()):
+                            target = masked_ids[batch_idx, history_start:history_end]
+                            target[motion_mask] = int(config.mask_token_id)
+                            history_masked += int(motion_mask.sum().item())
+
+            if self.motion_anchor_token_dropout_prob > 0.0:
+                for start, end in (
+                    (left_anchor_start, left_anchor_end),
+                    (right_anchor_start, right_anchor_end),
+                ):
+                    start = max(0, start)
+                    end = min(real_len, end)
+                    if end <= start:
+                        continue
+                    token_slice = ids[start:end]
+                    motion_mask = (
+                        (token_slice >= 0)
+                        & (token_slice < int(config.motion_vocab_size))
+                    )
+                    if not bool(motion_mask.any().item()):
+                        continue
+                    drop_mask = (
+                        torch.rand(end - start, device=device)
+                        < float(self.motion_anchor_token_dropout_prob)
+                    )
+                    final_mask = motion_mask & drop_mask
+                    if bool(final_mask.any().item()):
+                        target = masked_ids[batch_idx, start:end]
+                        target[final_mask] = int(config.mask_token_id)
+                        anchor_masked += int(final_mask.sum().item())
+
+        if history_masked or anchor_masked:
+            if output is inputs:
+                output = dict(inputs)
+            output["input_ids"] = masked_ids
+            stats["history_masked_tokens"] = float(history_masked)
+            stats["anchor_masked_tokens"] = float(anchor_masked)
+
+        return output, stats
 
     def _pad_token_sequences(
         self,
@@ -964,6 +1097,11 @@ class AudioFIMSelfForcingTrainer(Trainer):
         del kwargs
         global_step = int(self.state.global_step)
         config = self._unwrap_config(model)
+        loss_inputs, conditioning_stats = self._apply_conditioning_dropout_to_inputs(
+            inputs,
+            config=config,
+            training=bool(model.training),
+        )
         active_quantizers = self._active_quantizers_for_step(global_step, config)
         phase = self._phase_for_step(global_step)
         max_prefix = max(phase.prefix_choices) if phase.prefix_choices else -1
@@ -979,7 +1117,7 @@ class AudioFIMSelfForcingTrainer(Trainer):
                 active_quantizers if bool(model.training) else int(config.num_quantizers)
             )
             loss_inputs, masked_labels = self._apply_rvq_curriculum_to_inputs(
-                inputs,
+                loss_inputs,
                 config=config,
                 active_quantizers=active_for_loss,
             )
@@ -994,12 +1132,13 @@ class AudioFIMSelfForcingTrainer(Trainer):
                 "active_quantizers": float(active_for_loss),
                 "masked_labels": float(masked_labels),
             }
+            self._last_conditioning_state = conditioning_stats
             return (outputs.loss, outputs) if return_outputs else outputs.loss
 
         requested_prefix_len = random.choice(list(phase.prefix_choices))
         loss, outputs, actual_prefix_len, masked_labels = self._compute_self_forcing_loss(
             model,
-            inputs,
+            loss_inputs,
             requested_prefix_len=requested_prefix_len,
             active_quantizers=active_quantizers,
         )
@@ -1013,6 +1152,7 @@ class AudioFIMSelfForcingTrainer(Trainer):
             "active_quantizers": float(active_quantizers),
             "masked_labels": float(masked_labels),
         }
+        self._last_conditioning_state = conditioning_stats
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
@@ -1056,6 +1196,45 @@ class AudioFIMSelfForcingTrainer(Trainer):
             "rvq_curriculum/mask_inactive_inputs",
             float(self.rvq_curriculum_mask_inactive_inputs),
         )
+        logs.setdefault(
+            "conditioning/audio_dropout_prob",
+            float(self.audio_condition_dropout_prob),
+        )
+        logs.setdefault(
+            "conditioning/audio_dropped_examples",
+            float(self._last_conditioning_state.get("audio_dropped_examples", 0.0)),
+        )
+        logs.setdefault(
+            "conditioning/history_dropout_prob",
+            float(self.motion_history_dropout_prob),
+        )
+        logs.setdefault(
+            "conditioning/history_masked_tokens",
+            float(self._last_conditioning_state.get("history_masked_tokens", 0.0)),
+        )
+        logs.setdefault(
+            "conditioning/anchor_token_dropout_prob",
+            float(self.motion_anchor_token_dropout_prob),
+        )
+        logs.setdefault(
+            "conditioning/anchor_masked_tokens",
+            float(self._last_conditioning_state.get("anchor_masked_tokens", 0.0)),
+        )
+        try:
+            gate_model = self.accelerator.unwrap_model(self.model)
+        except Exception:
+            gate_model = getattr(self.model, "module", self.model)
+        audio_layer_gates = getattr(gate_model, "audio_layer_gates", None)
+        if audio_layer_gates is not None:
+            gate_values = audio_layer_gates.detach().float()
+            logs.setdefault(
+                "audio_fusion/gate_abs_mean",
+                float(gate_values.abs().mean().cpu()),
+            )
+            logs.setdefault(
+                "audio_fusion/gate_abs_max",
+                float(gate_values.abs().max().cpu()),
+            )
         return super().log(logs, *args, **kwargs)
 
 
@@ -1695,6 +1874,7 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
         teacher_forced_every_n_evals: int,
         generation_examples: int,
         generation_every_n_evals: int,
+        audio_cfg_scale: float = 1.0,
     ):
         self.eval_dataset = eval_dataset
         self.collator = collator
@@ -1710,6 +1890,7 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
             generation_examples,
         )
         self.generation_every_n_evals = max(1, int(generation_every_n_evals))
+        self.audio_cfg_scale = float(audio_cfg_scale)
         self._eval_calls = 0
 
     def _world_process_zero(self, state) -> bool:
@@ -1940,6 +2121,7 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
                 right_audio_feature=example.right_audio_feature,
                 history_audio_features=example.history_audio_features,
                 temperature=0.0,
+                audio_cfg_scale=self.audio_cfg_scale,
             )
             gap_exact = True
             for frame_idx, gt_frame in enumerate(example.middle_motion):
@@ -1966,6 +2148,7 @@ class AudioFIMEvalMetricsCallback(TrainerCallback):
 
         metrics = {
             "eval_gen/examples": float(len(self.generation_indices)),
+            "eval_gen/audio_cfg_scale": float(self.audio_cfg_scale),
             "eval_gen/token_acc_mean": safe_div(totals["correct"], totals["tokens"]),
             "eval_gen/exact_frame_acc": safe_div(
                 totals["exact_frames"],
@@ -2027,11 +2210,13 @@ class WandbEvalVideoCallback(TrainerCallback):
         num_examples: int,
         every_n_evals: int,
         fps: int,
+        audio_cfg_scale: float = 1.0,
     ):
         self.eval_dataset = eval_dataset
         self.num_examples = max(0, int(num_examples))
         self.every_n_evals = max(1, int(every_n_evals))
         self.fps = max(1, int(fps))
+        self.audio_cfg_scale = float(audio_cfg_scale)
         self._eval_calls = 0
 
     def on_evaluate(self, args, state, control, **kwargs):
@@ -2074,11 +2259,15 @@ class WandbEvalVideoCallback(TrainerCallback):
                 right_audio_feature=example.right_audio_feature,
                 history_audio_features=example.history_audio_features,
                 temperature=0.0,
+                audio_cfg_scale=self.audio_cfg_scale,
             )
             video = render_token_comparison_video(
                 gt_motion=example.middle_motion,
                 pred_motion=pred_motion,
-                title=f"{example.name} | step {state.global_step}",
+                title=(
+                    f"{example.name} | step {state.global_step} | "
+                    f"cfg {self.audio_cfg_scale:g}"
+                ),
                 fps=self.fps,
             )
             log_payload[f"eval_video/token_compare_{sample_idx}"] = wandb.Video(
@@ -2108,6 +2297,7 @@ class WandbEvalMotionVideoCallback(TrainerCallback):
         num_examples: int,
         every_n_evals: int,
         fps: int,
+        audio_cfg_scale: float = 1.0,
         scan_examples: int = 200,
     ):
         self.eval_dataset = eval_dataset
@@ -2118,6 +2308,7 @@ class WandbEvalMotionVideoCallback(TrainerCallback):
         self.num_examples = max(0, int(num_examples))
         self.every_n_evals = max(1, int(every_n_evals))
         self.fps = max(1, int(fps))
+        self.audio_cfg_scale = float(audio_cfg_scale)
         self._eval_calls = 0
         self._rvqvae: Optional[RVQVAE] = None
         self._rvq_config: Optional[Config] = None
@@ -2231,6 +2422,7 @@ class WandbEvalMotionVideoCallback(TrainerCallback):
                     right_audio_feature=example.right_audio_feature,
                     history_audio_features=example.history_audio_features,
                     temperature=0.0,
+                    audio_cfg_scale=self.audio_cfg_scale,
                 )
 
                 prefix = [list(frame) for frame in example.history_motion]
@@ -2302,7 +2494,8 @@ class WandbEvalMotionVideoCallback(TrainerCallback):
                     joint_names=joint_names,
                     title=(
                         f"{example.name} | step {state.global_step} | "
-                        f"middle token acc {token_acc:.3f}"
+                        f"middle token acc {token_acc:.3f} | "
+                        f"cfg {self.audio_cfg_scale:g}"
                     ),
                     fps=self.fps,
                     source_frames=len(gt_clip),
@@ -2523,6 +2716,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_quantizers", type=int, default=4)
     parser.add_argument("--audio_feat_dim", type=int, default=768)
     parser.add_argument(
+        "--audio_fusion",
+        type=str,
+        default="input_add",
+        choices=["input_add", "gated_layers"],
+        help=(
+            "How HuBERT audio enters the transformer. input_add is the original "
+            "embedding-level addition. gated_layers injects audio before every "
+            "transformer block through zero-init learned gates."
+        ),
+    )
+    parser.add_argument(
+        "--audio_gate_init",
+        type=float,
+        default=0.0,
+        help="Initial value for gated_layers audio gates.",
+    )
+    parser.add_argument(
         "--max_gap_frames",
         type=int,
         default=16,
@@ -2542,6 +2752,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--save_total_limit", type=int, default=3)
+    parser.add_argument(
+        "--audio_condition_dropout_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-example probability of zeroing all audio features during "
+            "training. Enables audio CFG at inference."
+        ),
+    )
+    parser.add_argument(
+        "--motion_history_dropout_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-example probability of masking all history motion context "
+            "tokens during training."
+        ),
+    )
+    parser.add_argument(
+        "--motion_anchor_token_dropout_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-token probability of masking left/right anchor RVQ tokens "
+            "during training."
+        ),
+    )
     parser.add_argument(
         "--self_forcing_schedule",
         type=str,
@@ -2606,6 +2843,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Run free-running generation metrics every N evaluation calls.",
+    )
+    parser.add_argument(
+        "--eval_audio_cfg_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Audio classifier-free guidance scale used by free-running eval "
+            "metrics and W&B videos. 1.0 is normal conditional generation."
+        ),
     )
     parser.add_argument(
         "--report_to",
@@ -2697,6 +2943,16 @@ def main() -> None:
         raise ValueError("--audio_fps must be > 0")
     if args.motion_fps <= 0:
         raise ValueError("--motion_fps must be > 0")
+    for name in (
+        "audio_condition_dropout_prob",
+        "motion_history_dropout_prob",
+        "motion_anchor_token_dropout_prob",
+    ):
+        value = float(getattr(args, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"--{name} must be in [0, 1]")
+    if args.eval_audio_cfg_scale < 0:
+        raise ValueError("--eval_audio_cfg_scale must be >= 0")
     self_forcing_schedule = parse_self_forcing_schedule(
         args.self_forcing_schedule
     )
@@ -2838,6 +3094,8 @@ def main() -> None:
         codebook_size=args.codebook_size,
         num_quantizers=args.num_quantizers,
         audio_feat_dim=args.audio_feat_dim,
+        audio_fusion=args.audio_fusion,
+        audio_gate_init=args.audio_gate_init,
         max_gap_frames=args.max_gap_frames,
         dropout=args.dropout,
     )
@@ -2896,12 +3154,22 @@ def main() -> None:
     if args.rvq_curriculum_mask_inactive_inputs:
         print("RVQ curr inputs: mask inactive supervised targets")
     print(
+        "Conditioning:     "
+        f"audio_drop={args.audio_condition_dropout_prob:g}, "
+        f"history_drop={args.motion_history_dropout_prob:g}, "
+        f"anchor_token_drop={args.motion_anchor_token_dropout_prob:g}, "
+        f"eval_cfg={args.eval_audio_cfg_scale:g}"
+    )
+    print(
         "Architecture:     "
         f"L={config.num_layers}, H={config.hidden_size}, "
         f"heads={config.num_heads}, ffn={config.intermediate_size}, "
         f"vocab={config.vocab_size}"
     )
     print(f"Arch preset:      {active_architecture_preset or 'custom'}")
+    print(f"Audio fusion:     {config.audio_fusion}")
+    if config.audio_fusion == "gated_layers":
+        print(f"Audio gate init:  {config.audio_gate_init:g}")
     print(f"Parameters:       {total_params:,} total / {trainable_params:,} trainable")
     print(f"Tie embeddings:   {config.tie_word_embeddings}")
     print(
@@ -2912,7 +3180,7 @@ def main() -> None:
     if wandb_run_name:
         print(f"W&B run:          {wandb_run_name}")
     if args.report_to == "wandb" and args.wandb_log_eval_videos:
-        print(f"W&B token video:  every {args.wandb_video_every_n_evals} eval(s)")
+            print(f"W&B token video:  every {args.wandb_video_every_n_evals} eval(s)")
     if args.report_to == "wandb" and args.wandb_log_eval_motion_videos:
         print(
             "W&B motion video: "
@@ -2926,7 +3194,8 @@ def main() -> None:
         print(
             "Eval metrics:     "
             f"teacher={args.eval_metric_examples} window(s), "
-            f"gen={args.eval_gen_metric_examples} window(s)"
+            f"gen={args.eval_gen_metric_examples} window(s), "
+            f"cfg={args.eval_audio_cfg_scale:g}"
         )
     print("=" * 70)
 
@@ -2993,6 +3262,7 @@ def main() -> None:
                 teacher_forced_every_n_evals=args.eval_metric_every_n_evals,
                 generation_examples=args.eval_gen_metric_examples,
                 generation_every_n_evals=args.eval_gen_metric_every_n_evals,
+                audio_cfg_scale=args.eval_audio_cfg_scale,
             )
         )
     if (
@@ -3007,6 +3277,7 @@ def main() -> None:
                 num_examples=args.wandb_video_examples,
                 every_n_evals=args.wandb_video_every_n_evals,
                 fps=args.wandb_video_fps,
+                audio_cfg_scale=args.eval_audio_cfg_scale,
             )
         )
     if (
@@ -3025,6 +3296,7 @@ def main() -> None:
                 num_examples=args.wandb_motion_video_examples,
                 every_n_evals=args.wandb_motion_video_every_n_evals,
                 fps=args.wandb_motion_video_fps,
+                audio_cfg_scale=args.eval_audio_cfg_scale,
             )
         )
 
@@ -3041,6 +3313,9 @@ def main() -> None:
             rvq_curriculum_mask_inactive_inputs=(
                 args.rvq_curriculum_mask_inactive_inputs
             ),
+            audio_condition_dropout_prob=args.audio_condition_dropout_prob,
+            motion_history_dropout_prob=args.motion_history_dropout_prob,
+            motion_anchor_token_dropout_prob=args.motion_anchor_token_dropout_prob,
         )
 
     with timed_stage("trainer.train", True):
