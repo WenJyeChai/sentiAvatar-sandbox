@@ -31,6 +31,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import Dataset
 from transformers import PretrainedConfig
@@ -352,6 +353,132 @@ class AudioFIMPositionEmbedding(nn.Module):
         return self.position_embeddings(position_ids)
 
 
+LayerKVCache = Tuple[torch.Tensor, torch.Tensor]
+
+
+class AudioFIMCausalDecoderLayer(nn.Module):
+    """
+    Transformer layer with an incremental KV-cache path.
+
+    Parameter names intentionally mirror nn.TransformerEncoderLayer so existing
+    checkpoints can still load: self_attn, linear1, linear2, norm1, norm2, and
+    the same dropout module names.
+    """
+
+    def __init__(self, config: AudioFIMCausalConfig):
+        super().__init__()
+        self.embed_dim = int(config.hidden_size)
+        self.num_heads = int(config.num_heads)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.self_attn = nn.MultiheadAttention(
+            self.embed_dim,
+            self.num_heads,
+            dropout=float(config.dropout),
+            batch_first=True,
+        )
+        self.linear1 = nn.Linear(self.embed_dim, int(config.intermediate_size))
+        self.dropout = nn.Dropout(float(config.dropout))
+        self.linear2 = nn.Linear(int(config.intermediate_size), self.embed_dim)
+        self.norm1 = nn.LayerNorm(self.embed_dim)
+        self.norm2 = nn.LayerNorm(self.embed_dim)
+        self.dropout1 = nn.Dropout(float(config.dropout))
+        self.dropout2 = nn.Dropout(float(config.dropout))
+        self.activation = ACT2FN[config.hidden_act]
+
+    def _shape_heads(self, states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = states.shape
+        return states.view(
+            batch_size, seq_len, self.num_heads, self.head_dim
+        ).transpose(1, 2).contiguous()
+
+    def _merge_heads(self, states: torch.Tensor) -> torch.Tensor:
+        batch_size, _, seq_len, _ = states.shape
+        return states.transpose(1, 2).contiguous().view(
+            batch_size, seq_len, self.embed_dim
+        )
+
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv = F.linear(
+            hidden_states,
+            self.self_attn.in_proj_weight,
+            self.self_attn.in_proj_bias,
+        )
+        return qkv.chunk(3, dim=-1)
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        return_kv: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, LayerKVCache]:
+        present_key_value = None
+        if return_kv:
+            _, key_states, value_states = self._project_qkv(src)
+            present_key_value = (
+                self._shape_heads(key_states),
+                self._shape_heads(value_states),
+            )
+
+        attn_output, _ = self.self_attn(
+            src,
+            src,
+            src,
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,
+        )
+        src = self.norm1(src + self.dropout1(attn_output))
+        ff_output = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = self.norm2(src + self.dropout2(ff_output))
+
+        if return_kv:
+            assert present_key_value is not None
+            return src, present_key_value
+        return src
+
+    def forward_cached(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_value: Optional[LayerKVCache] = None,
+    ) -> Tuple[torch.Tensor, LayerKVCache]:
+        query_states, key_states, value_states = self._project_qkv(hidden_states)
+        query_states = self._shape_heads(query_states)
+        key_states = self._shape_heads(key_states)
+        value_states = self._shape_heads(value_states)
+
+        if past_key_value is not None:
+            past_key, past_value = past_key_value
+            key_states = torch.cat([past_key, key_states], dim=2)
+            value_states = torch.cat([past_value, value_states], dim=2)
+
+        attn_scores = torch.matmul(
+            query_states,
+            key_states.transpose(-2, -1),
+        ) / math.sqrt(self.head_dim)
+        attn_probs = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(
+            query_states.dtype
+        )
+        attn_probs = F.dropout(
+            attn_probs,
+            p=float(self.self_attn.dropout),
+            training=self.training,
+        )
+        attn_output = torch.matmul(attn_probs, value_states)
+        attn_output = self._merge_heads(attn_output)
+        attn_output = self.self_attn.out_proj(attn_output)
+
+        hidden_states = self.norm1(hidden_states + self.dropout1(attn_output))
+        ff_output = self.linear2(
+            self.dropout(self.activation(self.linear1(hidden_states)))
+        )
+        hidden_states = self.norm2(hidden_states + self.dropout2(ff_output))
+        return hidden_states, (key_states, value_states)
+
+
 class AudioFIMCausalLM(PreTrainedModel):
     """
     Compact causal decoder for Step 2 audio-aware FIM.
@@ -386,15 +513,7 @@ class AudioFIMCausalLM(PreTrainedModel):
 
         self.layers = nn.ModuleList(
             [
-                nn.TransformerEncoderLayer(
-                    d_model=config.hidden_size,
-                    nhead=config.num_heads,
-                    dim_feedforward=config.intermediate_size,
-                    dropout=config.dropout,
-                    activation=ACT2FN[config.hidden_act],
-                    batch_first=True,
-                    norm_first=False,
-                )
+                AudioFIMCausalDecoderLayer(config)
                 for _ in range(config.num_layers)
             ]
         )
@@ -467,6 +586,104 @@ class AudioFIMCausalLM(PreTrainedModel):
         audio_emb = audio_emb * valid.unsqueeze(-1).to(audio_emb.dtype)
         return audio_emb
 
+    def _embed_inputs(
+        self,
+        input_ids: torch.Tensor,
+        audio_features: Optional[torch.Tensor] = None,
+        audio_frame_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        _, seq_len = input_ids.shape
+        if position_ids is None:
+            if seq_len > self.config.max_position_embeddings:
+                raise ValueError(
+                    f"seq_len={seq_len} exceeds max_position_embeddings="
+                    f"{self.config.max_position_embeddings}"
+                )
+        elif bool((position_ids >= self.config.max_position_embeddings).any().item()):
+            raise ValueError(
+                "position_ids exceed max_position_embeddings="
+                f"{self.config.max_position_embeddings}"
+            )
+
+        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = hidden_states + self.position_emb(
+            seq_len,
+            input_ids.device,
+            position_ids=position_ids,
+        )
+        token_audio_emb = self._token_audio_embeddings(
+            hidden_states,
+            audio_features=audio_features,
+            audio_frame_ids=audio_frame_ids,
+        )
+        if token_audio_emb is not None:
+            hidden_states = hidden_states + token_audio_emb
+        return self.dropout(self.input_norm(hidden_states))
+
+    def _forward_prefill_with_cache(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        audio_features: Optional[torch.Tensor] = None,
+        audio_frame_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[LayerKVCache]]:
+        _, seq_len = input_ids.shape
+        hidden_states = self._embed_inputs(
+            input_ids=input_ids,
+            audio_features=audio_features,
+            audio_frame_ids=audio_frame_ids,
+        )
+        causal_mask = self._build_causal_mask(seq_len, input_ids.device)
+        key_padding_mask = None
+        if attention_mask is not None:
+            key_padding_mask = attention_mask == 0
+
+        past_key_values: List[LayerKVCache] = []
+        for layer in self.layers:
+            hidden_states, layer_cache = layer(
+                hidden_states,
+                src_mask=causal_mask,
+                src_key_padding_mask=key_padding_mask,
+                return_kv=True,
+            )
+            past_key_values.append(layer_cache)
+
+        hidden_states = self.final_norm(hidden_states)
+        return self.out_head(hidden_states), past_key_values
+
+    def _forward_cached_step(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        past_key_values: Sequence[LayerKVCache],
+        audio_features: Optional[torch.Tensor] = None,
+        audio_frame_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, List[LayerKVCache]]:
+        if len(past_key_values) != len(self.layers):
+            raise ValueError(
+                f"Expected {len(self.layers)} layer caches, got "
+                f"{len(past_key_values)}"
+            )
+
+        hidden_states = self._embed_inputs(
+            input_ids=input_ids,
+            audio_features=audio_features,
+            audio_frame_ids=audio_frame_ids,
+            position_ids=position_ids,
+        )
+        next_key_values: List[LayerKVCache] = []
+        for layer, layer_cache in zip(self.layers, past_key_values):
+            hidden_states, next_cache = layer.forward_cached(
+                hidden_states,
+                past_key_value=layer_cache,
+            )
+            next_key_values.append(next_cache)
+
+        hidden_states = self.final_norm(hidden_states)
+        return self.out_head(hidden_states), next_key_values
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -479,25 +696,13 @@ class AudioFIMCausalLM(PreTrainedModel):
     ) -> CausalLMOutput:
         del kwargs
 
-        batch_size, seq_len = input_ids.shape
-        if seq_len > self.config.max_position_embeddings:
-            raise ValueError(
-                f"seq_len={seq_len} exceeds max_position_embeddings="
-                f"{self.config.max_position_embeddings}"
-            )
-
-        hidden_states = self.embed_tokens(input_ids)
-        hidden_states = hidden_states + self.position_emb(
-            seq_len, input_ids.device, position_ids=position_ids
-        )
-        token_audio_emb = self._token_audio_embeddings(
-            hidden_states,
+        _, seq_len = input_ids.shape
+        hidden_states = self._embed_inputs(
+            input_ids=input_ids,
             audio_features=audio_features,
             audio_frame_ids=audio_frame_ids,
+            position_ids=position_ids,
         )
-        if token_audio_emb is not None:
-            hidden_states = hidden_states + token_audio_emb
-        hidden_states = self.dropout(self.input_norm(hidden_states))
 
         causal_mask = self._build_causal_mask(seq_len, input_ids.device)
         key_padding_mask = None
@@ -550,15 +755,15 @@ class AudioFIMCausalLM(PreTrainedModel):
         history_audio_features: Optional[torch.Tensor] = None,
         temperature: float = 0.0,
         audio_cfg_scale: float = 1.0,
+        use_cache: bool = True,
     ) -> MotionSequence:
         """
         Generate a fixed-gap middle motion sequence.
 
-        This simple helper favors correctness over maximum speed. It rebuilds
-        the full context each generated token. A KV-cache path can be added once
-        the training behavior is confirmed. When audio_cfg_scale != 1, classifier-
-        free guidance is applied on the audio condition with zero-audio as the
-        unconditional branch.
+        By default this uses a transformer KV cache: one full causal prefill for
+        the prompt, then one-token decode steps for the generated motion stream.
+        When audio_cfg_scale != 1, classifier-free guidance is applied on the
+        audio condition with zero-audio as the unconditional branch.
         """
 
         self.eval()
@@ -590,35 +795,10 @@ class AudioFIMCausalLM(PreTrainedModel):
             int(middle_audio_features.shape[0]) * self.config.num_quantizers
         )
 
-        for token_idx in range(total_motion_tokens):
-            if float(audio_cfg_scale) == 1.0:
-                outputs = self(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    audio_features=audio_features,
-                    audio_frame_ids=audio_frame_ids,
-                )
-                next_logits = outputs.logits[:, -1, :].clone()
-            else:
-                cond_outputs = self(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    audio_features=audio_features,
-                    audio_frame_ids=audio_frame_ids,
-                )
-                uncond_outputs = self(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    audio_features=torch.zeros_like(audio_features),
-                    audio_frame_ids=audio_frame_ids,
-                )
-                cond_logits = cond_outputs.logits[:, -1, :]
-                uncond_logits = uncond_outputs.logits[:, -1, :]
-                next_logits = (
-                    uncond_logits
-                    + float(audio_cfg_scale) * (cond_logits - uncond_logits)
-                ).clone()
+        cfg_scale = float(audio_cfg_scale)
 
+        def select_next_id(next_logits: torch.Tensor, token_idx: int) -> torch.Tensor:
+            next_logits = next_logits.clone()
             quantizer_idx = token_idx % self.config.num_quantizers
             allowed_start = quantizer_idx * self.config.codebook_size
             allowed_end = allowed_start + self.config.codebook_size
@@ -628,23 +808,118 @@ class AudioFIMCausalLM(PreTrainedModel):
 
             if temperature and temperature > 0:
                 probs = torch.softmax(next_logits / temperature, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
+                return torch.multinomial(probs, num_samples=1)
+            return torch.argmax(next_logits, dim=-1, keepdim=True)
+
+        if use_cache:
+            prompt_len = input_ids.size(1)
+            cond_logits, cond_cache = self._forward_prefill_with_cache(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                audio_features=audio_features,
+                audio_frame_ids=audio_frame_ids,
+            )
+            if cfg_scale == 1.0:
+                current_logits = cond_logits[:, -1, :]
+                uncond_cache = None
+                zero_audio_features = None
             else:
-                next_id = torch.argmax(next_logits, dim=-1, keepdim=True)
+                zero_audio_features = torch.zeros_like(audio_features)
+                uncond_logits, uncond_cache = self._forward_prefill_with_cache(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    audio_features=zero_audio_features,
+                    audio_frame_ids=audio_frame_ids,
+                )
+                current_logits = uncond_logits[:, -1, :] + cfg_scale * (
+                    cond_logits[:, -1, :] - uncond_logits[:, -1, :]
+                )
 
-            generated_ids.append(int(next_id.item()))
-            input_ids = torch.cat([input_ids, next_id], dim=1)
-            attention_mask = torch.ones_like(input_ids)
+            for token_idx in range(total_motion_tokens):
+                next_id = select_next_id(current_logits, token_idx)
+                generated_ids.append(int(next_id.item()))
 
-            next_predict_idx = token_idx + 1
-            next_audio_id = -1
-            if next_predict_idx < total_motion_tokens:
+                next_predict_idx = token_idx + 1
+                if next_predict_idx >= total_motion_tokens:
+                    break
+
                 middle_frame_idx = next_predict_idx // self.config.num_quantizers
                 next_audio_id = encoded.middle_audio_local_ids[middle_frame_idx]
-            next_audio = torch.tensor(
-                [[next_audio_id]], dtype=torch.long, device=device
+                step_audio_frame_ids = torch.tensor(
+                    [[next_audio_id]], dtype=torch.long, device=device
+                )
+                step_position_ids = torch.tensor(
+                    [[prompt_len + token_idx]], dtype=torch.long, device=device
+                )
+                cond_logits, cond_cache = self._forward_cached_step(
+                    input_ids=next_id,
+                    past_key_values=cond_cache,
+                    audio_features=audio_features,
+                    audio_frame_ids=step_audio_frame_ids,
+                    position_ids=step_position_ids,
+                )
+                if cfg_scale == 1.0:
+                    current_logits = cond_logits[:, -1, :]
+                else:
+                    assert zero_audio_features is not None
+                    assert uncond_cache is not None
+                    uncond_logits, uncond_cache = self._forward_cached_step(
+                        input_ids=next_id,
+                        past_key_values=uncond_cache,
+                        audio_features=zero_audio_features,
+                        audio_frame_ids=step_audio_frame_ids,
+                        position_ids=step_position_ids,
+                    )
+                    current_logits = uncond_logits[:, -1, :] + cfg_scale * (
+                        cond_logits[:, -1, :] - uncond_logits[:, -1, :]
+                    )
+        else:
+            zero_audio_features = (
+                torch.zeros_like(audio_features) if cfg_scale != 1.0 else None
             )
-            audio_frame_ids = torch.cat([audio_frame_ids, next_audio], dim=1)
+            for token_idx in range(total_motion_tokens):
+                if cfg_scale == 1.0:
+                    outputs = self(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        audio_features=audio_features,
+                        audio_frame_ids=audio_frame_ids,
+                    )
+                    next_logits = outputs.logits[:, -1, :]
+                else:
+                    assert zero_audio_features is not None
+                    cond_outputs = self(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        audio_features=audio_features,
+                        audio_frame_ids=audio_frame_ids,
+                    )
+                    uncond_outputs = self(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        audio_features=zero_audio_features,
+                        audio_frame_ids=audio_frame_ids,
+                    )
+                    cond_logits = cond_outputs.logits[:, -1, :]
+                    uncond_logits = uncond_outputs.logits[:, -1, :]
+                    next_logits = uncond_logits + cfg_scale * (
+                        cond_logits - uncond_logits
+                    )
+
+                next_id = select_next_id(next_logits, token_idx)
+                generated_ids.append(int(next_id.item()))
+                input_ids = torch.cat([input_ids, next_id], dim=1)
+                attention_mask = torch.ones_like(input_ids)
+
+                next_predict_idx = token_idx + 1
+                next_audio_id = -1
+                if next_predict_idx < total_motion_tokens:
+                    middle_frame_idx = next_predict_idx // self.config.num_quantizers
+                    next_audio_id = encoded.middle_audio_local_ids[middle_frame_idx]
+                next_audio = torch.tensor(
+                    [[next_audio_id]], dtype=torch.long, device=device
+                )
+                audio_frame_ids = torch.cat([audio_frame_ids, next_audio], dim=1)
 
         frames = []
         for start in range(0, len(generated_ids), self.config.num_quantizers):
