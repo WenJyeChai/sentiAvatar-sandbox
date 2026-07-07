@@ -356,6 +356,22 @@ def configure_wandb(args: argparse.Namespace, default_run_name: str) -> Optional
     return args.wandb_run_name or default_run_name
 
 
+class AudioFIMRawTrainer(Trainer):
+    """Plain Trainer with DDP summed-loss logging normalized for readability."""
+
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        logs = dict(logs)
+        if (
+            "loss" in logs
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            world_size = torch.distributed.get_world_size()
+            if world_size > 1:
+                logs["loss"] = logs["loss"] / world_size
+        return super().log(logs, *args, **kwargs)
+
+
 
 def _token_color(value: int) -> tuple[int, int, int]:
     """Stable color for compact 0..511 RVQ token values."""
@@ -2308,7 +2324,7 @@ def main() -> None:
         )
 
     with timed_stage("create Trainer", args.profile_startup):
-        trainer = Trainer(
+        trainer = AudioFIMRawTrainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
