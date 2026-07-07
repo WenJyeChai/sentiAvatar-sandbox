@@ -362,13 +362,14 @@ class AudioFIMRawTrainer(Trainer):
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
         logs = dict(logs)
         if (
-            "loss" in logs
-            and torch.distributed.is_available()
+            torch.distributed.is_available()
             and torch.distributed.is_initialized()
         ):
             world_size = torch.distributed.get_world_size()
             if world_size > 1:
-                logs["loss"] = logs["loss"] / world_size
+                for key in ("loss", "eval_loss"):
+                    if key in logs:
+                        logs[key] = logs[key] / world_size
         return super().log(logs, *args, **kwargs)
 
 
