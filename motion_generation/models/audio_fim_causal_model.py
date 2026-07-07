@@ -88,8 +88,6 @@ class AudioFIMCausalConfig(PretrainedConfig):
         dropout: float = 0.2,
         rms_norm_eps: float = 1e-6,
         hidden_act: str = "gelu",
-        audio_fusion: str = "input_add",
-        audio_gate_init: float = 0.0,
         initializer_range: float = 0.02,
         vocab_size: Optional[int] = None,
         **kwargs,
@@ -98,11 +96,6 @@ class AudioFIMCausalConfig(PretrainedConfig):
             raise ValueError("hidden_size must be divisible by num_heads")
         if max_gap_frames < 1:
             raise ValueError("max_gap_frames must be >= 1")
-        if audio_fusion not in {"input_add", "gated_layers"}:
-            raise ValueError(
-                "audio_fusion must be one of {'input_add', 'gated_layers'}"
-            )
-
         motion_vocab_size = int(codebook_size) * int(num_quantizers)
         cursor = motion_vocab_size
         mask_token_id = cursor
@@ -136,6 +129,8 @@ class AudioFIMCausalConfig(PretrainedConfig):
         kwargs.pop("bos_token_id", None)
         kwargs.pop("eos_token_id", None)
         kwargs.pop("tie_word_embeddings", None)
+        kwargs.pop("audio_fusion", None)
+        kwargs.pop("audio_gate_init", None)
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -158,8 +153,6 @@ class AudioFIMCausalConfig(PretrainedConfig):
         self.dropout = float(dropout)
         self.rms_norm_eps = float(rms_norm_eps)
         self.hidden_act = hidden_act
-        self.audio_fusion = audio_fusion
-        self.audio_gate_init = float(audio_gate_init)
         self.initializer_range = float(initializer_range)
 
         self.mask_token_id = int(mask_token_id)
@@ -405,17 +398,6 @@ class AudioFIMCausalLM(PreTrainedModel):
                 for _ in range(config.num_layers)
             ]
         )
-        if config.audio_fusion == "gated_layers":
-            self.audio_layer_gates = nn.Parameter(
-                torch.full(
-                    (config.num_layers,),
-                    float(config.audio_gate_init),
-                    dtype=torch.float32,
-                )
-            )
-        else:
-            self.audio_layer_gates = None
-
         self.final_norm = AudioFIMRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.out_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -513,7 +495,7 @@ class AudioFIMCausalLM(PreTrainedModel):
             audio_features=audio_features,
             audio_frame_ids=audio_frame_ids,
         )
-        if self.config.audio_fusion == "input_add" and token_audio_emb is not None:
+        if token_audio_emb is not None:
             hidden_states = hidden_states + token_audio_emb
         hidden_states = self.dropout(self.input_norm(hidden_states))
 
@@ -522,16 +504,7 @@ class AudioFIMCausalLM(PreTrainedModel):
         if attention_mask is not None:
             key_padding_mask = attention_mask == 0
 
-        for layer_idx, layer in enumerate(self.layers):
-            if (
-                self.config.audio_fusion == "gated_layers"
-                and token_audio_emb is not None
-            ):
-                gate = self.audio_layer_gates[layer_idx].to(
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-                hidden_states = hidden_states + gate * token_audio_emb
+        for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 hidden_states = checkpoint(
                     lambda x, layer=layer: layer(
