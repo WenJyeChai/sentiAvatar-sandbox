@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -16,6 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -243,11 +245,13 @@ def run_epoch(
     device: torch.device,
     args: argparse.Namespace,
     optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[LambdaLR] = None,
     epoch: int = 0,
     split: str = "train",
     wandb_run=None,
     state: Optional[Dict[str, int]] = None,
     on_step_end=None,
+    progress=None,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -256,18 +260,6 @@ def run_epoch(
     start_time = time.time()
     model_core = unwrap_model(model)
     use_bf16 = bool(args.bf16 and device.type == "cuda")
-    show_progress = is_main_process(args) and not args.disable_tqdm and tqdm is not None
-    progress = (
-        tqdm(
-            total=len(loader),
-            desc=f"{split} epoch {epoch}/{args.epochs}",
-            dynamic_ncols=True,
-            leave=False,
-        )
-        if show_progress
-        else None
-    )
-
     for step, batch in enumerate(loader, start=1):
         inputs = move_parts(batch["parts"], device)
         with torch.set_grad_enabled(is_train):
@@ -292,6 +284,8 @@ def run_epoch(
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
                 if state is not None:
                     state["global_step"] = int(state.get("global_step", 0)) + 1
 
@@ -302,11 +296,12 @@ def run_epoch(
             totals[key] += float(losses[key].item()) * batch_size
 
         global_step = int(state.get("global_step", step) if state is not None else step)
-        if progress is not None:
+        if is_train and progress is not None:
             progress.update(1)
             progress.set_postfix(
                 {
                     "gstep": global_step,
+                    "epoch": f"{epoch}/{args.epochs}",
                     "loss": f"{float(losses['loss'].item()):.4f}",
                     "rec": f"{float(losses['rec'].item()):.4f}",
                     "vel": f"{float(losses['vel'].item()):.4f}",
@@ -347,9 +342,6 @@ def run_epoch(
         if args.dry_run_batches and step >= args.dry_run_batches:
             break
 
-    if progress is not None:
-        progress.close()
-
     return average_totals(
         totals,
         count,
@@ -362,6 +354,7 @@ def save_checkpoint(
     path: Path,
     model: MultiPartRVQVAE,
     optimizer: torch.optim.Optimizer,
+    scheduler: Optional[LambdaLR],
     epoch: int,
     args: argparse.Namespace,
     normalizer_path: Path,
@@ -375,6 +368,7 @@ def save_checkpoint(
             "epoch": epoch,
             "model_state_dict": model_core.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "model_config": model_core.config_dict(),
             "args": vars(args),
             "normalizer_path": str(normalizer_path),
@@ -417,6 +411,35 @@ def build_model(args: argparse.Namespace) -> MultiPartRVQVAE:
         quantize_dropout_cutoff_index=args.quantize_dropout_cutoff_index,
         mu=args.mu,
     )
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    total_training_steps: int,
+) -> Optional[LambdaLR]:
+    if args.lr_scheduler_type == "constant":
+        return None
+    if total_training_steps <= 0:
+        return None
+
+    warmup_steps = int(args.warmup_steps)
+    if args.warmup_ratio > 0:
+        warmup_steps = max(warmup_steps, int(total_training_steps * args.warmup_ratio))
+    warmup_steps = min(max(warmup_steps, 0), total_training_steps)
+
+    def lr_lambda(current_step: int) -> float:
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step + 1) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_training_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        if args.lr_scheduler_type == "cosine":
+            min_factor = float(args.min_lr_ratio)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_factor + (1.0 - min_factor) * cosine
+        raise ValueError(f"Unsupported lr_scheduler_type: {args.lr_scheduler_type}")
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def _wandb_config(args: argparse.Namespace) -> Dict[str, object]:
@@ -563,6 +586,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_train_epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--lr_scheduler_type", choices=["constant", "cosine"], default="constant")
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--warmup_ratio", type=float, default=0.0)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.05)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--rec_weight", type=float, default=1.0)
     parser.add_argument("--vel_weight", type=float, default=1.0)
@@ -739,12 +766,14 @@ def main() -> None:
     start_epoch = 1
     best_val: Optional[float] = None
     optimizer_state = None
+    scheduler_state = None
     state = {"global_step": 0}
 
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer_state = checkpoint.get("optimizer_state_dict")
+        scheduler_state = checkpoint.get("scheduler_state_dict")
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_val = checkpoint.get("best_val")
         state["global_step"] = int(checkpoint.get("global_step", 0))
@@ -757,6 +786,10 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
+    total_training_steps_for_scheduler = len(train_loader) * max(0, args.epochs - start_epoch + 1)
+    scheduler = build_scheduler(optimizer, args, total_training_steps_for_scheduler)
+    if scheduler is not None and scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
     if wandb_run is not None and args.wandb_watch:
         wandb_run.watch(model, log="gradients", log_freq=max(args.log_every, 1))
 
@@ -801,6 +834,11 @@ def main() -> None:
             f"save_steps={args.save_steps or 'epoch'}, "
             f"save_total_limit={args.save_total_limit}"
         )
+        print(
+            f"LR schedule: {args.lr_scheduler_type}, "
+            f"warmup_steps={args.warmup_steps}, warmup_ratio={args.warmup_ratio}, "
+            f"min_lr_ratio={args.min_lr_ratio}"
+        )
 
     training_start_time = time.time()
     def step_eval_and_save(global_step: int, epoch: int) -> None:
@@ -828,6 +866,7 @@ def main() -> None:
                         model_dir / "best.pth",
                         model,
                         optimizer,
+                        scheduler,
                         epoch,
                         args,
                         normalizer_path,
@@ -846,6 +885,7 @@ def main() -> None:
                 model_dir / f"step_{global_step}.pth",
                 model,
                 optimizer,
+                scheduler,
                 epoch,
                 args,
                 normalizer_path,
@@ -856,6 +896,7 @@ def main() -> None:
                 model_dir / "latest.pth",
                 model,
                 optimizer,
+                scheduler,
                 epoch,
                 args,
                 normalizer_path,
@@ -864,105 +905,128 @@ def main() -> None:
             )
             prune_step_checkpoints(model_dir, args.save_total_limit)
 
-    for epoch in range(start_epoch, args.epochs + 1):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-        epoch_start = time.time()
-        train_metrics = run_epoch(
-            model,
-            train_loader,
-            device,
-            args,
-            optimizer=optimizer,
-            epoch=epoch,
-            split="train",
-            wandb_run=wandb_run,
-            state=state,
-            on_step_end=lambda global_step, current_epoch=epoch: step_eval_and_save(
-                global_step,
-                current_epoch,
-            ),
+    total_remaining_steps = len(train_loader) * max(0, args.epochs - start_epoch + 1)
+    global_progress = None
+    if is_main_process(args) and not args.disable_tqdm and tqdm is not None:
+        global_progress = tqdm(
+            total=total_remaining_steps,
+            initial=0,
+            desc="train total",
+            dynamic_ncols=True,
+            leave=True,
         )
-        val_metrics = None
-        if val_loader is not None and args.eval_steps <= 0:
-            with torch.no_grad():
-                val_metrics = run_epoch(
-                    model,
-                    val_loader,
-                    device,
-                    args,
-                    optimizer=None,
-                    epoch=epoch,
-                    split="val",
-                    wandb_run=wandb_run,
-                )
 
-        elapsed = time.time() - epoch_start
-        epochs_completed = max(1, epoch - start_epoch + 1)
-        avg_epoch_sec = (time.time() - training_start_time) / epochs_completed
-        remaining_epochs = max(0, args.epochs - epoch)
-        eta_text = format_duration(avg_epoch_sec * remaining_epochs)
-        line = (
-            f"epoch {epoch:04d}/{args.epochs:04d} "
-            f"train_loss={train_metrics['total']:.5f} "
-            f"rec={train_metrics['rec']:.5f} vel={train_metrics['vel']:.5f} "
-            f"commit={train_metrics['commit']:.5f}"
-        )
-        if val_metrics is not None:
-            line += f" val_loss={val_metrics['total']:.5f}"
-        line += f" time={elapsed:.1f}s eta={eta_text}"
-        if is_main_process(args):
-            print(line)
+    try:
+        for epoch in range(start_epoch, args.epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            epoch_start = time.time()
+            train_metrics = run_epoch(
+                model,
+                train_loader,
+                device,
+                args,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                split="train",
+                wandb_run=wandb_run,
+                state=state,
+                on_step_end=lambda global_step, current_epoch=epoch: step_eval_and_save(
+                    global_step,
+                    current_epoch,
+                ),
+                progress=global_progress,
+            )
+            val_metrics = None
+            if val_loader is not None and args.eval_steps <= 0:
+                with torch.no_grad():
+                    val_metrics = run_epoch(
+                        model,
+                        val_loader,
+                        device,
+                        args,
+                        optimizer=None,
+                        epoch=epoch,
+                        split="val",
+                        wandb_run=wandb_run,
+                    )
 
-        current_val = val_metrics["total"] if val_metrics is not None else train_metrics["total"]
-        if best_val is None or current_val < best_val:
-            best_val = current_val
+            elapsed = time.time() - epoch_start
+            epochs_completed = max(1, epoch - start_epoch + 1)
+            avg_epoch_sec = (time.time() - training_start_time) / epochs_completed
+            remaining_epochs = max(0, args.epochs - epoch)
+            eta_text = format_duration(avg_epoch_sec * remaining_epochs)
+            line = (
+                f"epoch {epoch:04d}/{args.epochs:04d} "
+                f"train_loss={train_metrics['total']:.5f} "
+                f"rec={train_metrics['rec']:.5f} vel={train_metrics['vel']:.5f} "
+                f"commit={train_metrics['commit']:.5f}"
+            )
+            if val_metrics is not None:
+                line += f" val_loss={val_metrics['total']:.5f}"
+            line += f" time={elapsed:.1f}s eta={eta_text}"
+            if is_main_process(args):
+                if global_progress is not None:
+                    global_progress.write(line)
+                else:
+                    print(line)
+
+            current_val = val_metrics["total"] if val_metrics is not None else train_metrics["total"]
+            if best_val is None or current_val < best_val:
+                best_val = current_val
+                if is_main_process(args):
+                    save_checkpoint(
+                        model_dir / "best.pth",
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        args,
+                        normalizer_path,
+                        best_val,
+                        global_step=state["global_step"],
+                    )
+
+            if wandb_run is not None and is_main_process(args):
+                payload = {
+                    "epoch": epoch,
+                    "global_step": state["global_step"],
+                    "time/epoch_sec": elapsed,
+                    "best/loss": best_val,
+                }
+                payload.update({f"train/{key}_epoch": value for key, value in train_metrics.items()})
+                if val_metrics is not None:
+                    payload.update({f"val/{key}_epoch": value for key, value in val_metrics.items()})
+                wandb_run.log(payload, step=state["global_step"])
+
             if is_main_process(args):
                 save_checkpoint(
-                    model_dir / "best.pth",
+                    model_dir / "latest.pth",
                     model,
                     optimizer,
+                    scheduler,
                     epoch,
                     args,
                     normalizer_path,
                     best_val,
                     global_step=state["global_step"],
                 )
-
-        if wandb_run is not None and is_main_process(args):
-            payload = {
-                "epoch": epoch,
-                "global_step": state["global_step"],
-                "time/epoch_sec": elapsed,
-                "best/loss": best_val,
-            }
-            payload.update({f"train/{key}_epoch": value for key, value in train_metrics.items()})
-            if val_metrics is not None:
-                payload.update({f"val/{key}_epoch": value for key, value in val_metrics.items()})
-            wandb_run.log(payload, step=state["global_step"])
-
-        if is_main_process(args):
-            save_checkpoint(
-                model_dir / "latest.pth",
-                model,
-                optimizer,
-                epoch,
-                args,
-                normalizer_path,
-                best_val,
-                global_step=state["global_step"],
-            )
-            if args.save_every > 0 and epoch % args.save_every == 0:
-                save_checkpoint(
-                    model_dir / f"epoch_{epoch}.pth",
-                    model,
-                    optimizer,
-                    epoch,
-                    args,
-                    normalizer_path,
-                    best_val,
-                    global_step=state["global_step"],
-                )
+                if args.save_every > 0 and epoch % args.save_every == 0:
+                    save_checkpoint(
+                        model_dir / f"epoch_{epoch}.pth",
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        args,
+                        normalizer_path,
+                        best_val,
+                        global_step=state["global_step"],
+                    )
+    finally:
+        if global_progress is not None:
+            global_progress.close()
 
     if wandb_run is not None:
         wandb_run.finish()
