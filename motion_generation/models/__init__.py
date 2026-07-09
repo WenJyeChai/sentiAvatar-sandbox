@@ -5,7 +5,7 @@ except ModuleNotFoundError:
     AudioMotionConfig = None
 
 try:
-    from .audio_fim_causal_model import (
+    from .audio_fim_causal import (
         AudioFIMCausalCollator,
         AudioFIMCausalConfig,
         AudioFIMCausalDataset,

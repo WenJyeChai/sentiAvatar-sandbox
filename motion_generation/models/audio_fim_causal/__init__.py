@@ -1,0 +1,41 @@
+"""Compact causal AudioFIM Step 2 package."""
+
+from .modeling import (
+    IGNORE_INDEX,
+    AudioFIMAudioEncoder,
+    AudioFIMCausalCollator,
+    AudioFIMCausalConfig,
+    AudioFIMCausalDataset,
+    AudioFIMCausalDecoderLayer,
+    AudioFIMCausalExample,
+    AudioFIMCausalLM,
+    AudioFIMPositionEmbedding,
+    AudioFIMRMSNorm,
+    AudioFIMSequenceBuilder,
+    AudioFIMSpecialTokenNames,
+    AudioFIMTokenMapper,
+    EncodedAudioFIMExample,
+    FrameTokens,
+    LayerKVCache,
+    MotionSequence,
+)
+
+__all__ = [
+    "IGNORE_INDEX",
+    "AudioFIMAudioEncoder",
+    "AudioFIMCausalCollator",
+    "AudioFIMCausalConfig",
+    "AudioFIMCausalDataset",
+    "AudioFIMCausalDecoderLayer",
+    "AudioFIMCausalExample",
+    "AudioFIMCausalLM",
+    "AudioFIMPositionEmbedding",
+    "AudioFIMRMSNorm",
+    "AudioFIMSequenceBuilder",
+    "AudioFIMSpecialTokenNames",
+    "AudioFIMTokenMapper",
+    "EncodedAudioFIMExample",
+    "FrameTokens",
+    "LayerKVCache",
+    "MotionSequence",
+]

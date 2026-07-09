@@ -45,7 +45,7 @@ MOTION_GENERATION_DIR = THIS_DIR.parent
 PROJECT_DIR = MOTION_GENERATION_DIR.parent
 sys.path.insert(0, str(MOTION_GENERATION_DIR))
 
-from models.audio_fim_causal_model import (  # noqa: E402
+from models.audio_fim_causal import (  # noqa: E402
     AudioFIMCausalCollator,
     AudioFIMCausalConfig,
     AudioFIMCausalDataset,

@@ -10,7 +10,9 @@ Keep this path separate from:
 
 Current model path:
 
-- `models/audio_fim_causal_model.py`
+- `models/audio_fim_causal/modeling.py`
+- `models/audio_fim_causal/__init__.py`
+- legacy import shim: `models/audio_fim_causal_model.py`
 - `scripts/train_audio_fim_causal.py`
 - default checkpoint: `checkpoints/audio_fim_causal`
 
