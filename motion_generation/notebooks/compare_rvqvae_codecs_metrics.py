@@ -161,6 +161,19 @@ def require_path(path: Path, label: str) -> Path:
     return path
 
 
+def torch_load_trusted(path: Path, map_location=None):
+    """Load a trusted local checkpoint across PyTorch 2.5/2.6 defaults.
+
+    PyTorch 2.6 changed torch.load's default to weights_only=True. These local
+    checkpoints intentionally store small metadata objects such as pathlib.Path
+    inside args, so the comparison notebook must opt into full unpickling.
+    """
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def auto_find_part_checkpoint(part: str) -> Optional[Path]:
     roots = [PROJECT_DIR / "checkpoints", PROJECT_DIR / "tmp", OUT_ROOT]
     patterns = [
@@ -308,7 +321,7 @@ def load_old_rvqvae_model(checkpoint_path: Path, device: torch.device) -> Tuple[
         activation=config.model.vq_act,
         norm=config.model.vq_norm,
     )
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch_load_trusted(checkpoint_path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
     elif isinstance(checkpoint, dict) and "model" in checkpoint:
@@ -349,7 +362,7 @@ def infer_part_from_path(path: Path) -> Optional[str]:
 
 def load_multipart_checkpoint(checkpoint_path: Path, device: torch.device) -> LoadedMultipartModel:
     checkpoint_path = require_path(checkpoint_path, "multipart checkpoint")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch_load_trusted(checkpoint_path, map_location=device)
     args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     model_config = checkpoint.get("model_config", {}) if isinstance(checkpoint, dict) else {}
 
@@ -1022,7 +1035,7 @@ def load_evaluator_motion_encoder(device: torch.device):
         cfg.motion_encoder.dropout,
         cfg.motion_encoder.activation,
     )
-    ckpt = torch.load(EVALUATOR_CKPT, map_location="cpu")
+    ckpt = torch_load_trusted(EVALUATOR_CKPT, map_location="cpu")
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         ckpt = ckpt["state_dict"]
     motion_state = {
@@ -1076,8 +1089,8 @@ def encode_evaluator_latents(
     files = sorted(motion_dir.glob(f"*_{suffix}.npy"))
     if not files:
         raise FileNotFoundError(f"No *_{suffix}.npy files found in {motion_dir}")
-    mean = torch.load(ACTIVE_EVALUATOR_STATS_DIR / "mean.pt", map_location="cpu").float()
-    std = torch.load(ACTIVE_EVALUATOR_STATS_DIR / "std.pt", map_location="cpu").float()
+    mean = torch_load_trusted(ACTIVE_EVALUATOR_STATS_DIR / "mean.pt", map_location="cpu").float()
+    std = torch_load_trusted(ACTIVE_EVALUATOR_STATS_DIR / "std.pt", map_location="cpu").float()
     max_len = int(cfg.dataset.max_motion_length)
 
     names: List[str] = []
@@ -1191,7 +1204,7 @@ def load_chrontmr_retrieval_model(device: torch.device):
     finally:
         transformers.AutoModel.from_pretrained = original_from_pretrained
 
-    ckpt = torch.load(EVALUATOR_CKPT, map_location=device)
+    ckpt = torch_load_trusted(EVALUATOR_CKPT, map_location=device)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         ckpt = ckpt["state_dict"]
     missing, unexpected = model.load_state_dict(ckpt, strict=False)
