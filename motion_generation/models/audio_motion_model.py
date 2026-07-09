@@ -17,6 +17,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers.modeling_utils import PreTrainedModel
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.activations import ACT2FN
@@ -40,6 +41,7 @@ class AudioMotionConfig(PretrainedConfig):
         num_frames=5,           # 窗口帧数
         dropout=0.2,
         cond_drop_prob=0.2,
+        constrain_token_logits=False,
         rms_norm_eps=1e-6,
         hidden_act="gelu",
         **kwargs,
@@ -57,6 +59,7 @@ class AudioMotionConfig(PretrainedConfig):
         self.num_frames = num_frames
         self.dropout = dropout
         self.cond_drop_prob = cond_drop_prob
+        self.constrain_token_logits = constrain_token_logits
         self.rms_norm_eps = rms_norm_eps
         self.hidden_act = hidden_act
 
@@ -168,9 +171,54 @@ class AudioMotionTransformer(PreTrainedModel):
 
         # Normalization
         self.norm = AudioMotionRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.gradient_checkpointing = False
 
         # Initialize weights
         self.post_init()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        del gradient_checkpointing_kwargs
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing = False
+
+    def _run_encoder(self, x, attention_mask=None):
+        if self.gradient_checkpointing and self.training:
+            hidden_states = x
+            for layer in self.encoder.layers:
+                hidden_states = checkpoint(
+                    lambda states, layer=layer: layer(states, src_mask=attention_mask),
+                    hidden_states,
+                    use_reentrant=False,
+                )
+            if self.encoder.norm is not None:
+                hidden_states = self.encoder.norm(hidden_states)
+            return hidden_states
+
+        return self.encoder(x, mask=attention_mask)
+
+    def _slot_valid_mask(self, seq_len, device):
+        """Return valid vocab ids for each motion-token slot.
+
+        Slot j is trained with the id range
+        [j * codebook_size, (j + 1) * codebook_size). This optional mask keeps
+        inference from producing a token from the wrong residual/part slot.
+        """
+        ntpf = int(self.config.num_tokens_per_frame)
+        codebook_size = int(self.config.codebook_size)
+        vocab = int(self.config.vocab_size)
+        slot_ids = torch.arange(seq_len, device=device) % ntpf
+        vocab_ids = torch.arange(vocab, device=device)
+        starts = slot_ids[:, None] * codebook_size
+        ends = starts + codebook_size
+        return (vocab_ids[None, :] >= starts) & (vocab_ids[None, :] < ends)
+
+    def constrain_logits_by_slot(self, logits):
+        if not getattr(self.config, "constrain_token_logits", False):
+            return logits
+        valid = self._slot_valid_mask(logits.size(1), logits.device).unsqueeze(0)
+        return logits.masked_fill(~valid, torch.finfo(logits.dtype).min)
 
     def _fuse_audio(self, token_embeddings, audio_features):
         """
@@ -224,17 +272,18 @@ class AudioMotionTransformer(PreTrainedModel):
 
         # Normalize and encode
         x = self.norm(x)
-        output = self.encoder(x, mask=attention_mask)  # (B, seq_len, hidden_size)
+        output = self._run_encoder(x, attention_mask)  # (B, seq_len, hidden_size)
 
         # Get logits
         logits = self.out_head(output)  # (B, seq_len, vocab_size)
+        logits = self.constrain_logits_by_slot(logits)
 
         if labels is None:
             return logits
 
         # Calculate loss (only on masked positions, labels=-100 for non-masked)
         loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction="mean")
-        loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+        loss = loss_fn(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
 
         with torch.no_grad():
             preds = logits.argmax(dim=-1)
