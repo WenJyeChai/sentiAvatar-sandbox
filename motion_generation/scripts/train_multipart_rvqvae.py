@@ -116,9 +116,11 @@ def compute_losses(
 ) -> Dict[str, torch.Tensor]:
     rec = output["rec"]
     commit = output["commit_loss"]
+    perplexity = output["perplexity"]
     rec_terms = []
     vel_terms = []
     commit_terms = []
+    metrics: Dict[str, torch.Tensor] = {}
 
     for part in PART_ORDER:
         pred = rec[part]
@@ -126,20 +128,31 @@ def compute_losses(
         frames = min(pred.shape[1], target.shape[1])
         pred = pred[:, :frames]
         target = target[:, :frames]
-        rec_terms.append(F.smooth_l1_loss(pred, target))
-        vel_terms.append(part_velocity_loss(pred, target))
-        commit_terms.append(commit[part])
+        part_rec = F.smooth_l1_loss(pred, target)
+        part_vel = part_velocity_loss(pred, target)
+        part_commit = commit[part]
+        part_total = rec_weight * part_rec + vel_weight * part_vel + commit_weight * part_commit
+        rec_terms.append(part_rec)
+        vel_terms.append(part_vel)
+        commit_terms.append(part_commit)
+        metrics[f"{part}/loss"] = part_total.detach()
+        metrics[f"{part}/rec"] = part_rec.detach()
+        metrics[f"{part}/vel"] = part_vel.detach()
+        metrics[f"{part}/commit"] = part_commit.detach()
+        metrics[f"{part}/perplexity"] = perplexity[part].detach()
 
     rec_loss = torch.stack(rec_terms).mean()
     vel_loss = torch.stack(vel_terms).mean()
     commit_loss = torch.stack(commit_terms).mean()
     total = rec_weight * rec_loss + vel_weight * vel_loss + commit_weight * commit_loss
-    return {
+    metrics.update({
         "total": total,
+        "loss": total.detach(),
         "rec": rec_loss.detach(),
         "vel": vel_loss.detach(),
         "commit": commit_loss.detach(),
-    }
+    })
+    return metrics
 
 
 def run_epoch(
@@ -154,7 +167,7 @@ def run_epoch(
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
-    totals = {"total": 0.0, "rec": 0.0, "vel": 0.0, "commit": 0.0}
+    totals: Dict[str, float] = {}
     count = 0
     start_time = time.time()
 
@@ -178,7 +191,8 @@ def run_epoch(
 
         batch_size = next(iter(inputs.values())).shape[0]
         count += batch_size
-        for key in totals:
+        for key in losses:
+            totals.setdefault(key, 0.0)
             totals[key] += float(losses[key].item()) * batch_size
 
         if is_train and args.log_every > 0 and step % args.log_every == 0:
@@ -539,20 +553,10 @@ def main() -> None:
                 "epoch": epoch,
                 "time/epoch_sec": elapsed,
                 "best/loss": best_val,
-                "train/loss_epoch": train_metrics["total"],
-                "train/rec_epoch": train_metrics["rec"],
-                "train/vel_epoch": train_metrics["vel"],
-                "train/commit_epoch": train_metrics["commit"],
             }
+            payload.update({f"train/{key}_epoch": value for key, value in train_metrics.items()})
             if val_metrics is not None:
-                payload.update(
-                    {
-                        "val/loss_epoch": val_metrics["total"],
-                        "val/rec_epoch": val_metrics["rec"],
-                        "val/vel_epoch": val_metrics["vel"],
-                        "val/commit_epoch": val_metrics["commit"],
-                    }
-                )
+                payload.update({f"val/{key}_epoch": value for key, value in val_metrics.items()})
             wandb_run.log(payload)
 
         save_checkpoint(
