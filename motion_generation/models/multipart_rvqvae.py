@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Mapping, Optional
+from typing import Dict, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -18,6 +18,7 @@ class MultiPartRVQVAE(nn.Module):
     def __init__(
         self,
         part_dims: Optional[Mapping[str, int]] = None,
+        part_order: Optional[Sequence[str]] = None,
         nb_code: int = 512,
         code_dim: int = 512,
         num_quantizers: int = 4,
@@ -35,8 +36,12 @@ class MultiPartRVQVAE(nn.Module):
         mu: float = 0.99,
     ) -> None:
         super().__init__()
-        self.part_order = tuple(PART_ORDER)
-        self.part_dims = dict(part_dims or PART_DIMS)
+        source_dims = dict(part_dims or PART_DIMS)
+        self.part_order = tuple(part_order or PART_ORDER)
+        unknown = [part for part in self.part_order if part not in source_dims]
+        if unknown:
+            raise ValueError(f"Unknown motion part(s): {unknown}")
+        self.part_dims = {part: int(source_dims[part]) for part in self.part_order}
         self.nb_code = int(nb_code)
         self.code_dim = int(code_dim)
         self.num_quantizers = int(num_quantizers)
@@ -154,4 +159,3 @@ class MultiPartRVQVAE(nn.Module):
             "num_quantizers": self.num_quantizers,
             "unit_length": self.unit_length,
         }
-

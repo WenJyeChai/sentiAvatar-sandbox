@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from einops import rearrange
 
 
@@ -103,6 +104,8 @@ class Quantizer(nn.Module):
         """初始化码本"""
         out = self._tile(x)
         self.codebook = out[:self.nb_code]
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast(self.codebook, src=0)
         self.code_sum = self.codebook.clone()
         self.code_count = torch.ones(self.nb_code, device=self.codebook.device)
         self.init = True
@@ -166,6 +169,9 @@ class Quantizer(nn.Module):
         
         code_sum = torch.matmul(code_onehot, x)
         code_count = code_onehot.sum(dim=-1)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(code_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(code_count, op=dist.ReduceOp.SUM)
         
         out = self._tile(x)
         code_rand = out[:self.nb_code]
@@ -246,6 +252,9 @@ class QuantizerEMA(Quantizer):
         
         code_sum = torch.matmul(code_onehot, x)
         code_count = code_onehot.sum(dim=-1)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(code_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(code_count, op=dist.ReduceOp.SUM)
         
         # EMA 更新
         self.code_sum = self.mu * self.code_sum + (1. - self.mu) * code_sum
