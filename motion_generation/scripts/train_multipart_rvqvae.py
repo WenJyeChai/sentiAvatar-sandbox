@@ -19,6 +19,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is expected but keep CLI robust.
+    tqdm = None
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 MODULE_DIR = PROJECT_DIR / "motion_generation"
@@ -158,6 +163,17 @@ def average_totals(
     return {key: float(tensor[i + 1].item() / total_count) for i, key in enumerate(keys)}
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
 def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
@@ -240,6 +256,17 @@ def run_epoch(
     start_time = time.time()
     model_core = unwrap_model(model)
     use_bf16 = bool(args.bf16 and device.type == "cuda")
+    show_progress = is_main_process(args) and not args.disable_tqdm and tqdm is not None
+    progress = (
+        tqdm(
+            total=len(loader),
+            desc=f"{split} epoch {epoch}/{args.epochs}",
+            dynamic_ncols=True,
+            leave=False,
+        )
+        if show_progress
+        else None
+    )
 
     for step, batch in enumerate(loader, start=1):
         inputs = move_parts(batch["parts"], device)
@@ -275,6 +302,16 @@ def run_epoch(
             totals[key] += float(losses[key].item()) * batch_size
 
         global_step = int(state.get("global_step", step) if state is not None else step)
+        if progress is not None:
+            progress.update(1)
+            progress.set_postfix(
+                {
+                    "gstep": global_step,
+                    "loss": f"{float(losses['loss'].item()):.4f}",
+                    "rec": f"{float(losses['rec'].item()):.4f}",
+                    "vel": f"{float(losses['vel'].item()):.4f}",
+                }
+            )
         should_log = is_train and args.log_every > 0 and global_step % args.log_every == 0
         if should_log:
             elapsed = time.time() - start_time
@@ -285,12 +322,16 @@ def run_epoch(
                 distributed=getattr(args, "distributed", False),
             )
             if is_main_process(args):
-                print(
+                message = (
                     f"global_step {global_step:07d} epoch_step {step:05d}/{len(loader):05d} "
                     f"loss={avg['total']:.5f} rec={avg['rec']:.5f} "
                     f"vel={avg['vel']:.5f} commit={avg['commit']:.5f} "
                     f"time={elapsed:.1f}s"
                 )
+                if progress is not None:
+                    progress.write(message)
+                else:
+                    print(message)
             if wandb_run is not None and is_main_process(args):
                 payload = {f"{split}/{key}": value for key, value in avg.items()}
                 payload["epoch"] = epoch
@@ -305,6 +346,9 @@ def run_epoch(
 
         if args.dry_run_batches and step >= args.dry_run_batches:
             break
+
+    if progress is not None:
+        progress.close()
 
     return average_totals(
         totals,
@@ -533,6 +577,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_steps", type=int, default=0)
     parser.add_argument("--eval_steps", type=int, default=0)
     parser.add_argument("--save_total_limit", type=int, default=3)
+    parser.add_argument("--disable_tqdm", action="store_true")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument(
@@ -716,12 +761,30 @@ def main() -> None:
         wandb_run.watch(model, log="gradients", log_freq=max(args.log_every, 1))
 
     if is_main_process(args):
+        train_samples_per_epoch = (
+            len(train_sampler) * args.world_size
+            if train_sampler is not None
+            else len(train_dataset)
+        )
+        val_samples_per_eval = (
+            len(val_sampler) * args.world_size
+            if val_sampler is not None
+            else (len(val_dataset) if val_dataset is not None else 0)
+        )
+        steps_per_epoch = len(train_loader)
+        total_optimizer_steps = steps_per_epoch * max(0, args.epochs - start_epoch + 1)
+        eval_loader_steps = len(val_loader) if val_loader is not None else 0
         print(f"Run dir: {run_dir}")
         print(f"Device: {device}")
         print(f"World size: {args.world_size}")
-        print(f"Train clips: {len(train_dataset)}")
+        print(f"Train examples: {len(train_dataset)} unique")
+        print(f"Train samples/epoch: {train_samples_per_epoch} including DDP padding")
+        print(f"Train steps/epoch: {steps_per_epoch} optimizer steps per rank")
+        print(f"Total optimizer steps: {total_optimizer_steps} remaining ({steps_per_epoch} x {args.epochs - start_epoch + 1} epochs)")
         if val_dataset is not None:
-            print(f"Val clips: {len(val_dataset)}")
+            print(f"Val examples: {len(val_dataset)} unique")
+            print(f"Val samples/eval: {val_samples_per_eval} including DDP padding")
+            print(f"Val steps/eval: {eval_loader_steps} per rank")
         selected_part_dims = {part: PART_DIMS[part] for part in args.parts}
         print(f"Parts: {selected_part_dims}")
         print(
@@ -730,9 +793,16 @@ def main() -> None:
         )
         print(
             f"Batch: per_device_train={args.per_device_train_batch_size}, "
-            f"effective_train={args.per_device_train_batch_size * args.world_size}"
+            f"effective_train={args.per_device_train_batch_size * args.world_size * args.gradient_accumulation_steps}"
+        )
+        print(
+            f"Cadence: logging_steps={args.log_every}, "
+            f"eval_steps={args.eval_steps or 'epoch'}, "
+            f"save_steps={args.save_steps or 'epoch'}, "
+            f"save_total_limit={args.save_total_limit}"
         )
 
+    training_start_time = time.time()
     def step_eval_and_save(global_step: int, epoch: int) -> None:
         nonlocal best_val
         if global_step <= 0:
@@ -828,6 +898,10 @@ def main() -> None:
                 )
 
         elapsed = time.time() - epoch_start
+        epochs_completed = max(1, epoch - start_epoch + 1)
+        avg_epoch_sec = (time.time() - training_start_time) / epochs_completed
+        remaining_epochs = max(0, args.epochs - epoch)
+        eta_text = format_duration(avg_epoch_sec * remaining_epochs)
         line = (
             f"epoch {epoch:04d}/{args.epochs:04d} "
             f"train_loss={train_metrics['total']:.5f} "
@@ -836,7 +910,7 @@ def main() -> None:
         )
         if val_metrics is not None:
             line += f" val_loss={val_metrics['total']:.5f}"
-        line += f" time={elapsed:.1f}s"
+        line += f" time={elapsed:.1f}s eta={eta_text}"
         if is_main_process(args):
             print(line)
 
