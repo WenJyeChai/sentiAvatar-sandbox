@@ -465,6 +465,7 @@ class AudioMotionMaskMetricsCallback(TrainerCallback):
         preds: torch.Tensor,
         labels: torch.Tensor,
         *,
+        logits: Optional[torch.Tensor] = None,
         topk: Optional[torch.Tensor] = None,
     ) -> None:
         valid, part_ids, quantizer_ids = slot_stat_masks(
@@ -477,10 +478,32 @@ class AudioMotionMaskMetricsCallback(TrainerCallback):
         if total == 0:
             return
 
+        def add_mean_stat(key: str, values: torch.Tensor, mask: torch.Tensor) -> None:
+            stat_total = int(mask.sum().item())
+            if stat_total == 0:
+                return
+            payload[f"{key}_sum"] = payload.get(f"{key}_sum", 0.0) + float(
+                values[mask].sum().item()
+            )
+            payload[f"{key}_count"] = payload.get(f"{key}_count", 0.0) + stat_total
+
         payload[f"{prefix}/token_acc"] = payload.get(f"{prefix}/token_acc", 0.0) + int(
             correct.sum().item()
         )
         payload[f"{prefix}/token_total"] = payload.get(f"{prefix}/token_total", 0.0) + total
+
+        nll = pred_conf = target_prob = None
+        if logits is not None:
+            logits_f = logits.float()
+            safe_labels = labels.masked_fill(~valid, 0).unsqueeze(-1)
+            target_logits = logits_f.gather(-1, safe_labels).squeeze(-1)
+            logsumexp = torch.logsumexp(logits_f, dim=-1)
+            nll = logsumexp - target_logits
+            pred_conf = (logits_f.max(dim=-1).values - logsumexp).exp()
+            target_prob = (-nll).exp()
+            add_mean_stat(f"{prefix}/nll", nll, valid)
+            add_mean_stat(f"{prefix}/pred_conf", pred_conf, valid)
+            add_mean_stat(f"{prefix}/target_prob", target_prob, valid)
 
         for part_idx, part in enumerate(self.part_order):
             mask = valid & part_ids.eq(part_idx)
@@ -492,6 +515,10 @@ class AudioMotionMaskMetricsCallback(TrainerCallback):
                 payload[f"{prefix}/{part}_total"] = payload.get(
                     f"{prefix}/{part}_total", 0.0
                 ) + part_total
+                if nll is not None and pred_conf is not None and target_prob is not None:
+                    add_mean_stat(f"{prefix}/{part}_nll", nll, mask)
+                    add_mean_stat(f"{prefix}/{part}_pred_conf", pred_conf, mask)
+                    add_mean_stat(f"{prefix}/{part}_target_prob", target_prob, mask)
 
         for q_idx in range(self.num_quantizers_per_part):
             mask = valid & quantizer_ids.eq(q_idx)
@@ -503,6 +530,10 @@ class AudioMotionMaskMetricsCallback(TrainerCallback):
                 payload[f"{prefix}/q{q_idx}_total"] = payload.get(
                     f"{prefix}/q{q_idx}_total", 0.0
                 ) + q_total
+                if nll is not None and pred_conf is not None and target_prob is not None:
+                    add_mean_stat(f"{prefix}/q{q_idx}_nll", nll, mask)
+                    add_mean_stat(f"{prefix}/q{q_idx}_pred_conf", pred_conf, mask)
+                    add_mean_stat(f"{prefix}/q{q_idx}_target_prob", target_prob, mask)
 
         if topk is not None:
             labels_expanded = labels.unsqueeze(-1)
@@ -520,12 +551,16 @@ class AudioMotionMaskMetricsCallback(TrainerCallback):
     def _finalize_payload(payload: Dict[str, float]) -> Dict[str, float]:
         final: Dict[str, float] = {}
         for key, value in payload.items():
-            if not key.endswith("_acc"):
-                continue
-            total_key = key[:-4] + "_total"
-            total = payload.get(total_key, 0.0)
-            if total > 0:
-                final[key] = float(value) / float(total)
+            if key.endswith("_acc"):
+                total_key = key[:-4] + "_total"
+                total = payload.get(total_key, 0.0)
+                if total > 0:
+                    final[key] = float(value) / float(total)
+            elif key.endswith("_sum"):
+                metric_key = key[:-4]
+                count = payload.get(f"{metric_key}_count", 0.0)
+                if count > 0:
+                    final[metric_key] = float(value) / float(count)
         return final
 
     @staticmethod
@@ -564,6 +599,7 @@ class AudioMotionMaskMetricsCallback(TrainerCallback):
                 "eval_teacher",
                 preds,
                 batch["labels"],
+                logits=logits,
                 topk=topk,
             )
         return self._finalize_payload(payload)
