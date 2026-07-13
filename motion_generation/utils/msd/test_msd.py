@@ -8,7 +8,8 @@ import math
 import torch
 import pytest
 
-from msd import (MSDConfig, compute_msd, dct2_matrix,
+from msd import (MSDConfig, compute_msd, compute_msd_components, dct2_matrix,
+                 msd_from_multipart_tokens, multipart_tokens_to_embeddings,
                  omega_to_weights, pool_motion_omega_to_token_rate)
 
 T, D, W = 120, 32, 8
@@ -101,6 +102,16 @@ def test_shapes_and_no_nans():
     assert torch.isfinite(phi).all() and torch.isfinite(omega).all()
 
 
+def test_components_preserve_energy_before_normalization():
+    x = torch.arange(20, dtype=torch.float32).view(10, 2)
+    components = compute_msd_components(x, MSDConfig(W=4))
+    assert components.phi.shape == (10, 4)
+    assert components.omega.shape == (10,)
+    assert components.energy.shape == (10,)
+    assert torch.all(components.energy > 0)
+    assert torch.allclose(components.phi.norm(dim=-1), torch.ones(10), atol=1e-5)
+
+
 def test_dct_matrix_matches_scipy_convention():
     scipy = pytest.importorskip("scipy.fft")
     import numpy as np
@@ -125,3 +136,64 @@ def test_motion_to_token_pooling_alignment():
     pooled = pool_motion_omega_to_token_rate(om_motion, T_tok=69)
     assert pooled.shape == (69,)
     assert pooled[0] == 0.5 and pooled[1] == 2.5         # pairwise means
+
+
+# ---- multipart RVQ integration ---------------------------------------------
+
+def make_multipart_fixture(frames=37):
+    torch.manual_seed(4)
+    codebooks = {
+        "upper": torch.randn(2, 7, 3),
+        "hands": torch.randn(2, 7, 5),
+    }
+    tokens = torch.randint(0, 7, (frames, 4))
+    return tokens, codebooks
+
+
+def test_multipart_embeddings_sum_levels_and_keep_parts_separate():
+    tokens, codebooks = make_multipart_fixture()
+    embeddings = multipart_tokens_to_embeddings(
+        tokens,
+        codebooks,
+        part_order=("upper", "hands"),
+    )
+    expected_upper = (
+        codebooks["upper"][0, tokens[:, 0]]
+        + codebooks["upper"][1, tokens[:, 1]]
+    )
+    expected_hands = (
+        codebooks["hands"][0, tokens[:, 2]]
+        + codebooks["hands"][1, tokens[:, 3]]
+    )
+    assert torch.allclose(embeddings["upper"], expected_upper)
+    assert torch.allclose(embeddings["hands"], expected_hands)
+    assert embeddings["upper"].shape[-1] == 3
+    assert embeddings["hands"].shape[-1] == 5
+
+
+def test_multipart_msd_returns_combined_and_per_part_descriptors():
+    tokens, codebooks = make_multipart_fixture()
+    result = msd_from_multipart_tokens(
+        tokens,
+        codebooks,
+        MSDConfig(W=8),
+        part_order=("upper", "hands"),
+    )
+    assert result.phi.shape == (len(tokens), 8)
+    assert result.omega.shape == (len(tokens),)
+    assert set(result.part_phi) == {"upper", "hands"}
+    assert set(result.part_omega) == {"upper", "hands"}
+    assert all(value.shape == (len(tokens), 8) for value in result.part_phi.values())
+    assert all(value.shape == (len(tokens),) for value in result.part_omega.values())
+    assert torch.isfinite(result.phi).all()
+    assert torch.isfinite(result.omega).all()
+
+
+def test_multipart_msd_rejects_wrong_slot_count():
+    tokens, codebooks = make_multipart_fixture()
+    with pytest.raises(ValueError, match="slot count mismatch"):
+        msd_from_multipart_tokens(
+            tokens[:, :-1],
+            codebooks,
+            part_order=("upper", "hands"),
+        )

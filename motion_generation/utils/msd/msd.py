@@ -12,6 +12,11 @@ Pipeline (per clip):
     per-band energy f_k = ||F_{k,:}||_2  -> phi_t = f/(||f||+eps) in R^W
     Omega(t) = mean(phi_t)              # spectral SPREAD, range ~[0, 1/sqrt(W)]
 
+Multipart extension:
+    tokens (T,16) -> sum q0..q3 within each part -> concatenate part latents
+    -> combined MSD, plus independent upper/lower/feet/hands diagnostics.
+    Independent part latents are never added to one another.
+
 Key decisions (see walkthrough / spec):
   * Token-rate default W = 8 (= 0.8 s @ 10 Hz). Decoded-motion variant
     uses W = 16 (= 0.8 s @ 20 fps) to match the time span.
@@ -23,9 +28,11 @@ Key decisions (see walkthrough / spec):
 """
 
 from __future__ import annotations
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
-from dataclasses import dataclass
 
 
 # --------------------------------------------------------------------------
@@ -69,6 +76,105 @@ def tokens_to_embedding(tokens: torch.Tensor, codebooks: torch.Tensor) -> torch.
     return x
 
 
+def multipart_tokens_to_embeddings(
+    tokens: torch.Tensor,
+    codebooks: Mapping[str, torch.Tensor],
+    part_order: Sequence[str] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Convert a flattened multipart RVQ frame into one embedding per part.
+
+    Args:
+        tokens: Per-codebook indices shaped ``(T, sum(Q_part))``. Slots must be
+            contiguous by part, matching the multipart token export layout.
+        codebooks: Mapping from part name to codebooks shaped ``(Q, V, D)``.
+        part_order: Token-layout order. Defaults to mapping insertion order.
+
+    RVQ levels are summed within a part because they share one residual latent
+    space. Part embeddings are kept separate because independently trained part
+    codecs do not share a latent coordinate system.
+    """
+    if tokens.ndim != 2:
+        raise ValueError(f"Expected multipart tokens shaped (T, slots), got {tuple(tokens.shape)}")
+    order = tuple(part_order or codebooks.keys())
+    if not order:
+        raise ValueError("part_order is empty")
+    missing = [part for part in order if part not in codebooks]
+    if missing:
+        raise KeyError(f"Missing multipart codebooks for: {missing}")
+
+    devices = {codebooks[part].device for part in order}
+    if len(devices) != 1:
+        raise ValueError(f"All multipart codebooks must be on one device, got {devices}")
+    device = next(iter(devices))
+    tokens = tokens.to(device=device, dtype=torch.long)
+
+    expected_slots = sum(int(codebooks[part].shape[0]) for part in order)
+    if tokens.shape[1] != expected_slots:
+        raise ValueError(
+            f"Multipart token slot count mismatch: got {tokens.shape[1]}, "
+            f"expected {expected_slots} for part_order={list(order)}"
+        )
+
+    embeddings: dict[str, torch.Tensor] = {}
+    offset = 0
+    for part in order:
+        books = codebooks[part]
+        if books.ndim != 3:
+            raise ValueError(
+                f"Codebooks for '{part}' must be shaped (Q, V, D), got {tuple(books.shape)}"
+            )
+        quantizers = int(books.shape[0])
+        part_tokens = tokens[:, offset : offset + quantizers]
+        if part_tokens.numel():
+            min_id = int(part_tokens.min().item())
+            max_id = int(part_tokens.max().item())
+            if min_id < 0 or max_id >= int(books.shape[1]):
+                raise ValueError(
+                    f"Token id outside '{part}' codebook range [0,{books.shape[1] - 1}]: "
+                    f"min={min_id}, max={max_id}"
+                )
+        embeddings[part] = tokens_to_embedding(part_tokens, books)
+        offset += quantizers
+    return embeddings
+
+
+def concatenate_part_embeddings(
+    part_embeddings: Mapping[str, torch.Tensor],
+    part_order: Sequence[str] | None = None,
+    part_weights: Mapping[str, float] | None = None,
+) -> torch.Tensor:
+    """Concatenate independent part latents into one MSD feature vector.
+
+    ``sqrt(weight)`` scaling makes each configured weight act on squared
+    spectral energy. Equal weights are used by default.
+    """
+    order = tuple(part_order or part_embeddings.keys())
+    if not order:
+        raise ValueError("part_order is empty")
+    frames = {int(part_embeddings[part].shape[0]) for part in order}
+    if len(frames) != 1:
+        raise ValueError(f"Part embedding frame counts differ: {frames}")
+
+    weighted = []
+    for part in order:
+        value = part_embeddings[part]
+        weight = float((part_weights or {}).get(part, 1.0))
+        if weight < 0:
+            raise ValueError(f"Part weight must be non-negative, got {part}={weight}")
+        weighted.append(value * weight ** 0.5)
+    return torch.cat(weighted, dim=-1)
+
+
+@dataclass
+class MultipartMSDResult:
+    """Combined and diagnostic per-part descriptors for multipart tokens."""
+
+    phi: torch.Tensor
+    omega: torch.Tensor
+    part_phi: dict[str, torch.Tensor]
+    part_omega: dict[str, torch.Tensor]
+
+
 # --------------------------------------------------------------------------
 # Core MSD
 # --------------------------------------------------------------------------
@@ -90,10 +196,22 @@ class MSDConfig:
                                # (see scripts/precompute_msd.py --calibrate-floor)
 
 
+@dataclass
+class MSDComponents:
+    """Full local spectral quantities before scalar supervision weighting."""
+
+    phi: torch.Tensor
+    omega: torch.Tensor
+    energy: torch.Tensor
+
+
 @torch.no_grad()
-def compute_msd(x: torch.Tensor, cfg: MSDConfig) -> tuple[torch.Tensor, torch.Tensor]:
-    """x: (T, D) continuous per-frame features (token-embedding sums OR decoded
-    motion features). Returns (phi (T, W), omega (T,)).
+def compute_msd_components(x: torch.Tensor, cfg: MSDConfig) -> MSDComponents:
+    """Return spectral shape, spread, and pre-normalization energy.
+
+    ``energy`` is ``||f||_2`` from the local DCT response. Unlike ``omega``, it
+    retains motion amplitude and can test whether MSD adds information beyond
+    ordinary motion magnitude.
     """
     T, D = x.shape
     W = cfg.W
@@ -116,7 +234,14 @@ def compute_msd(x: torch.Tensor, cfg: MSDConfig) -> tuple[torch.Tensor, torch.Te
     if cfg.energy_floor > 0:
         phi = torch.where(norm > cfg.energy_floor, phi, torch.zeros_like(phi))
     omega = phi.mean(dim=-1)                                    # (T,)
-    return phi, omega
+    return MSDComponents(phi=phi, omega=omega, energy=norm.squeeze(-1))
+
+
+@torch.no_grad()
+def compute_msd(x: torch.Tensor, cfg: MSDConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(phi, omega)`` while preserving the original public API."""
+    components = compute_msd_components(x, cfg)
+    return components.phi, components.omega
 
 
 @torch.no_grad()
@@ -124,6 +249,37 @@ def msd_from_tokens(tokens: torch.Tensor, codebooks: torch.Tensor,
                     cfg: MSDConfig = MSDConfig(W=8)) -> tuple[torch.Tensor, torch.Tensor]:
     """Variant 1.1 — MSD on summed RVQ embeddings (token rate, 10 Hz)."""
     return compute_msd(tokens_to_embedding(tokens, codebooks), cfg)
+
+
+@torch.no_grad()
+def msd_from_multipart_tokens(
+    tokens: torch.Tensor,
+    codebooks: Mapping[str, torch.Tensor],
+    cfg: MSDConfig = MSDConfig(W=8),
+    part_order: Sequence[str] | None = None,
+    part_weights: Mapping[str, float] | None = None,
+) -> MultipartMSDResult:
+    """Compute MSD from independent upper/lower/feet/hands RVQ streams.
+
+    Residual quantizer embeddings are summed within each part. The resulting
+    part embeddings are concatenated for the combined descriptor, while
+    per-part descriptors are returned for diagnostics and loss ablations.
+    """
+    order = tuple(part_order or codebooks.keys())
+    part_embeddings = multipart_tokens_to_embeddings(tokens, codebooks, order)
+    combined = concatenate_part_embeddings(part_embeddings, order, part_weights)
+    phi, omega = compute_msd(combined, cfg)
+
+    part_phi: dict[str, torch.Tensor] = {}
+    part_omega: dict[str, torch.Tensor] = {}
+    for part in order:
+        part_phi[part], part_omega[part] = compute_msd(part_embeddings[part], cfg)
+    return MultipartMSDResult(
+        phi=phi,
+        omega=omega,
+        part_phi=part_phi,
+        part_omega=part_omega,
+    )
 
 
 @torch.no_grad()
@@ -137,11 +293,14 @@ def msd_from_motion(motion: torch.Tensor,
 
 
 def pool_motion_omega_to_token_rate(omega_motion: torch.Tensor,
-                                    T_tok: int) -> torch.Tensor:
+                                    T_tok: int,
+                                    unit_length: int = 2) -> torch.Tensor:
     """Average-pool 20 fps Omega onto the 10 Hz token grid for the 1.3
     agreement study. Handles odd lengths by trimming the tail frame."""
-    L = (omega_motion.shape[0] // 2) * 2
-    pooled = omega_motion[:L].view(-1, 2).mean(dim=-1)
+    if unit_length < 1:
+        raise ValueError(f"unit_length must be >= 1, got {unit_length}")
+    L = (omega_motion.shape[0] // unit_length) * unit_length
+    pooled = omega_motion[:L].view(-1, unit_length).mean(dim=-1)
     return pooled[:T_tok]
 
 

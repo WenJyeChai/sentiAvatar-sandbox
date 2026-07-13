@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import pathlib
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -29,10 +31,19 @@ from utils.multipart_motion import (  # noqa: E402
 
 
 def torch_load_trusted(path: Path, map_location=None):
+    # Training checkpoints may contain pathlib.PosixPath values. Python cannot
+    # instantiate that class on Windows, so map it to the native path class for
+    # the duration of this explicitly trusted pickle load.
+    saved_posix_path = pathlib.PosixPath
+    if os.name == "nt":
+        pathlib.PosixPath = pathlib.WindowsPath
     try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
+        try:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location=map_location)
+    finally:
+        pathlib.PosixPath = saved_posix_path
 
 
 @dataclass
