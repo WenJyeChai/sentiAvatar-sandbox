@@ -1160,14 +1160,66 @@ def plot_complexity_distributions(frames: pd.DataFrame) -> plt.Figure:
 def plot_speed_complexity_joint(frames: pd.DataFrame, max_points: int = 100000) -> plt.Figure:
     import matplotlib.pyplot as plt
 
-    data = _sample_rows(frames.dropna(subset=["fk_speed", "omega", "energy"]), max_points)
+    data = frames.dropna(subset=["omega"])
+    speed_data = _sample_rows(
+        data.loc[data["fk_speed"].notna() & data["fk_speed"].gt(0)],
+        max_points,
+    )
+    energy_data = _sample_rows(
+        data.loc[data["energy"].notna() & data["energy"].gt(0)],
+        max_points,
+    )
+    nonpositive_speed = int((data["fk_speed"].notna() & data["fk_speed"].le(0)).sum())
+    nonpositive_energy = int((data["energy"].notna() & data["energy"].le(0)).sum())
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    first = axes[0].hexbin(data["fk_speed"], data["omega"], gridsize=55, xscale="log", mincnt=1, cmap="viridis")
-    second = axes[1].hexbin(data["energy"], data["omega"], gridsize=55, xscale="log", mincnt=1, cmap="magma")
+    first = None
+    if not speed_data.empty:
+        first = axes[0].hexbin(
+            speed_data["fk_speed"],
+            speed_data["omega"],
+            gridsize=55,
+            xscale="log",
+            mincnt=1,
+            cmap="viridis",
+        )
+    else:
+        axes[0].text(0.5, 0.5, "No positive FK-speed values", ha="center", va="center")
+    second = None
+    if not energy_data.empty:
+        second = axes[1].hexbin(
+            energy_data["energy"],
+            energy_data["omega"],
+            gridsize=55,
+            xscale="log",
+            mincnt=1,
+            cmap="magma",
+        )
+    else:
+        axes[1].text(0.5, 0.5, "No positive energy values", ha="center", va="center")
     axes[0].set(title="Physical Speed vs MSD", xlabel="FK speed (m/frame)", ylabel="Omega")
     axes[1].set(title="Spectral Energy vs MSD", xlabel="Spectral energy", ylabel="Omega")
-    fig.colorbar(first, ax=axes[0], label="Frames")
-    fig.colorbar(second, ax=axes[1], label="Frames")
+    if nonpositive_speed:
+        axes[0].text(
+            0.02,
+            0.98,
+            f"Excluded {nonpositive_speed:,} non-positive speed frames from log x-axis",
+            transform=axes[0].transAxes,
+            va="top",
+            fontsize=9,
+        )
+    if nonpositive_energy:
+        axes[1].text(
+            0.02,
+            0.98,
+            f"Excluded {nonpositive_energy:,} zero-energy frames from log x-axis",
+            transform=axes[1].transAxes,
+            va="top",
+            fontsize=9,
+        )
+    if first is not None:
+        fig.colorbar(first, ax=axes[0], label="Frames")
+    if second is not None:
+        fig.colorbar(second, ax=axes[1], label="Frames")
     fig.tight_layout()
     return fig
 
