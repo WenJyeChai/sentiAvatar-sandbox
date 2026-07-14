@@ -428,6 +428,7 @@ class VariableGapC2FTrainer(Trainer):
         self_forcing_max_prob: float,
         embedding_loss_weight: float,
         final_latent_loss_weight: float,
+        adaptive_target_mode: str = "self_forced",
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -438,6 +439,11 @@ class VariableGapC2FTrainer(Trainer):
         self.self_forcing_warmup_ratio = float(self_forcing_warmup_ratio)
         self.self_forcing_ramp_ratio = float(self_forcing_ramp_ratio)
         self.self_forcing_max_prob = float(self_forcing_max_prob)
+        if adaptive_target_mode not in {"never", "self_forced", "always"}:
+            raise ValueError(
+                "adaptive_target_mode must be one of: never, self_forced, always"
+            )
+        self.adaptive_target_mode = str(adaptive_target_mode)
         self.embedding_loss_weight = float(embedding_loss_weight)
         self.final_latent_loss_weight = float(final_latent_loss_weight)
         self._metric_sums: dict[str, float] = {}
@@ -504,6 +510,13 @@ class VariableGapC2FTrainer(Trainer):
             int(self.args.seed) + 104729 + int(getattr(self.state, "global_step", 0))
         )
         return bool(torch.rand((), generator=generator).item() < probability), probability
+
+    def _use_adaptive_targets(self, stage: int, self_forced: bool) -> bool:
+        if stage == 0 or self.adaptive_target_mode == "never":
+            return False
+        if self.adaptive_target_mode == "always":
+            return True
+        return bool(self_forced)
 
     def _fill_prefix(
         self,
@@ -727,6 +740,7 @@ class VariableGapC2FTrainer(Trainer):
 
         stage = self._sample_stage()
         self_forced, probability = self._use_self_forcing(stage)
+        adaptive_targets = self._use_adaptive_targets(stage, self_forced)
         current = self._fill_prefix(
             model,
             inputs["input_ids"],
@@ -745,11 +759,12 @@ class VariableGapC2FTrainer(Trainer):
             inputs["attention_mask"],
             inputs["middle_mask"],
             stage=stage,
-            adaptive=self_forced and stage > 0,
+            adaptive=adaptive_targets,
             metric_prefix="train_c2f",
         )
         self._record("train_c2f/self_forcing_probability", probability)
         self._record("train_c2f/self_forced_batch", float(self_forced))
+        self._record("train_c2f/adaptive_target_batch", float(adaptive_targets))
         self._record("train_c2f/gap_mean", inputs["gap_lengths"].float().mean())
         return (loss, {"loss": loss}) if return_outputs else loss
 
@@ -821,6 +836,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self_forcing_warmup_ratio", type=float, default=0.10)
     parser.add_argument("--self_forcing_ramp_ratio", type=float, default=0.30)
     parser.add_argument("--self_forcing_max_prob", type=float, default=1.0)
+    parser.add_argument(
+        "--adaptive_target_mode",
+        choices=("never", "self_forced", "always"),
+        default="self_forced",
+        help=(
+            "When to recompute q1+ residual targets: never, only when generated "
+            "prefixes are used, or always including teacher-forced prefixes."
+        ),
+    )
     parser.add_argument("--embedding_loss_weight", type=float, default=0.1)
     parser.add_argument("--final_latent_loss_weight", type=float, default=0.1)
 
@@ -984,6 +1008,7 @@ def main() -> None:
     model.config.variable_gap = True
     model.config.generation_order = "quantizer_coarse_to_fine"
     model.config.constrain_token_logits = True
+    model.config.adaptive_target_mode = args.adaptive_target_mode
 
     checkpoint_paths = {part: Path(getattr(args, f"{part}_ckpt")) for part in part_order}
     codebooks = MultipartCodebookSet.from_checkpoints(
@@ -1034,6 +1059,7 @@ def main() -> None:
         f"warmup={args.self_forcing_warmup_ratio}, ramp={args.self_forcing_ramp_ratio}, "
         f"max={args.self_forcing_max_prob}"
     )
+    print(f"Adaptive targets: {args.adaptive_target_mode}")
     print(
         f"Loss weights:     embed={args.embedding_loss_weight}, "
         f"final_latent={args.final_latent_loss_weight}"
@@ -1086,6 +1112,7 @@ def main() -> None:
         self_forcing_warmup_ratio=args.self_forcing_warmup_ratio,
         self_forcing_ramp_ratio=args.self_forcing_ramp_ratio,
         self_forcing_max_prob=args.self_forcing_max_prob,
+        adaptive_target_mode=args.adaptive_target_mode,
         embedding_loss_weight=args.embedding_loss_weight,
         final_latent_loss_weight=args.final_latent_loss_weight,
     )

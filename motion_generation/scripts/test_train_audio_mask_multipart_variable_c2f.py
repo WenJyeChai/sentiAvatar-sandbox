@@ -328,6 +328,15 @@ def test_trainer_self_forced_stage_builds_a_finite_backward_loss(tmp_path):
     trainer.state.global_step = 1
     trainer.state.max_steps = 1
 
+    assert not trainer._use_adaptive_targets(stage=0, self_forced=True)
+    assert not trainer._use_adaptive_targets(stage=1, self_forced=False)
+    assert trainer._use_adaptive_targets(stage=1, self_forced=True)
+    trainer.adaptive_target_mode = "always"
+    assert trainer._use_adaptive_targets(stage=1, self_forced=False)
+    trainer.adaptive_target_mode = "never"
+    assert not trainer._use_adaptive_targets(stage=1, self_forced=True)
+    trainer.adaptive_target_mode = "self_forced"
+
     loss = trainer.compute_loss(model, batch)
     loss.backward()
 
