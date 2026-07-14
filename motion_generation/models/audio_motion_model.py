@@ -184,11 +184,29 @@ class AudioMotionTransformer(PreTrainedModel):
         self.gradient_checkpointing = False
 
     def _run_encoder(self, x, attention_mask=None):
+        encoder_mask = None
+        key_padding_mask = None
+        if attention_mask is not None:
+            if (
+                attention_mask.dim() == 2
+                and attention_mask.shape[0] == x.shape[0]
+                and attention_mask.shape[1] == x.shape[1]
+            ):
+                key_padding_mask = ~attention_mask.to(dtype=torch.bool)
+            else:
+                # Preserve support for callers that provide a square/causal
+                # transformer mask rather than a batch padding mask.
+                encoder_mask = attention_mask
+
         if self.gradient_checkpointing and self.training:
             hidden_states = x
             for layer in self.encoder.layers:
                 hidden_states = checkpoint(
-                    lambda states, layer=layer: layer(states, src_mask=attention_mask),
+                    lambda states, layer=layer: layer(
+                        states,
+                        src_mask=encoder_mask,
+                        src_key_padding_mask=key_padding_mask,
+                    ),
                     hidden_states,
                     use_reentrant=False,
                 )
@@ -196,7 +214,11 @@ class AudioMotionTransformer(PreTrainedModel):
                 hidden_states = self.encoder.norm(hidden_states)
             return hidden_states
 
-        return self.encoder(x, mask=attention_mask)
+        return self.encoder(
+            x,
+            mask=encoder_mask,
+            src_key_padding_mask=key_padding_mask,
+        )
 
     def _slot_valid_mask(self, seq_len, device):
         """Return valid vocab ids for each motion-token slot.
@@ -246,6 +268,13 @@ class AudioMotionTransformer(PreTrainedModel):
             audio_emb.size(0), -1, audio_emb.size(-1)
         )
 
+        if audio_emb.shape[:2] != token_embeddings.shape[:2]:
+            raise ValueError(
+                "Audio/token length mismatch: "
+                f"audio expands to {audio_emb.shape[1]} tokens but input has "
+                f"{token_embeddings.shape[1]}"
+            )
+
         return token_embeddings + audio_emb
 
     def forward(self, input_ids, labels=None, audio_features=None, attention_mask=None):
@@ -260,6 +289,12 @@ class AudioMotionTransformer(PreTrainedModel):
             If labels provided: (loss, predictions, accuracy)
             Else: logits
         """
+        if input_ids.size(1) > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Sequence length {input_ids.size(1)} exceeds max_position_embeddings "
+                f"{self.config.max_position_embeddings}"
+            )
+
         # Embed motion tokens: (B, seq_len, hidden_size)
         x = self.embed_tokens(input_ids)
 
@@ -295,6 +330,78 @@ class AudioMotionTransformer(PreTrainedModel):
                 acc = torch.tensor(0.0)
 
         return loss, preds, acc
+
+    @torch.no_grad()
+    def generate_quantizer_coarse_to_fine(
+        self,
+        input_ids,
+        audio_features,
+        middle_mask=None,
+        attention_mask=None,
+    ):
+        """Fill multipart RVQ tokens in q0 -> qN order.
+
+        Each pass fills the selected quantizer for every missing temporal frame
+        and every body part. Padding positions are excluded by ``attention_mask``.
+        """
+        device = next(self.parameters()).device
+        input_ids = torch.as_tensor(input_ids, dtype=torch.long, device=device)
+        audio_features = torch.as_tensor(
+            audio_features, dtype=torch.float32, device=device
+        )
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if audio_features.dim() == 2:
+            audio_features = audio_features.unsqueeze(0)
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            attention_mask = torch.as_tensor(
+                attention_mask, dtype=torch.bool, device=device
+            )
+        mask_token_id = int(
+            getattr(self.config, "mask_token_id", self.config.vocab_size - 1)
+        )
+        if middle_mask is None:
+            middle_mask = input_ids.eq(mask_token_id) & attention_mask
+        else:
+            middle_mask = torch.as_tensor(
+                middle_mask, dtype=torch.bool, device=device
+            ) & attention_mask
+        if middle_mask.shape != input_ids.shape:
+            raise ValueError(
+                f"middle_mask shape {tuple(middle_mask.shape)} does not match "
+                f"input_ids {tuple(input_ids.shape)}"
+            )
+
+        ntpf = int(self.config.num_tokens_per_frame)
+        quantizers = int(getattr(self.config, "num_quantizers_per_part", 1))
+        if ntpf % quantizers != 0:
+            raise ValueError(
+                f"num_tokens_per_frame={ntpf} is not divisible by "
+                f"num_quantizers_per_part={quantizers}"
+            )
+        slots = torch.arange(input_ids.size(1), device=device).remainder(ntpf)
+        quantizer_slots = slots.remainder(quantizers).view(1, -1)
+        output_ids = input_ids.clone()
+
+        for quantizer in range(quantizers):
+            fill = (
+                middle_mask
+                & quantizer_slots.eq(quantizer)
+                & output_ids.eq(mask_token_id)
+            )
+            if not bool(fill.any()):
+                continue
+            logits = self.forward(
+                output_ids,
+                audio_features=audio_features,
+                attention_mask=attention_mask,
+            )
+            predictions = logits.argmax(dim=-1)
+            output_ids[fill] = predictions[fill]
+        return output_ids
 
     def generate_sbs(self, input_ids, audio_features, generate_steps=1, attention_mask=None):
         """
