@@ -13,9 +13,11 @@ if str(MOTION_GENERATION_DIR) not in sys.path:
 
 from models.audio_motion_model import AudioMotionConfig, AudioMotionTransformer
 from scripts.train_audio_mask_multipart_variable_c2f import (
+    EpochResamplingLengthGroupedSampler,
     ResidualTargetBuilder,
     VariableGapC2FCollator,
     VariableGapC2FTrainer,
+    VariableGapMaskDataset,
     VariableGapMaskExample,
 )
 from transformers import TrainingArguments
@@ -44,6 +46,83 @@ def tiny_config(*, max_positions: int = 32) -> AudioMotionConfig:
 
 def raw_frame(value: int) -> list[int]:
     return [value, value, value, value]
+
+
+def synthetic_sequence(name: str, frames: int) -> dict:
+    return {
+        "name": name,
+        "motion_tokens": [raw_frame(frame % 4) for frame in range(frames)],
+        "audio_features": torch.randn(frames, 3).numpy(),
+        "audio_fps": 10.0,
+        "motion_token_fps": 10.0,
+    }
+
+
+def test_training_windows_resample_reproducibly_and_remain_clip_balanced():
+    sequences = [
+        synthetic_sequence("long", 20),
+        synthetic_sequence("medium", 10),
+        synthetic_sequence("too_short", 2),
+    ]
+    dataset = VariableGapMaskDataset(
+        sequences,
+        min_gap_frames=1,
+        max_gap_frames=7,
+        windows_per_sequence=4,
+        seed=17,
+    )
+    epoch0 = list(dataset.windows)
+    dataset.resample(0)
+    assert dataset.windows == epoch0
+    assert len(dataset) == 8
+    for sequence_idx in (0, 1):
+        clip_windows = [
+            (left, gap)
+            for seq, left, gap in dataset.windows
+            if seq == sequence_idx
+        ]
+        assert len(clip_windows) == 4
+        assert len(set(clip_windows)) == 4
+    assert all(sequence_idx != 2 for sequence_idx, _, _ in dataset.windows)
+
+    dataset.resample(1)
+    epoch1 = list(dataset.windows)
+    assert epoch1 != epoch0
+    assert len(epoch1) == len(epoch0)
+
+    replica = VariableGapMaskDataset(
+        sequences,
+        min_gap_frames=1,
+        max_gap_frames=7,
+        windows_per_sequence=4,
+        seed=17,
+    )
+    replica.resample(1)
+    assert replica.windows == epoch1
+
+
+def test_epoch_sampler_resamples_then_returns_every_dataset_index():
+    dataset = VariableGapMaskDataset(
+        [synthetic_sequence("a", 20), synthetic_sequence("b", 16)],
+        min_gap_frames=1,
+        max_gap_frames=7,
+        windows_per_sequence=4,
+        seed=23,
+    )
+    sampler = EpochResamplingLengthGroupedSampler(
+        dataset,
+        batch_size=4,
+        tokens_per_frame=4,
+        seed=23,
+    )
+    epoch0_windows = list(dataset.windows)
+    epoch0_indices = list(iter(sampler))
+    assert sorted(epoch0_indices) == list(range(len(dataset)))
+
+    sampler.set_epoch(1)
+    epoch1_indices = list(iter(sampler))
+    assert dataset.windows != epoch0_windows
+    assert sorted(epoch1_indices) == list(range(len(dataset)))
 
 
 def test_variable_collator_pads_whole_frames_and_tracks_valid_masks():

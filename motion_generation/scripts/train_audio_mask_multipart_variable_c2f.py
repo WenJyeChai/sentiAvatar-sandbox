@@ -21,9 +21,9 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import Trainer, TrainingArguments, set_seed
-from transformers.trainer_pt_utils import LengthGroupedSampler
+from transformers.trainer_pt_utils import get_length_grouped_indices
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -62,7 +62,7 @@ class VariableGapMaskExample:
 
 
 class VariableGapMaskDataset(Dataset):
-    """Clip-balanced variable-gap windows sampled once per dataset build."""
+    """Clip-balanced variable-gap windows that can be resampled each epoch."""
 
     def __init__(
         self,
@@ -88,8 +88,10 @@ class VariableGapMaskDataset(Dataset):
         self.max_gap_frames = int(max_gap_frames)
         self.windows_per_sequence = int(windows_per_sequence)
         self.gap_bucket_weights = tuple(float(value) for value in gap_bucket_weights)
+        self.seed = int(seed)
+        self.epoch = -1
+        self.eligible: list[tuple[int, int, list[int], int]] = []
         self.windows: list[tuple[int, int, int]] = []
-        rng = random.Random(seed)
 
         for sequence_idx, item in enumerate(self.sequences):
             usable = self._usable_motion_frames(item)
@@ -98,12 +100,10 @@ class VariableGapMaskDataset(Dataset):
             )
             if not valid_gaps:
                 continue
-            gap_weights = self._length_weights(valid_gaps)
-            for _ in range(self.windows_per_sequence):
-                gap = rng.choices(valid_gaps, weights=gap_weights, k=1)[0]
-                max_left = usable - (gap + 2)
-                left_idx = rng.randint(0, max_left)
-                self.windows.append((sequence_idx, left_idx, gap))
+            candidate_count = sum(usable - gap - 1 for gap in valid_gaps)
+            sample_count = min(self.windows_per_sequence, candidate_count)
+            self.eligible.append((sequence_idx, usable, valid_gaps, sample_count))
+        self.resample(0)
 
     def _bucket_index(self, gap: int) -> int:
         span = self.max_gap_frames - self.min_gap_frames + 1
@@ -124,6 +124,43 @@ class VariableGapMaskDataset(Dataset):
             for gap in valid_gaps
             for bucket in [self._bucket_index(gap)]
         ]
+
+    def resample(self, epoch: int) -> None:
+        """Draw new unique windows for every eligible clip for ``epoch``."""
+        epoch = int(epoch)
+        if epoch == self.epoch:
+            return
+        rng = random.Random(self.seed + epoch * 1_000_003)
+        windows: list[tuple[int, int, int]] = []
+        for sequence_idx, usable, valid_gaps, sample_count in self.eligible:
+            gap_weights = self._length_weights(valid_gaps)
+            selected: set[tuple[int, int]] = set()
+            attempts = 0
+            max_attempts = max(100, sample_count * 50)
+            while len(selected) < sample_count and attempts < max_attempts:
+                gap = rng.choices(valid_gaps, weights=gap_weights, k=1)[0]
+                left_idx = rng.randint(0, usable - gap - 2)
+                selected.add((left_idx, gap))
+                attempts += 1
+
+            # The weighted rejection loop can be unlucky on very short clips.
+            # Fill deterministically from remaining candidates without changing
+            # the requested number of windows.
+            if len(selected) < sample_count:
+                candidates = [
+                    (left_idx, gap)
+                    for gap in valid_gaps
+                    for left_idx in range(usable - gap - 1)
+                    if (left_idx, gap) not in selected
+                ]
+                rng.shuffle(candidates)
+                selected.update(candidates[: sample_count - len(selected)])
+            windows.extend(
+                (sequence_idx, left_idx, gap)
+                for left_idx, gap in sorted(selected)
+            )
+        self.windows = windows
+        self.epoch = epoch
 
     @staticmethod
     def _usable_motion_frames(item: Dict[str, Any]) -> int:
@@ -167,6 +204,46 @@ class VariableGapMaskDataset(Dataset):
                 [self._audio_feature_for_frame(item, frame) for frame in frame_indices]
             ),
         )
+
+
+class EpochResamplingLengthGroupedSampler(Sampler[int]):
+    """Resample dataset windows, then group similar lengths for each epoch."""
+
+    def __init__(
+        self,
+        dataset: VariableGapMaskDataset,
+        *,
+        batch_size: int,
+        tokens_per_frame: int,
+        seed: int,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.tokens_per_frame = int(tokens_per_frame)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        self.dataset.resample(self.epoch)
+
+    def __iter__(self):
+        self.dataset.resample(self.epoch)
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        lengths = [
+            frames * self.tokens_per_frame
+            for frames in self.dataset.sequence_lengths
+        ]
+        return iter(
+            get_length_grouped_indices(
+                lengths,
+                batch_size=self.batch_size,
+                generator=generator,
+            )
+        )
+
+    def __len__(self) -> int:
+        return len(self.dataset)
 
 
 class VariableGapC2FCollator:
@@ -375,11 +452,11 @@ class VariableGapC2FTrainer(Trainer):
         if dataset is None or not isinstance(dataset, VariableGapMaskDataset):
             return super()._get_train_sampler(train_dataset)
         ntpf = int(self.model.config.num_tokens_per_frame)
-        lengths = [frames * ntpf for frames in dataset.sequence_lengths]
-        return LengthGroupedSampler(
-            self.args.train_batch_size * self.args.gradient_accumulation_steps,
-            dataset=dataset,
-            lengths=lengths,
+        return EpochResamplingLengthGroupedSampler(
+            dataset,
+            batch_size=self.args.train_batch_size * self.args.gradient_accumulation_steps,
+            tokens_per_frame=ntpf,
+            seed=int(self.args.seed),
         )
 
     def _stage_mask(self, middle_mask: torch.Tensor, stage: int) -> torch.Tensor:
@@ -939,9 +1016,15 @@ def main() -> None:
     print(f"Initialization:   {args.model_name_or_path or 'from scratch'}")
     print(f"Train clips:      {len(train_sequences)} / {train_stats['requested']}")
     print(f"Train windows:    {len(train_dataset)}")
+    print(
+        "Train sampling:   "
+        f"up to {args.train_windows_per_sequence} unique windows/eligible clip, "
+        "resampled every epoch"
+    )
     if eval_dataset is not None:
         print(f"Eval clips:       {len(eval_sequences)} / {eval_stats['requested']}")
         print(f"Eval windows:     {len(eval_dataset)}")
+        print("Eval sampling:    fixed across evaluations")
     print(f"Gap range:        {args.min_gap_frames}-{args.max_gap_frames} token frames")
     print(f"Max sequence:     {max_seq_len} tokens ({args.max_gap_frames + 2} frames)")
     print(f"Gap weights:      {gap_weights}")
