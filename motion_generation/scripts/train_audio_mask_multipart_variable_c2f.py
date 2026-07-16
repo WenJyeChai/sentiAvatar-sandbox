@@ -3,8 +3,8 @@
 
 The temporal gap is variable, while RVQ levels are generated in q0 -> qN
 order. Training can transition from ground-truth quantizer prefixes to detached
-self-generated prefixes and uses greedy residual targets after a generated
-prefix changes the residual being quantized.
+self-generated prefixes. Canonical codec targets remain available as the main
+objective, with optional hard or distributional residual-recovery supervision.
 """
 
 from __future__ import annotations
@@ -429,6 +429,10 @@ class VariableGapC2FTrainer(Trainer):
         embedding_loss_weight: float,
         final_latent_loss_weight: float,
         adaptive_target_mode: str = "self_forced",
+        soft_recovery_weight: float = 0.0,
+        soft_recovery_topk: int = 8,
+        soft_recovery_sigma_scale: float = 1.0,
+        soft_recovery_only_wrong_prefix: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -446,8 +450,20 @@ class VariableGapC2FTrainer(Trainer):
         self.adaptive_target_mode = str(adaptive_target_mode)
         self.embedding_loss_weight = float(embedding_loss_weight)
         self.final_latent_loss_weight = float(final_latent_loss_weight)
+        self.soft_recovery_weight = float(soft_recovery_weight)
+        self.soft_recovery_topk = int(soft_recovery_topk)
+        self.soft_recovery_sigma_scale = float(soft_recovery_sigma_scale)
+        self.soft_recovery_only_wrong_prefix = bool(soft_recovery_only_wrong_prefix)
+        if self.soft_recovery_weight < 0:
+            raise ValueError("soft_recovery_weight must be >= 0")
+        if self.soft_recovery_topk < 1:
+            raise ValueError("soft_recovery_topk must be >= 1")
+        if self.soft_recovery_sigma_scale <= 0:
+            raise ValueError("soft_recovery_sigma_scale must be > 0")
         self._metric_sums: dict[str, float] = {}
         self._metric_counts: dict[str, float] = {}
+        self._rmse_sums: dict[str, float] = {}
+        self._rmse_counts: dict[str, int] = {}
 
     @property
     def num_quantizers(self) -> int:
@@ -476,14 +492,30 @@ class VariableGapC2FTrainer(Trainer):
         self._metric_sums[key] = self._metric_sums.get(key, 0.0) + number * count
         self._metric_counts[key] = self._metric_counts.get(key, 0.0) + count
 
+    def _record_rmse(self, key: str, squared_errors: torch.Tensor) -> None:
+        if not squared_errors.numel():
+            return
+        self._rmse_sums[key] = self._rmse_sums.get(key, 0.0) + float(
+            squared_errors.detach().float().sum().item()
+        )
+        self._rmse_counts[key] = self._rmse_counts.get(key, 0) + int(
+            squared_errors.numel()
+        )
+
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
         logs = dict(logs)
         for key, total in self._metric_sums.items():
             count = self._metric_counts.get(key, 0.0)
             if count > 0:
                 logs[key] = total / count
+        for key, total in self._rmse_sums.items():
+            count = self._rmse_counts.get(key, 0)
+            if count > 0:
+                logs[key] = math.sqrt(total / count)
         self._metric_sums.clear()
         self._metric_counts.clear()
+        self._rmse_sums.clear()
+        self._rmse_counts.clear()
         super().log(logs, *args, **kwargs)
 
     def _self_forcing_probability(self) -> float:
@@ -595,10 +627,170 @@ class VariableGapC2FTrainer(Trainer):
                 )
                 final_losses.append(F.l1_loss(prefix_latent + expected, target_latent))
 
-        zero = logits.sum() * 0.0
+        # Slot-constrained logits contain the dtype minimum outside their local
+        # codebook range. Summing all logits can overflow to -inf, so multiplying
+        # that sum by zero produces NaN even though the absent loss is zero.
+        zero = logits.new_zeros(())
         embed_loss = torch.stack(embedding_losses).mean() if embedding_losses else zero
         final_loss = torch.stack(final_losses).mean() if final_losses else zero
         return embed_loss, final_loss
+
+    def _soft_recovery_loss(
+        self,
+        logits: torch.Tensor,
+        gt_ids: torch.Tensor,
+        current_ids: torch.Tensor,
+        middle_mask: torch.Tensor,
+        stage: int,
+        metric_prefix: str,
+    ) -> torch.Tensor:
+        """Match a local Gaussian pool of residual codes without replacing CE labels."""
+        zero = logits.new_zeros(())
+        if stage == 0 or self.soft_recovery_weight <= 0:
+            return zero
+
+        self.target_builder._ensure_device(logits.device)
+        q = self.num_quantizers
+        ntpf = int(self.model.config.num_tokens_per_frame)
+        frames = logits.shape[1] // ntpf
+        gt_view = gt_ids.reshape(gt_ids.shape[0], frames, ntpf)
+        current_view = current_ids.reshape_as(gt_view)
+        middle_view = middle_mask.reshape_as(gt_view)
+        frame_valid = middle_view[..., 0]
+        logits_view = logits.reshape(logits.shape[0], frames, ntpf, -1)
+        losses = []
+        entropies = []
+        nearest_matches = []
+        sample_count = 0
+
+        for part_idx, part in enumerate(self.target_builder.part_order):
+            slot = part_idx * q + stage
+            gt_raw = self.target_builder.raw_part_ids(gt_view, part_idx).long()
+            current_raw = self.target_builder.raw_part_ids(current_view, part_idx).long()
+            valid = frame_valid
+            if self.soft_recovery_only_wrong_prefix:
+                valid = valid & current_raw[..., :stage].ne(gt_raw[..., :stage]).any(dim=-1)
+            if not bool(valid.any()):
+                continue
+
+            target_latent = self.target_builder.target_latent(gt_view, part_idx)
+            prefix_latent = sum(
+                self.target_builder.codebooks[part][prefix].index_select(
+                    0, current_raw[..., prefix].reshape(-1)
+                ).reshape(*current_raw.shape[:-1], -1)
+                for prefix in range(stage)
+            )
+            residual = (target_latent - prefix_latent)[valid].float()
+            book = self.target_builder.codebooks[part][stage].float()
+            distances = (
+                residual.square().sum(dim=-1, keepdim=True)
+                + book.square().sum(dim=-1).unsqueeze(0)
+                - 2.0 * residual @ book.transpose(0, 1)
+            ).clamp_min(0.0)
+            pool_size = min(self.soft_recovery_topk, book.shape[0])
+            pool_distances, pool_ids = torch.topk(
+                distances, k=pool_size, dim=-1, largest=False, sorted=True
+            )
+            shifted = pool_distances - pool_distances[:, :1]
+            if pool_size > 1:
+                local_variance = shifted[:, 1:].median(dim=-1, keepdim=True).values
+            else:
+                local_variance = torch.ones_like(shifted)
+            local_variance = (
+                local_variance.clamp_min(torch.finfo(torch.float32).eps)
+                * self.soft_recovery_sigma_scale**2
+            )
+            target_probabilities = F.softmax(
+                -shifted / (2.0 * local_variance), dim=-1
+            )
+
+            start = slot * self.target_builder.codebook_size
+            local_logits = logits_view[..., slot, :][valid][
+                :, start : start + self.target_builder.codebook_size
+            ].float()
+            selected_log_probs = F.log_softmax(local_logits, dim=-1).gather(1, pool_ids)
+            losses.append(-(target_probabilities * selected_log_probs).sum(dim=-1))
+            entropies.append(
+                -(target_probabilities * target_probabilities.clamp_min(1e-12).log()).sum(
+                    dim=-1
+                )
+            )
+            nearest_matches.append(pool_ids[:, 0].eq(gt_raw[..., stage][valid]))
+            sample_count += int(valid.sum().item())
+
+        if not losses:
+            return zero
+        loss = torch.cat(losses).mean()
+        entropy = torch.cat(entropies).mean()
+        nearest_original = torch.cat(nearest_matches).float().mean()
+        self._record(f"{metric_prefix}/q{stage}_soft_recovery", loss)
+        self._record(f"{metric_prefix}/q{stage}_recovery_pool_entropy", entropy)
+        self._record(
+            f"{metric_prefix}/q{stage}_recovery_top1_original_rate", nearest_original
+        )
+        self._record(f"{metric_prefix}/q{stage}_recovery_samples", float(sample_count))
+        return loss
+
+    def _record_hard_latent_metrics(
+        self,
+        predicted_ids: torch.Tensor,
+        gt_ids: torch.Tensor,
+        middle_mask: torch.Tensor,
+        gap_lengths: torch.Tensor,
+    ) -> None:
+        """Record hard-code latent error after the complete C2F rollout."""
+        self.target_builder._ensure_device(predicted_ids.device)
+        q = self.num_quantizers
+        ntpf = int(self.model.config.num_tokens_per_frame)
+        frames = predicted_ids.shape[1] // ntpf
+        predicted_view = predicted_ids.reshape(predicted_ids.shape[0], frames, ntpf)
+        gt_view = gt_ids.reshape_as(predicted_view)
+        middle_view = middle_mask.reshape_as(predicted_view)
+        frame_valid = middle_view[..., 0]
+        all_squared_errors = []
+        all_q0_correct = []
+        all_gap_lengths = []
+
+        for part_idx, part in enumerate(self.target_builder.part_order):
+            predicted_raw = self.target_builder.raw_part_ids(predicted_view, part_idx).long()
+            gt_raw = self.target_builder.raw_part_ids(gt_view, part_idx).long()
+            predicted_latent = sum(
+                self.target_builder.codebooks[part][stage].index_select(
+                    0, predicted_raw[..., stage].reshape(-1)
+                ).reshape(*predicted_raw.shape[:-1], -1)
+                for stage in range(q)
+            )
+            target_latent = self.target_builder.target_latent(gt_view, part_idx)
+            valid_squared_errors = (predicted_latent - target_latent).square()[frame_valid]
+            valid_q0_correct = predicted_raw[..., 0][frame_valid].eq(
+                gt_raw[..., 0][frame_valid]
+            )
+            expanded_gaps = gap_lengths.view(-1, 1).expand(-1, frames)[frame_valid]
+            if valid_squared_errors.numel():
+                self._record_rmse(
+                    f"eval_c2f/{part}_hard_latent_rmse", valid_squared_errors
+                )
+                all_squared_errors.append(valid_squared_errors)
+                all_q0_correct.append(valid_q0_correct)
+                all_gap_lengths.append(expanded_gaps)
+
+        if not all_squared_errors:
+            return
+        squared_errors = torch.cat(all_squared_errors)
+        q0_correct = torch.cat(all_q0_correct)
+        gaps = torch.cat(all_gap_lengths)
+        self._record_rmse("eval_c2f/hard_latent_rmse", squared_errors)
+        for name, selection in (
+            ("q0_correct", q0_correct),
+            ("q0_wrong", ~q0_correct),
+            ("gap_1_3", gaps.le(3)),
+            ("gap_4_7", gaps.ge(4) & gaps.le(7)),
+            ("gap_8_15", gaps.ge(8)),
+        ):
+            if bool(selection.any()):
+                self._record_rmse(
+                    f"eval_c2f/hard_latent_rmse_{name}", squared_errors[selection]
+                )
 
     def _record_stage_metrics(
         self,
@@ -653,6 +845,7 @@ class VariableGapC2FTrainer(Trainer):
         *,
         stage: int,
         adaptive: bool,
+        soft_recovery: bool = False,
         metric_prefix: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         targets = self.target_builder.build_targets(
@@ -675,10 +868,23 @@ class VariableGapC2FTrainer(Trainer):
         embed_loss, final_loss = self._embedding_losses(
             logits, targets, gt_ids, current_ids, middle_mask, stage
         )
+        soft_recovery_loss = (
+            self._soft_recovery_loss(
+                logits,
+                gt_ids,
+                current_ids,
+                middle_mask,
+                stage,
+                metric_prefix,
+            )
+            if soft_recovery
+            else logits.new_zeros(())
+        )
         loss = (
             ce_loss
             + self.embedding_loss_weight * embed_loss
             + self.final_latent_loss_weight * final_loss
+            + self.soft_recovery_weight * soft_recovery_loss
         )
         self._record_stage_metrics(
             metric_prefix,
@@ -709,7 +915,8 @@ class VariableGapC2FTrainer(Trainer):
                 inputs["attention_mask"],
                 inputs["middle_mask"],
                 stage=stage,
-                adaptive=stage > 0,
+                adaptive=stage > 0 and self.adaptive_target_mode != "never",
+                soft_recovery=stage > 0 and self.soft_recovery_weight > 0,
                 metric_prefix="eval_c2f",
             )
             losses.append(loss)
@@ -730,6 +937,12 @@ class VariableGapC2FTrainer(Trainer):
                     f"eval_c2f/gap_{int(gap)}_original_acc",
                     current[gap_valid].eq(inputs["gt_ids"][gap_valid]).float().mean(),
                 )
+        self._record_hard_latent_metrics(
+            current,
+            inputs["gt_ids"],
+            inputs["middle_mask"],
+            inputs["gap_lengths"],
+        )
         return torch.stack(losses).mean()
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -741,6 +954,7 @@ class VariableGapC2FTrainer(Trainer):
         stage = self._sample_stage()
         self_forced, probability = self._use_self_forcing(stage)
         adaptive_targets = self._use_adaptive_targets(stage, self_forced)
+        soft_recovery = self_forced and self.soft_recovery_weight > 0
         current = self._fill_prefix(
             model,
             inputs["input_ids"],
@@ -760,11 +974,13 @@ class VariableGapC2FTrainer(Trainer):
             inputs["middle_mask"],
             stage=stage,
             adaptive=adaptive_targets,
+            soft_recovery=soft_recovery,
             metric_prefix="train_c2f",
         )
         self._record("train_c2f/self_forcing_probability", probability)
         self._record("train_c2f/self_forced_batch", float(self_forced))
         self._record("train_c2f/adaptive_target_batch", float(adaptive_targets))
+        self._record("train_c2f/soft_recovery_batch", float(soft_recovery))
         self._record("train_c2f/gap_mean", inputs["gap_lengths"].float().mean())
         return (loss, {"loss": loss}) if return_outputs else loss
 
@@ -847,6 +1063,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--embedding_loss_weight", type=float, default=0.1)
     parser.add_argument("--final_latent_loss_weight", type=float, default=0.1)
+    parser.add_argument(
+        "--soft_recovery_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for a top-K distance-weighted residual target distribution. "
+            "Canonical codec CE remains the primary target."
+        ),
+    )
+    parser.add_argument("--soft_recovery_topk", type=int, default=8)
+    parser.add_argument("--soft_recovery_sigma_scale", type=float, default=1.0)
+    parser.add_argument(
+        "--soft_recovery_include_correct_prefix",
+        action="store_true",
+        help="Also apply soft recovery when the generated prefix matches ground truth.",
+    )
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_train_epochs", type=float, default=100.0)
@@ -883,6 +1115,12 @@ def main() -> None:
     set_seed(args.seed)
     if not 0 <= args.self_forcing_max_prob <= 1:
         raise ValueError("self_forcing_max_prob must be in [0,1]")
+    if args.soft_recovery_weight < 0:
+        raise ValueError("soft_recovery_weight must be >= 0")
+    if args.soft_recovery_topk < 1:
+        raise ValueError("soft_recovery_topk must be >= 1")
+    if args.soft_recovery_sigma_scale <= 0:
+        raise ValueError("soft_recovery_sigma_scale must be > 0")
     if args.min_gap_frames < 1 or args.max_gap_frames < args.min_gap_frames:
         raise ValueError("Invalid gap range")
 
@@ -1009,6 +1247,10 @@ def main() -> None:
     model.config.generation_order = "quantizer_coarse_to_fine"
     model.config.constrain_token_logits = True
     model.config.adaptive_target_mode = args.adaptive_target_mode
+    model.config.soft_recovery_weight = args.soft_recovery_weight
+    model.config.soft_recovery_topk = args.soft_recovery_topk
+    model.config.soft_recovery_sigma_scale = args.soft_recovery_sigma_scale
+    model.config.soft_recovery_only_wrong_prefix = not args.soft_recovery_include_correct_prefix
 
     checkpoint_paths = {part: Path(getattr(args, f"{part}_ckpt")) for part in part_order}
     codebooks = MultipartCodebookSet.from_checkpoints(
@@ -1060,6 +1302,12 @@ def main() -> None:
         f"max={args.self_forcing_max_prob}"
     )
     print(f"Adaptive targets: {args.adaptive_target_mode}")
+    print(
+        "Soft recovery:    "
+        f"weight={args.soft_recovery_weight}, topk={args.soft_recovery_topk}, "
+        f"sigma_scale={args.soft_recovery_sigma_scale}, "
+        f"only_wrong_prefix={not args.soft_recovery_include_correct_prefix}"
+    )
     print(
         f"Loss weights:     embed={args.embedding_loss_weight}, "
         f"final_latent={args.final_latent_loss_weight}"
@@ -1115,6 +1363,10 @@ def main() -> None:
         adaptive_target_mode=args.adaptive_target_mode,
         embedding_loss_weight=args.embedding_loss_weight,
         final_latent_loss_weight=args.final_latent_loss_weight,
+        soft_recovery_weight=args.soft_recovery_weight,
+        soft_recovery_topk=args.soft_recovery_topk,
+        soft_recovery_sigma_scale=args.soft_recovery_sigma_scale,
+        soft_recovery_only_wrong_prefix=not args.soft_recovery_include_correct_prefix,
     )
 
     if args.dry_run_batches > 0:

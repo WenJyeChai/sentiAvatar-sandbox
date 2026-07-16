@@ -343,3 +343,140 @@ def test_trainer_self_forced_stage_builds_a_finite_backward_loss(tmp_path):
     assert torch.isfinite(loss)
     assert model.embed_tokens.weight.grad is not None
     assert torch.isfinite(model.embed_tokens.weight.grad).all()
+
+
+def test_soft_recovery_uses_incorrect_prefix_pool_without_replacing_targets(tmp_path):
+    torch.manual_seed(19)
+    config = tiny_config()
+    model = AudioMotionTransformer(config).train()
+    collator = VariableGapC2FCollator(config)
+    example = VariableGapMaskExample(
+        name="gap2",
+        left_idx=0,
+        right_idx=3,
+        gap_frames=2,
+        motion_tokens=[raw_frame(0), raw_frame(1), raw_frame(2), raw_frame(3)],
+        audio_features=torch.randn(4, 3),
+    )
+    batch = collator([example])
+    builder = ResidualTargetBuilder(
+        {part: torch.randn(2, 4, 8) for part in ("upper", "lower")},
+        part_order=("upper", "lower"),
+        codebook_size=4,
+        num_quantizers=2,
+    )
+    trainer = VariableGapC2FTrainer(
+        model=model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            report_to="none",
+            remove_unused_columns=False,
+        ),
+        target_builder=builder,
+        stage_weights=(0.0, 1.0),
+        self_forcing_warmup_ratio=0.0,
+        self_forcing_ramp_ratio=0.0,
+        self_forcing_max_prob=1.0,
+        adaptive_target_mode="never",
+        embedding_loss_weight=0.1,
+        final_latent_loss_weight=0.1,
+        soft_recovery_weight=0.1,
+        soft_recovery_topk=2,
+    )
+
+    current = batch["input_ids"].clone()
+    q0_mask = trainer._stage_mask(batch["middle_mask"], 0)
+    current[q0_mask] = batch["gt_ids"][q0_mask]
+    slots = torch.arange(current.shape[1]).remainder(config.num_tokens_per_frame)
+    q0_positions = q0_mask & slots.view(1, -1).remainder(2).eq(0)
+    offsets = slots.view(1, -1) * config.codebook_size
+    raw = (current - offsets).remainder(config.codebook_size)
+    current[q0_positions] = (
+        offsets.expand_as(current)[q0_positions]
+        + (raw[q0_positions] + 1).remainder(config.codebook_size)
+    )
+    logits = model(
+        input_ids=current,
+        audio_features=batch["audio_features"],
+        attention_mask=batch["attention_mask"],
+    )
+    loss = trainer._soft_recovery_loss(
+        logits,
+        batch["gt_ids"],
+        current,
+        batch["middle_mask"],
+        stage=1,
+        metric_prefix="train_c2f",
+    )
+    canonical = builder.build_targets(
+        batch["gt_ids"], current, batch["middle_mask"], stage=1, adaptive=False
+    )
+
+    assert torch.isfinite(loss) and float(loss.detach()) > 0
+    assert torch.equal(
+        canonical[trainer._stage_mask(batch["middle_mask"], 1)],
+        batch["gt_ids"][trainer._stage_mask(batch["middle_mask"], 1)],
+    )
+    assert "train_c2f/q1_soft_recovery" in trainer._metric_sums
+    assert trainer._metric_sums["train_c2f/q1_recovery_samples"] > 0
+    loss.backward()
+    assert torch.isfinite(model.embed_tokens.weight.grad).all()
+
+
+def test_evaluation_loss_and_hard_latent_metrics_are_finite(tmp_path):
+    torch.manual_seed(29)
+    config = tiny_config()
+    model = AudioMotionTransformer(config)
+    collator = VariableGapC2FCollator(config)
+    examples = [
+        VariableGapMaskExample(
+            name="gap1",
+            left_idx=0,
+            right_idx=2,
+            gap_frames=1,
+            motion_tokens=[raw_frame(0), raw_frame(1), raw_frame(2)],
+            audio_features=torch.randn(3, 3),
+        ),
+        VariableGapMaskExample(
+            name="gap2",
+            left_idx=0,
+            right_idx=3,
+            gap_frames=2,
+            motion_tokens=[raw_frame(0), raw_frame(1), raw_frame(2), raw_frame(3)],
+            audio_features=torch.randn(4, 3),
+        ),
+    ]
+    builder = ResidualTargetBuilder(
+        {part: torch.randn(2, 4, 8) for part in ("upper", "lower")},
+        part_order=("upper", "lower"),
+        codebook_size=4,
+        num_quantizers=2,
+    )
+    trainer = VariableGapC2FTrainer(
+        model=model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            per_device_eval_batch_size=2,
+            prediction_loss_only=True,
+            report_to="none",
+            remove_unused_columns=False,
+        ),
+        eval_dataset=examples,
+        data_collator=collator,
+        target_builder=builder,
+        stage_weights=(0.5, 0.5),
+        self_forcing_warmup_ratio=0.0,
+        self_forcing_ramp_ratio=0.0,
+        self_forcing_max_prob=0.0,
+        adaptive_target_mode="never",
+        embedding_loss_weight=0.1,
+        final_latent_loss_weight=0.1,
+    )
+
+    metrics = trainer.evaluate()
+    logged = trainer.state.log_history[-1]
+
+    assert torch.isfinite(torch.tensor(metrics["eval_loss"]))
+    assert torch.isfinite(torch.tensor(logged["eval_c2f/hard_latent_rmse"]))
+    assert "eval_c2f/hard_latent_rmse_q0_wrong" in logged
+    assert "eval_c2f/hard_latent_rmse_gap_1_3" in logged
