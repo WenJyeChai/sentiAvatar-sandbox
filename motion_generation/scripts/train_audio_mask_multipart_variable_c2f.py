@@ -1528,6 +1528,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable DDP unused-parameter discovery. By default this is enabled "
+            "automatically for stage-specific audio posterior heads."
+        ),
+    )
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--dry_run_batches", type=int, default=0)
@@ -1825,6 +1834,12 @@ def main() -> None:
     print(f"Total steps:      {total_steps}")
     print("=" * 76)
 
+    ddp_find_unused_parameters = (
+        args.ddp_find_unused_parameters
+        if args.ddp_find_unused_parameters is not None
+        else audio_conditioning_mode
+        in {"residual_posterior", "additive_residual_posterior"}
+    )
     training_kwargs: Dict[str, Any] = {
         "output_dir": args.output_dir,
         "num_train_epochs": args.num_train_epochs,
@@ -1845,6 +1860,7 @@ def main() -> None:
         "bf16": args.bf16,
         "fp16": args.fp16,
         "gradient_checkpointing": args.gradient_checkpointing,
+        "ddp_find_unused_parameters": ddp_find_unused_parameters,
         "remove_unused_columns": False,
         "prediction_loss_only": True,
         "report_to": args.report_to,
