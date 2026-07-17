@@ -14,8 +14,6 @@ vocab_size = 512 * 4 + 1 = 2049 (最后一个是mask token)
 
 import random
 import math
-from typing import Mapping, Optional, Sequence
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,14 +42,6 @@ class AudioMotionConfig(PretrainedConfig):
         dropout=0.2,
         cond_drop_prob=0.2,
         constrain_token_logits=False,
-        audio_conditioning_mode="additive",
-        audio_residual_part_order=None,
-        audio_residual_num_quantizers=0,
-        audio_residual_latent_dims=None,
-        audio_residual_prior_weight=1.0,
-        audio_residual_gate_init=-4.0,
-        audio_residual_log_sigma_min=-3.0,
-        audio_residual_log_sigma_max=3.0,
         rms_norm_eps=1e-6,
         hidden_act="gelu",
         **kwargs,
@@ -70,14 +60,6 @@ class AudioMotionConfig(PretrainedConfig):
         self.dropout = dropout
         self.cond_drop_prob = cond_drop_prob
         self.constrain_token_logits = constrain_token_logits
-        self.audio_conditioning_mode = audio_conditioning_mode
-        self.audio_residual_part_order = list(audio_residual_part_order or [])
-        self.audio_residual_num_quantizers = int(audio_residual_num_quantizers)
-        self.audio_residual_latent_dims = list(audio_residual_latent_dims or [])
-        self.audio_residual_prior_weight = float(audio_residual_prior_weight)
-        self.audio_residual_gate_init = float(audio_residual_gate_init)
-        self.audio_residual_log_sigma_min = float(audio_residual_log_sigma_min)
-        self.audio_residual_log_sigma_max = float(audio_residual_log_sigma_max)
         self.rms_norm_eps = rms_norm_eps
         self.hidden_act = hidden_act
 
@@ -121,270 +103,6 @@ class AudioEncoder(nn.Module):
         return self.proj(audio_features)
 
 
-class AudioResidualSlotHead(nn.Module):
-    """Predict one RVQ stage's residual Gaussian and confidence gate."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        latent_dim: int,
-        gate_init: float,
-        log_sigma_min: float,
-        log_sigma_max: float,
-    ) -> None:
-        super().__init__()
-        self.log_sigma_min = float(log_sigma_min)
-        self.log_sigma_max = float(log_sigma_max)
-        self.prefix_proj = nn.Sequential(
-            nn.Linear(latent_dim, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-        )
-        self.trunk = nn.Sequential(
-            nn.Linear(hidden_size * 3, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.GELU(),
-        )
-        self.mu = nn.Linear(hidden_size, latent_dim)
-        self.log_sigma = nn.Linear(hidden_size, 1)
-        self.gate = nn.Linear(hidden_size, 1)
-        nn.init.zeros_(self.log_sigma.weight)
-        nn.init.zeros_(self.log_sigma.bias)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.constant_(self.gate.bias, float(gate_init))
-
-    def forward(
-        self,
-        motion_states: torch.Tensor,
-        audio_states: torch.Tensor,
-        prefix_latent: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        prefix_states = self.prefix_proj(prefix_latent)
-        fused = self.trunk(
-            torch.cat([motion_states, audio_states, prefix_states], dim=-1)
-        )
-        log_sigma = self.log_sigma(fused).clamp(
-            self.log_sigma_min, self.log_sigma_max
-        )
-        return {
-            "mu": self.mu(fused),
-            "log_sigma": log_sigma,
-            "gate": torch.sigmoid(self.gate(fused)),
-        }
-
-
-class AudioResidualPosterior(nn.Module):
-    """Map audio and motion context to distributions over frozen RVQ codes."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        codebooks: Sequence[torch.Tensor],
-        part_order: Sequence[str],
-        num_quantizers: int,
-        codebook_size: int,
-        prior_weight: float,
-        gate_init: float,
-        log_sigma_min: float,
-        log_sigma_max: float,
-    ) -> None:
-        super().__init__()
-        self.part_order = tuple(str(part) for part in part_order)
-        self.num_quantizers = int(num_quantizers)
-        self.codebook_size = int(codebook_size)
-        self.prior_weight = float(prior_weight)
-        if len(codebooks) != len(self.part_order):
-            raise ValueError("One stacked codebook tensor is required per body part")
-
-        self.audio_temporal = nn.Sequential(
-            nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1),
-        )
-        self.audio_norm = nn.LayerNorm(hidden_size)
-        self.heads = nn.ModuleDict()
-        self._codebook_names: list[str] = []
-        for part_idx, (part, codebook) in enumerate(zip(self.part_order, codebooks)):
-            codebook = torch.as_tensor(codebook).detach().float()
-            if codebook.dim() != 3:
-                raise ValueError(
-                    f"{part} codebooks must have shape (Q,K,D), got {tuple(codebook.shape)}"
-                )
-            if codebook.shape[:2] != (self.num_quantizers, self.codebook_size):
-                raise ValueError(
-                    f"{part} codebook layout {tuple(codebook.shape[:2])} does not match "
-                    f"({self.num_quantizers},{self.codebook_size})"
-                )
-            buffer_name = f"codebook_{part_idx}"
-            self.register_buffer(buffer_name, codebook, persistent=True)
-            self._codebook_names.append(buffer_name)
-            for stage in range(self.num_quantizers):
-                self.heads[self._head_key(part_idx, stage)] = AudioResidualSlotHead(
-                    hidden_size=hidden_size,
-                    latent_dim=int(codebook.shape[-1]),
-                    gate_init=gate_init,
-                    log_sigma_min=log_sigma_min,
-                    log_sigma_max=log_sigma_max,
-                )
-
-    @staticmethod
-    def _head_key(part_idx: int, stage: int) -> str:
-        return f"part{part_idx}_q{stage}"
-
-    def codebook(self, part_idx: int) -> torch.Tensor:
-        return getattr(self, self._codebook_names[part_idx])
-
-    def set_codebooks(self, codebooks: Sequence[torch.Tensor]) -> None:
-        if len(codebooks) != len(self.part_order):
-            raise ValueError("Codebook part count changed")
-        for part_idx, value in enumerate(codebooks):
-            target = self.codebook(part_idx)
-            value = torch.as_tensor(value, dtype=target.dtype, device=target.device)
-            if value.shape != target.shape:
-                raise ValueError(
-                    f"Codebook shape changed for {self.part_order[part_idx]}: "
-                    f"{tuple(value.shape)} != {tuple(target.shape)}"
-                )
-            target.copy_(value)
-
-    def encode_temporal_audio(
-        self,
-        encoded_audio: torch.Tensor,
-        frame_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        temporal = self.audio_temporal(encoded_audio.transpose(1, 2)).transpose(1, 2)
-        temporal = self.audio_norm(encoded_audio + temporal)
-        if frame_mask is not None:
-            temporal = temporal * frame_mask.unsqueeze(-1).to(temporal.dtype)
-        return temporal
-
-    def _raw_part_ids(
-        self,
-        input_view: torch.Tensor,
-        part_idx: int,
-    ) -> torch.Tensor:
-        start_slot = part_idx * self.num_quantizers
-        offsets = (
-            torch.arange(
-                start_slot,
-                start_slot + self.num_quantizers,
-                device=input_view.device,
-            )
-            * self.codebook_size
-        )
-        return (input_view[..., start_slot : start_slot + self.num_quantizers] - offsets).clamp(
-            0, self.codebook_size - 1
-        )
-
-    def _prefix_latent(
-        self,
-        input_view: torch.Tensor,
-        part_idx: int,
-        stage: int,
-    ) -> torch.Tensor:
-        book = self.codebook(part_idx)
-        latent_shape = (*input_view.shape[:2], int(book.shape[-1]))
-        if stage == 0:
-            return book.new_zeros(latent_shape)
-        raw_ids = self._raw_part_ids(input_view, part_idx).long()
-        return sum(
-            book[prefix].index_select(0, raw_ids[..., prefix].reshape(-1)).reshape(
-                *raw_ids.shape[:-1], -1
-            )
-            for prefix in range(stage)
-        )
-
-    @staticmethod
-    def _code_logits(
-        mu: torch.Tensor,
-        log_sigma: torch.Tensor,
-        codebook: torch.Tensor,
-    ) -> torch.Tensor:
-        mean_squared_distance = (
-            mu.unsqueeze(-2)
-            - codebook.view(1, 1, codebook.shape[0], codebook.shape[1])
-        ).square().mean(dim=-1)
-        variance = torch.exp(2.0 * log_sigma.float()).clamp_min(1e-8)
-        return -0.5 * mean_squared_distance.float() / variance
-
-    def forward(
-        self,
-        logits: torch.Tensor,
-        motion_states: torch.Tensor,
-        encoded_audio: torch.Tensor,
-        input_ids: torch.Tensor,
-        *,
-        frame_mask: Optional[torch.Tensor] = None,
-        stage: Optional[int] = None,
-        negative_encoded_audio: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, dict[tuple[int, int], dict[str, torch.Tensor]]]:
-        ntpf = len(self.part_order) * self.num_quantizers
-        if input_ids.shape[1] % ntpf != 0:
-            raise ValueError("Input sequence is not divisible by the multipart token layout")
-        frames = input_ids.shape[1] // ntpf
-        input_view = input_ids.reshape(input_ids.shape[0], frames, ntpf)
-        hidden_view = motion_states.reshape(
-            motion_states.shape[0], frames, ntpf, motion_states.shape[-1]
-        )
-        logits_view = logits.reshape(logits.shape[0], frames, ntpf, logits.shape[-1])
-        positive_audio = self.encode_temporal_audio(encoded_audio, frame_mask)
-        negative_audio = (
-            self.encode_temporal_audio(negative_encoded_audio, frame_mask)
-            if negative_encoded_audio is not None
-            else None
-        )
-        stages = range(self.num_quantizers) if stage is None else (int(stage),)
-        details: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
-        adjusted = logits_view.clone()
-
-        for part_idx, part in enumerate(self.part_order):
-            part_book = self.codebook(part_idx)
-            for quantizer in stages:
-                if quantizer < 0 or quantizer >= self.num_quantizers:
-                    raise ValueError(f"Invalid quantizer stage {quantizer}")
-                slot = part_idx * self.num_quantizers + quantizer
-                prefix = self._prefix_latent(input_view, part_idx, quantizer)
-                head = self.heads[self._head_key(part_idx, quantizer)]
-                parameters = head(hidden_view[..., slot, :], positive_audio, prefix)
-                prior_logits = self._code_logits(
-                    parameters["mu"],
-                    parameters["log_sigma"],
-                    part_book[quantizer],
-                )
-                start = slot * self.codebook_size
-                end = start + self.codebook_size
-                adjusted[..., slot, start:end] = (
-                    logits_view[..., slot, start:end]
-                    + self.prior_weight
-                    * parameters["gate"]
-                    * prior_logits.to(logits.dtype)
-                )
-                slot_details = {
-                    **parameters,
-                    "prior_logits": prior_logits,
-                    "part": part,
-                }
-                if negative_audio is not None:
-                    negative_parameters = head(
-                        hidden_view[..., slot, :], negative_audio, prefix
-                    )
-                    slot_details.update(
-                        {
-                            "negative_mu": negative_parameters["mu"],
-                            "negative_log_sigma": negative_parameters["log_sigma"],
-                            "negative_prior_logits": self._code_logits(
-                                negative_parameters["mu"],
-                                negative_parameters["log_sigma"],
-                                part_book[quantizer],
-                            ),
-                        }
-                    )
-                details[(part_idx, quantizer)] = slot_details
-        return adjusted.reshape_as(logits), details
-
-
 class PositionEmbedding(nn.Module):
     """可学习的位置嵌入，使用正弦初始化"""
 
@@ -421,7 +139,6 @@ class AudioMotionTransformer(PreTrainedModel):
     def __init__(self, config: AudioMotionConfig):
         super().__init__(config)
         self.config = config
-        self._validate_audio_conditioning_mode(config.audio_conditioning_mode)
 
         # Motion token embedding
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -430,27 +147,6 @@ class AudioMotionTransformer(PreTrainedModel):
         self.audio_encoder = AudioEncoder(
             config.audio_feat_dim, config.hidden_size, config.dropout
         )
-        self.audio_residual_posterior: Optional[AudioResidualPosterior] = None
-        if (
-            config.audio_conditioning_mode
-            in {"residual_posterior", "additive_residual_posterior"}
-            and config.audio_residual_part_order
-            and config.audio_residual_num_quantizers > 0
-            and config.audio_residual_latent_dims
-        ):
-            placeholder_books = [
-                torch.zeros(
-                    config.audio_residual_num_quantizers,
-                    config.codebook_size,
-                    int(latent_dim),
-                )
-                for latent_dim in config.audio_residual_latent_dims
-            ]
-            self.audio_residual_posterior = self._build_audio_residual_posterior(
-                placeholder_books,
-                config.audio_residual_part_order,
-                config.audio_residual_num_quantizers,
-            )
 
         # Position embedding
         self.position_emb = PositionEmbedding(
@@ -479,99 +175,6 @@ class AudioMotionTransformer(PreTrainedModel):
 
         # Initialize weights
         self.post_init()
-        if self.audio_residual_posterior is not None:
-            for head in self.audio_residual_posterior.heads.values():
-                nn.init.zeros_(head.gate.weight)
-                nn.init.constant_(
-                    head.gate.bias, float(config.audio_residual_gate_init)
-                )
-
-    @staticmethod
-    def _validate_audio_conditioning_mode(mode: str) -> None:
-        if mode not in {
-            "additive",
-            "residual_posterior",
-            "additive_residual_posterior",
-        }:
-            raise ValueError(
-                "audio_conditioning_mode must be additive, residual_posterior, "
-                "or additive_residual_posterior"
-            )
-
-    def _build_audio_residual_posterior(
-        self,
-        codebooks: Sequence[torch.Tensor],
-        part_order: Sequence[str],
-        num_quantizers: int,
-    ) -> AudioResidualPosterior:
-        return AudioResidualPosterior(
-            hidden_size=int(self.config.hidden_size),
-            codebooks=codebooks,
-            part_order=part_order,
-            num_quantizers=num_quantizers,
-            codebook_size=int(self.config.codebook_size),
-            prior_weight=float(self.config.audio_residual_prior_weight),
-            gate_init=float(self.config.audio_residual_gate_init),
-            log_sigma_min=float(self.config.audio_residual_log_sigma_min),
-            log_sigma_max=float(self.config.audio_residual_log_sigma_max),
-        )
-
-    def configure_audio_residual_posterior(
-        self,
-        codebooks: Mapping[str, torch.Tensor],
-        part_order: Sequence[str],
-        num_quantizers: int,
-        *,
-        mode: str,
-        prior_weight: float = 1.0,
-        gate_init: float = -4.0,
-        log_sigma_min: float = -3.0,
-        log_sigma_max: float = 3.0,
-    ) -> None:
-        """Attach or refresh the frozen multipart codebooks used by the prior."""
-        self._validate_audio_conditioning_mode(mode)
-        self.config.audio_conditioning_mode = mode
-        if mode == "additive":
-            return
-
-        order = tuple(str(part) for part in part_order)
-        stacked = [torch.as_tensor(codebooks[part]).detach().float() for part in order]
-        latent_dims = [int(value.shape[-1]) for value in stacked]
-        self.config.audio_residual_part_order = list(order)
-        self.config.audio_residual_num_quantizers = int(num_quantizers)
-        self.config.audio_residual_latent_dims = latent_dims
-        self.config.audio_residual_prior_weight = float(prior_weight)
-        self.config.audio_residual_gate_init = float(gate_init)
-        self.config.audio_residual_log_sigma_min = float(log_sigma_min)
-        self.config.audio_residual_log_sigma_max = float(log_sigma_max)
-
-        compatible = (
-            self.audio_residual_posterior is not None
-            and self.audio_residual_posterior.part_order == order
-            and self.audio_residual_posterior.num_quantizers == int(num_quantizers)
-            and all(
-                self.audio_residual_posterior.codebook(index).shape == value.shape
-                for index, value in enumerate(stacked)
-            )
-        )
-        if compatible:
-            self.audio_residual_posterior.prior_weight = float(prior_weight)
-            self.audio_residual_posterior.set_codebooks(stacked)
-            for head in self.audio_residual_posterior.heads.values():
-                head.log_sigma_min = float(log_sigma_min)
-                head.log_sigma_max = float(log_sigma_max)
-            return
-
-        posterior = self._build_audio_residual_posterior(stacked, order, num_quantizers)
-        self.audio_residual_posterior = posterior.to(next(self.parameters()).device)
-
-    @property
-    def uses_audio_residual_posterior(self) -> bool:
-        return (
-            self.config.audio_conditioning_mode
-            in {"residual_posterior", "additive_residual_posterior"}
-            and self.audio_residual_posterior is not None
-        )
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         del gradient_checkpointing_kwargs
@@ -639,7 +242,7 @@ class AudioMotionTransformer(PreTrainedModel):
         valid = self._slot_valid_mask(logits.size(1), logits.device).unsqueeze(0)
         return logits.masked_fill(~valid, torch.finfo(logits.dtype).min)
 
-    def _fuse_encoded_audio(self, token_embeddings, audio_emb):
+    def _fuse_audio(self, token_embeddings, audio_features):
         """
         将音频特征融合到motion token embedding上。
         每帧的audio特征投影后加到该帧的所有4个motion token embedding上。
@@ -654,6 +257,8 @@ class AudioMotionTransformer(PreTrainedModel):
         num_tokens_per_frame = self.config.num_tokens_per_frame
 
         # 投影音频特征: (B, num_frames, hidden_size)
+        audio_emb = self.audio_encoder(audio_features)
+
         # 扩展到每帧的每个token: (B, num_frames, 1, hidden_size) -> (B, num_frames, 4, hidden_size)
         audio_emb = audio_emb.unsqueeze(2).expand(
             -1, -1, num_tokens_per_frame, -1
@@ -672,21 +277,7 @@ class AudioMotionTransformer(PreTrainedModel):
 
         return token_embeddings + audio_emb
 
-    def _fuse_audio(self, token_embeddings, audio_features):
-        return self._fuse_encoded_audio(
-            token_embeddings, self.audio_encoder(audio_features)
-        )
-
-    def forward(
-        self,
-        input_ids,
-        labels=None,
-        audio_features=None,
-        attention_mask=None,
-        audio_prior_stage=None,
-        negative_audio_features=None,
-        return_audio_prior_details=False,
-    ):
+    def forward(self, input_ids, labels=None, audio_features=None, attention_mask=None):
         """
         Args:
             input_ids: (batch_size, seq_len) - Motion token IDs (with offset)
@@ -710,14 +301,9 @@ class AudioMotionTransformer(PreTrainedModel):
         # Add position embeddings
         x = x + self.position_emb(x.size(1), x.device)
 
-        encoded_audio = None
+        # Fuse audio features
         if audio_features is not None:
-            encoded_audio = self.audio_encoder(audio_features)
-            if self.config.audio_conditioning_mode in {
-                "additive",
-                "additive_residual_posterior",
-            }:
-                x = self._fuse_encoded_audio(x, encoded_audio)
+            x = self._fuse_audio(x, audio_features)
 
         # Normalize and encode
         x = self.norm(x)
@@ -725,40 +311,7 @@ class AudioMotionTransformer(PreTrainedModel):
 
         # Get logits
         logits = self.out_head(output)  # (B, seq_len, vocab_size)
-        audio_prior_details = {}
-        if self.uses_audio_residual_posterior and encoded_audio is not None:
-            ntpf = int(self.config.num_tokens_per_frame)
-            frame_mask = None
-            if (
-                attention_mask is not None
-                and attention_mask.dim() == 2
-                and attention_mask.shape == input_ids.shape
-            ):
-                frame_mask = attention_mask.reshape(
-                    attention_mask.shape[0], -1, ntpf
-                )[..., 0].to(dtype=torch.bool)
-            negative_encoded_audio = (
-                self.audio_encoder(negative_audio_features)
-                if negative_audio_features is not None
-                else None
-            )
-            logits, audio_prior_details = self.audio_residual_posterior(
-                logits,
-                output,
-                encoded_audio,
-                input_ids,
-                frame_mask=frame_mask,
-                stage=audio_prior_stage,
-                negative_encoded_audio=negative_encoded_audio,
-            )
         logits = self.constrain_logits_by_slot(logits)
-
-        if return_audio_prior_details:
-            if labels is not None:
-                raise ValueError(
-                    "return_audio_prior_details is only supported when labels are omitted"
-                )
-            return {"logits": logits, "audio_prior": audio_prior_details}
 
         if labels is None:
             return logits
@@ -841,13 +394,11 @@ class AudioMotionTransformer(PreTrainedModel):
             )
             if not bool(fill.any()):
                 continue
-            forward_kwargs = {
-                "audio_features": audio_features,
-                "attention_mask": attention_mask,
-            }
-            if self.uses_audio_residual_posterior:
-                forward_kwargs["audio_prior_stage"] = quantizer
-            logits = self.forward(output_ids, **forward_kwargs)
+            logits = self.forward(
+                output_ids,
+                audio_features=audio_features,
+                attention_mask=attention_mask,
+            )
             predictions = logits.argmax(dim=-1)
             output_ids[fill] = predictions[fill]
         return output_ids
@@ -877,12 +428,6 @@ class AudioMotionTransformer(PreTrainedModel):
             input_ids = input_ids.unsqueeze(0)
         if audio_features.dim() == 2:
             audio_features = audio_features.unsqueeze(0)
-        if self.uses_audio_residual_posterior:
-            return self.generate_quantizer_coarse_to_fine(
-                input_ids,
-                audio_features,
-                attention_mask=attention_mask,
-            )
 
         step_out = input_ids.clone()
         batch_size = step_out.size(0)

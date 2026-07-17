@@ -21,7 +21,6 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml
 from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import Trainer, TrainingArguments, set_seed
 from transformers.trainer_pt_utils import get_length_grouped_indices
@@ -434,12 +433,6 @@ class VariableGapC2FTrainer(Trainer):
         soft_recovery_topk: int = 8,
         soft_recovery_sigma_scale: float = 1.0,
         soft_recovery_only_wrong_prefix: bool = True,
-        audio_residual_soft_weight: float = 0.0,
-        audio_residual_nll_weight: float = 0.0,
-        audio_residual_rank_weight: float = 0.0,
-        audio_residual_topk: int = 8,
-        audio_residual_sigma_scale: float = 1.0,
-        audio_residual_rank_margin: float = 0.2,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -461,44 +454,12 @@ class VariableGapC2FTrainer(Trainer):
         self.soft_recovery_topk = int(soft_recovery_topk)
         self.soft_recovery_sigma_scale = float(soft_recovery_sigma_scale)
         self.soft_recovery_only_wrong_prefix = bool(soft_recovery_only_wrong_prefix)
-        self.audio_residual_soft_weight = float(audio_residual_soft_weight)
-        self.audio_residual_nll_weight = float(audio_residual_nll_weight)
-        self.audio_residual_rank_weight = float(audio_residual_rank_weight)
-        self.audio_residual_topk = int(audio_residual_topk)
-        self.audio_residual_sigma_scale = float(audio_residual_sigma_scale)
-        self.audio_residual_rank_margin = float(audio_residual_rank_margin)
         if self.soft_recovery_weight < 0:
             raise ValueError("soft_recovery_weight must be >= 0")
         if self.soft_recovery_topk < 1:
             raise ValueError("soft_recovery_topk must be >= 1")
         if self.soft_recovery_sigma_scale <= 0:
             raise ValueError("soft_recovery_sigma_scale must be > 0")
-        if min(
-            self.audio_residual_soft_weight,
-            self.audio_residual_nll_weight,
-            self.audio_residual_rank_weight,
-        ) < 0:
-            raise ValueError("audio residual loss weights must be >= 0")
-        if self.audio_residual_topk < 1:
-            raise ValueError("audio_residual_topk must be >= 1")
-        if self.audio_residual_sigma_scale <= 0:
-            raise ValueError("audio_residual_sigma_scale must be > 0")
-        if self.audio_residual_rank_margin < 0:
-            raise ValueError("audio_residual_rank_margin must be >= 0")
-        uses_audio_prior = bool(
-            getattr(self.model, "uses_audio_residual_posterior", False)
-        )
-        if (
-            self.audio_residual_soft_weight
-            + self.audio_residual_nll_weight
-            + self.audio_residual_rank_weight
-            > 0
-            and not uses_audio_prior
-        ):
-            raise ValueError(
-                "Audio residual losses require audio_conditioning_mode to use "
-                "the residual posterior"
-            )
         self._metric_sums: dict[str, float] = {}
         self._metric_counts: dict[str, float] = {}
         self._rmse_sums: dict[str, float] = {}
@@ -609,27 +570,16 @@ class VariableGapC2FTrainer(Trainer):
                 current[fill] = gt_ids[fill]
             return current
 
-        was_training = model.training
-        model.eval()
-        try:
-            with torch.no_grad():
-                for prefix in range(stage):
-                    forward_kwargs = {
-                        "input_ids": current,
-                        "audio_features": audio,
-                        "attention_mask": attention_mask,
-                    }
-                    base_model = getattr(model, "module", model)
-                    if bool(
-                        getattr(base_model, "uses_audio_residual_posterior", False)
-                    ):
-                        forward_kwargs["audio_prior_stage"] = prefix
-                    logits = model(**forward_kwargs)
-                    predictions = logits.argmax(dim=-1)
-                    fill = self._stage_mask(middle_mask, prefix)
-                    current[fill] = predictions[fill]
-        finally:
-            model.train(was_training)
+        with torch.no_grad():
+            for prefix in range(stage):
+                logits = model(
+                    input_ids=current,
+                    audio_features=audio,
+                    attention_mask=attention_mask,
+                )
+                predictions = logits.argmax(dim=-1)
+                fill = self._stage_mask(middle_mask, prefix)
+                current[fill] = predictions[fill]
         return current
 
     def _embedding_losses(
@@ -684,228 +634,6 @@ class VariableGapC2FTrainer(Trainer):
         embed_loss = torch.stack(embedding_losses).mean() if embedding_losses else zero
         final_loss = torch.stack(final_losses).mean() if final_losses else zero
         return embed_loss, final_loss
-
-    @staticmethod
-    def _distance_weighted_pool(
-        residual: torch.Tensor,
-        codebook: torch.Tensor,
-        *,
-        topk: int,
-        sigma_scale: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        distances = (
-            residual.square().sum(dim=-1, keepdim=True)
-            + codebook.square().sum(dim=-1).unsqueeze(0)
-            - 2.0 * residual @ codebook.transpose(0, 1)
-        ).clamp_min(0.0)
-        pool_size = min(int(topk), int(codebook.shape[0]))
-        pool_distances, pool_ids = torch.topk(
-            distances, k=pool_size, dim=-1, largest=False, sorted=True
-        )
-        shifted = pool_distances - pool_distances[:, :1]
-        if pool_size > 1:
-            local_variance = shifted[:, 1:].median(dim=-1, keepdim=True).values
-        else:
-            local_variance = torch.ones_like(shifted)
-        local_variance = (
-            local_variance.clamp_min(torch.finfo(torch.float32).eps)
-            * float(sigma_scale) ** 2
-        )
-        weights = F.softmax(-shifted / (2.0 * local_variance), dim=-1)
-        return pool_ids, weights
-
-    @staticmethod
-    def _mismatched_audio(audio: torch.Tensor) -> torch.Tensor:
-        if audio.shape[0] > 1:
-            return audio.roll(shifts=1, dims=0)
-        if audio.shape[1] > 1:
-            return audio.roll(shifts=max(1, audio.shape[1] // 2), dims=1)
-        return audio.flip(dims=(-1,))
-
-    def _audio_residual_losses(
-        self,
-        prior_details: Mapping[tuple[int, int], Mapping[str, Any]],
-        gt_ids: torch.Tensor,
-        current_ids: torch.Tensor,
-        middle_mask: torch.Tensor,
-        stage: int,
-        metric_prefix: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not prior_details:
-            zero = torch.zeros((), device=gt_ids.device, dtype=torch.float32)
-            return zero, zero, zero
-
-        self.target_builder._ensure_device(gt_ids.device)
-        q = self.num_quantizers
-        ntpf = int(self.model.config.num_tokens_per_frame)
-        frames = gt_ids.shape[1] // ntpf
-        gt_view = gt_ids.reshape(gt_ids.shape[0], frames, ntpf)
-        current_view = current_ids.reshape_as(gt_view)
-        frame_valid = middle_mask.reshape_as(gt_view)[..., 0]
-        soft_samples = []
-        nll_samples = []
-        rank_samples = []
-        negative_samples = []
-
-        for part_idx, part in enumerate(self.target_builder.part_order):
-            details = prior_details.get((part_idx, stage))
-            if details is None or not bool(frame_valid.any()):
-                continue
-            book = self.target_builder.codebooks[part][stage].float()
-            target_latent = self.target_builder.target_latent(gt_view, part_idx)
-            if stage == 0:
-                prefix_latent = torch.zeros_like(target_latent)
-            else:
-                current_raw = self.target_builder.raw_part_ids(
-                    current_view, part_idx
-                ).long()
-                prefix_latent = sum(
-                    self.target_builder.codebooks[part][prefix].index_select(
-                        0, current_raw[..., prefix].reshape(-1)
-                    ).reshape(*current_raw.shape[:-1], -1)
-                    for prefix in range(stage)
-                )
-            residual = (target_latent - prefix_latent)[frame_valid].float()
-            pool_ids, pool_weights = self._distance_weighted_pool(
-                residual,
-                book,
-                topk=self.audio_residual_topk,
-                sigma_scale=self.audio_residual_sigma_scale,
-            )
-
-            prior_logits = details["prior_logits"][frame_valid].float()
-            selected_log_probs = F.log_softmax(prior_logits, dim=-1).gather(
-                1, pool_ids
-            )
-            part_soft = -(pool_weights * selected_log_probs).sum(dim=-1)
-            mu = details["mu"][frame_valid].float()
-            log_sigma = details["log_sigma"][frame_valid].float().squeeze(-1)
-            residual_mse = (mu - residual).square().mean(dim=-1)
-            part_nll = 0.5 * (
-                residual_mse * torch.exp(-2.0 * log_sigma) + 2.0 * log_sigma
-            )
-            raw_gt = self.target_builder.raw_part_ids(gt_view, part_idx)[
-                ..., stage
-            ][frame_valid].long()
-            oracle_recall = pool_ids.eq(raw_gt.unsqueeze(-1)).any(dim=-1).float()
-            predicted_topk = prior_logits.topk(
-                k=min(self.audio_residual_topk, prior_logits.shape[-1]),
-                dim=-1,
-            ).indices
-            predicted_recall = predicted_topk.eq(
-                raw_gt.unsqueeze(-1)
-            ).any(dim=-1).float()
-            prior_top1 = prior_logits.argmax(dim=-1).eq(raw_gt).float()
-            prior_probabilities = prior_logits.softmax(dim=-1)
-            prior_entropy = -(
-                prior_probabilities
-                * prior_probabilities.clamp_min(1e-12).log()
-            ).sum(dim=-1)
-            count = float(part_soft.numel())
-
-            self._record(
-                f"{metric_prefix}/{part}_q{stage}_audio_soft_nll",
-                part_soft.mean(),
-                count,
-            )
-            self._record(
-                f"{metric_prefix}/{part}_q{stage}_audio_residual_nll",
-                part_nll.mean(),
-                count,
-            )
-            self._record(
-                f"{metric_prefix}/{part}_q{stage}_audio_gate",
-                details["gate"][frame_valid].float().mean(),
-                count,
-            )
-            self._record(
-                f"{metric_prefix}/{part}_q{stage}_audio_sigma",
-                log_sigma.exp().mean(),
-                count,
-            )
-            self._record(
-                f"{metric_prefix}/{part}_q{stage}_audio_topk_canonical_recall",
-                predicted_recall.mean(),
-                count,
-            )
-            self._record(
-                f"{metric_prefix}/{part}_q{stage}_oracle_pool_canonical_recall",
-                oracle_recall.mean(),
-                count,
-            )
-            self._record(
-                f"{metric_prefix}/{part}_q{stage}_audio_top1_canonical_acc",
-                prior_top1.mean(),
-                count,
-            )
-            self._record(
-                f"{metric_prefix}/{part}_q{stage}_audio_prior_entropy",
-                prior_entropy.mean(),
-                count,
-            )
-
-            soft_samples.append(part_soft)
-            nll_samples.append(part_nll)
-            negative_logits = details.get("negative_prior_logits")
-            if negative_logits is not None:
-                negative_log_probs = F.log_softmax(
-                    negative_logits[frame_valid].float(), dim=-1
-                ).gather(1, pool_ids)
-                part_negative = -(
-                    pool_weights * negative_log_probs
-                ).sum(dim=-1)
-                part_rank = F.relu(
-                    self.audio_residual_rank_margin + part_soft - part_negative
-                )
-                negative_samples.append(part_negative)
-                rank_samples.append(part_rank)
-                self._record(
-                    f"{metric_prefix}/{part}_q{stage}_audio_negative_nll",
-                    part_negative.mean(),
-                    count,
-                )
-                self._record(
-                    f"{metric_prefix}/{part}_q{stage}_audio_rank_accuracy",
-                    part_soft.lt(part_negative).float().mean(),
-                    count,
-                )
-
-        reference = next(iter(prior_details.values()))["mu"]
-        zero = reference.new_zeros(())
-        soft_loss = torch.cat(soft_samples).mean() if soft_samples else zero
-        nll_loss = torch.cat(nll_samples).mean() if nll_samples else zero
-        rank_loss = torch.cat(rank_samples).mean() if rank_samples else zero
-        sample_count = float(sum(value.numel() for value in soft_samples))
-        if sample_count:
-            self._record(
-                f"{metric_prefix}/q{stage}_audio_soft_nll",
-                soft_loss,
-                sample_count,
-            )
-            self._record(
-                f"{metric_prefix}/q{stage}_audio_residual_nll",
-                nll_loss,
-                sample_count,
-            )
-        if negative_samples:
-            negative = torch.cat(negative_samples)
-            positive = torch.cat(soft_samples)
-            self._record(
-                f"{metric_prefix}/q{stage}_audio_negative_nll",
-                negative.mean(),
-                float(negative.numel()),
-            )
-            self._record(
-                f"{metric_prefix}/q{stage}_audio_nll_margin",
-                (negative - positive).mean(),
-                float(negative.numel()),
-            )
-            self._record(
-                f"{metric_prefix}/q{stage}_audio_rank_loss",
-                rank_loss,
-                float(negative.numel()),
-            )
-        return soft_loss, nll_loss, rank_loss
 
     def _soft_recovery_loss(
         self,
@@ -1127,32 +855,11 @@ class VariableGapC2FTrainer(Trainer):
             stage=stage,
             adaptive=adaptive,
         )
-        base_model = getattr(model, "module", model)
-        uses_audio_prior = bool(
-            getattr(base_model, "uses_audio_residual_posterior", False)
+        logits = model(
+            input_ids=current_ids,
+            audio_features=audio,
+            attention_mask=attention_mask,
         )
-        if uses_audio_prior:
-            model_output = model(
-                input_ids=current_ids,
-                audio_features=audio,
-                attention_mask=attention_mask,
-                audio_prior_stage=stage,
-                negative_audio_features=(
-                    self._mismatched_audio(audio)
-                    if self.audio_residual_rank_weight > 0
-                    else None
-                ),
-                return_audio_prior_details=True,
-            )
-            logits = model_output["logits"]
-            prior_details = model_output["audio_prior"]
-        else:
-            logits = model(
-                input_ids=current_ids,
-                audio_features=audio,
-                attention_mask=attention_mask,
-            )
-            prior_details = {}
         ce_loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             targets.reshape(-1),
@@ -1173,26 +880,11 @@ class VariableGapC2FTrainer(Trainer):
             if soft_recovery
             else logits.new_zeros(())
         )
-        audio_soft_loss, audio_nll_loss, audio_rank_loss = (
-            self._audio_residual_losses(
-                prior_details,
-                gt_ids,
-                current_ids,
-                middle_mask,
-                stage,
-                metric_prefix,
-            )
-            if prior_details
-            else (logits.new_zeros(()),) * 3
-        )
         loss = (
             ce_loss
             + self.embedding_loss_weight * embed_loss
             + self.final_latent_loss_weight * final_loss
             + self.soft_recovery_weight * soft_recovery_loss
-            + self.audio_residual_soft_weight * audio_soft_loss
-            + self.audio_residual_nll_weight * audio_nll_loss
-            + self.audio_residual_rank_weight * audio_rank_loss
         )
         self._record_stage_metrics(
             metric_prefix,
@@ -1310,104 +1002,9 @@ def parse_float_list(text: str, expected: int, name: str) -> list[float]:
     return values
 
 
-def _flatten_yaml_config(
-    values: Mapping[str, Any],
-    *,
-    prefix: str = "",
-) -> Dict[str, Any]:
-    """Flatten readable YAML sections into argparse destination names."""
-    flattened: Dict[str, Any] = {}
-    for raw_key, value in values.items():
-        key = str(raw_key).replace("-", "_")
-        location = f"{prefix}.{raw_key}" if prefix else str(raw_key)
-        if isinstance(value, Mapping):
-            nested = _flatten_yaml_config(value, prefix=location)
-            duplicate = set(flattened).intersection(nested)
-            if duplicate:
-                names = ", ".join(sorted(duplicate))
-                raise ValueError(f"Duplicate YAML option(s): {names}")
-            flattened.update(nested)
-            continue
-        if key in flattened:
-            raise ValueError(f"Duplicate YAML option: {key}")
-        flattened[key] = value
-    return flattened
-
-
-def _yaml_defaults(
-    parser: argparse.ArgumentParser,
-    config_path: Path,
-) -> Dict[str, Any]:
-    if not config_path.is_file():
-        parser.error(f"YAML config does not exist: {config_path}")
-    try:
-        with config_path.open("r", encoding="utf-8") as handle:
-            loaded = yaml.safe_load(handle)
-    except yaml.YAMLError as exc:
-        parser.error(f"Invalid YAML in {config_path}: {exc}")
-    if loaded is None:
-        loaded = {}
-    if not isinstance(loaded, Mapping):
-        parser.error("YAML config root must be a mapping")
-
-    try:
-        flattened = _flatten_yaml_config(loaded)
-    except ValueError as exc:
-        parser.error(str(exc))
-    actions = {
-        action.dest: action
-        for action in parser._actions
-        if action.dest not in {argparse.SUPPRESS, "help", "config"}
-    }
-    unknown = sorted(set(flattened).difference(actions))
-    if unknown:
-        parser.error(f"Unknown YAML option(s): {', '.join(unknown)}")
-
-    defaults: Dict[str, Any] = {}
-    for key, value in flattened.items():
-        action = actions[key]
-        if isinstance(
-            action,
-            (
-                argparse._StoreTrueAction,
-                argparse._StoreFalseAction,
-                argparse.BooleanOptionalAction,
-            ),
-        ):
-            if not isinstance(value, bool):
-                parser.error(f"YAML option '{key}' must be true or false")
-            coerced = value
-        elif value is None:
-            coerced = None
-        else:
-            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-                if any(
-                    isinstance(item, (Mapping, Sequence))
-                    and not isinstance(item, (str, bytes))
-                    for item in value
-                ):
-                    parser.error(f"YAML option '{key}' must be a scalar or scalar list")
-                value = ",".join(str(item) for item in value)
-            try:
-                coerced = action.type(value) if action.type is not None else value
-            except (TypeError, ValueError) as exc:
-                parser.error(f"Invalid value for YAML option '{key}': {exc}")
-        if action.choices is not None and coerced not in action.choices:
-            choices = ", ".join(str(choice) for choice in action.choices)
-            parser.error(f"YAML option '{key}' must be one of: {choices}")
-        defaults[key] = coerced
-    return defaults
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help="YAML training config. Explicit CLI options override YAML values.",
-    )
-    parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--output_dir", required=True)
     parser.add_argument("--model_name_or_path", default=None)
     parser.add_argument(
         "--data_dir",
@@ -1479,33 +1076,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--soft_recovery_sigma_scale", type=float, default=1.0)
     parser.add_argument(
         "--soft_recovery_include_correct_prefix",
-        action=argparse.BooleanOptionalAction,
-        default=False,
+        action="store_true",
         help="Also apply soft recovery when the generated prefix matches ground truth.",
     )
-    parser.add_argument(
-        "--audio_conditioning_mode",
-        choices=(
-            "additive",
-            "residual_posterior",
-            "additive_residual_posterior",
-        ),
-        default=None,
-        help=(
-            "Audio fusion path. Omit to preserve a loaded checkpoint's mode; "
-            "new models default to additive."
-        ),
-    )
-    parser.add_argument("--audio_residual_prior_weight", type=float, default=1.0)
-    parser.add_argument("--audio_residual_gate_init", type=float, default=-4.0)
-    parser.add_argument("--audio_residual_log_sigma_min", type=float, default=-3.0)
-    parser.add_argument("--audio_residual_log_sigma_max", type=float, default=3.0)
-    parser.add_argument("--audio_residual_soft_weight", type=float, default=0.0)
-    parser.add_argument("--audio_residual_nll_weight", type=float, default=0.0)
-    parser.add_argument("--audio_residual_rank_weight", type=float, default=0.0)
-    parser.add_argument("--audio_residual_topk", type=int, default=8)
-    parser.add_argument("--audio_residual_sigma_scale", type=float, default=1.0)
-    parser.add_argument("--audio_residual_rank_margin", type=float, default=0.2)
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_train_epochs", type=float, default=100.0)
@@ -1521,13 +1094,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_steps", type=int, default=1000)
     parser.add_argument("--save_total_limit", type=int, default=3)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
+    parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--dry_run_batches", type=int, default=0)
@@ -1538,21 +1107,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--wandb_tags", default=None)
     parser.add_argument("--wandb_mode", choices=["online", "offline", "disabled"], default=None)
-    return parser
-
-
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    bootstrap = argparse.ArgumentParser(add_help=False)
-    bootstrap.add_argument("--config", type=Path, default=None)
-    bootstrap_args, _ = bootstrap.parse_known_args(argv)
-
-    parser = build_arg_parser()
-    if bootstrap_args.config is not None:
-        parser.set_defaults(**_yaml_defaults(parser, bootstrap_args.config))
-    args = parser.parse_args(argv)
-    if args.output_dir is None:
-        parser.error("--output_dir is required either in YAML or on the command line")
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -1566,24 +1121,6 @@ def main() -> None:
         raise ValueError("soft_recovery_topk must be >= 1")
     if args.soft_recovery_sigma_scale <= 0:
         raise ValueError("soft_recovery_sigma_scale must be > 0")
-    if args.audio_residual_prior_weight < 0:
-        raise ValueError("audio_residual_prior_weight must be >= 0")
-    if min(
-        args.audio_residual_soft_weight,
-        args.audio_residual_nll_weight,
-        args.audio_residual_rank_weight,
-    ) < 0:
-        raise ValueError("audio residual loss weights must be >= 0")
-    if args.audio_residual_topk < 1:
-        raise ValueError("audio_residual_topk must be >= 1")
-    if args.audio_residual_sigma_scale <= 0:
-        raise ValueError("audio_residual_sigma_scale must be > 0")
-    if args.audio_residual_rank_margin < 0:
-        raise ValueError("audio_residual_rank_margin must be >= 0")
-    if args.audio_residual_log_sigma_min >= args.audio_residual_log_sigma_max:
-        raise ValueError(
-            "audio_residual_log_sigma_min must be below audio_residual_log_sigma_max"
-        )
     if args.min_gap_frames < 1 or args.max_gap_frames < args.min_gap_frames:
         raise ValueError("Invalid gap range")
 
@@ -1698,11 +1235,6 @@ def main() -> None:
             num_frames=args.max_gap_frames + 2,
             dropout=args.dropout,
             constrain_token_logits=True,
-            audio_conditioning_mode=args.audio_conditioning_mode or "additive",
-            audio_residual_prior_weight=args.audio_residual_prior_weight,
-            audio_residual_gate_init=args.audio_residual_gate_init,
-            audio_residual_log_sigma_min=args.audio_residual_log_sigma_min,
-            audio_residual_log_sigma_max=args.audio_residual_log_sigma_max,
         )
         model = AudioMotionTransformer(config)
     model.config.part_order = list(part_order)
@@ -1726,33 +1258,7 @@ def main() -> None:
     )
     if codebooks.codebook_size != codebook_size or codebooks.num_quantizers != num_quantizers:
         raise ValueError("Codec checkpoints do not match token manifest")
-    audio_conditioning_mode = (
-        args.audio_conditioning_mode
-        or getattr(model.config, "audio_conditioning_mode", "additive")
-    )
-    model.configure_audio_residual_posterior(
-        codebooks.codebooks,
-        part_order,
-        num_quantizers,
-        mode=audio_conditioning_mode,
-        prior_weight=args.audio_residual_prior_weight,
-        gate_init=args.audio_residual_gate_init,
-        log_sigma_min=args.audio_residual_log_sigma_min,
-        log_sigma_max=args.audio_residual_log_sigma_max,
-    )
-    model.config.audio_residual_soft_weight = args.audio_residual_soft_weight
-    model.config.audio_residual_nll_weight = args.audio_residual_nll_weight
-    model.config.audio_residual_rank_weight = args.audio_residual_rank_weight
-    model.config.audio_residual_topk = args.audio_residual_topk
-    model.config.audio_residual_sigma_scale = args.audio_residual_sigma_scale
-    model.config.audio_residual_rank_margin = args.audio_residual_rank_margin
     model.config.part_checkpoints = {part: str(path) for part, path in checkpoint_paths.items()}
-    model.config.training_config_source = str(args.config) if args.config else None
-    model.config.training_config = {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(args).items()
-        if key != "config"
-    }
     target_builder = ResidualTargetBuilder(
         codebooks.codebooks, part_order, codebook_size, num_quantizers
     )
@@ -1773,7 +1279,6 @@ def main() -> None:
     total_params, trainable_params = count_parameters(model)
     print("=" * 76)
     print("Variable-gap coarse-to-fine multipart infilling")
-    print(f"Config:           {args.config or 'command-line/defaults'}")
     print(f"Output:           {args.output_dir}")
     print(f"Initialization:   {args.model_name_or_path or 'from scratch'}")
     print(f"Train clips:      {len(train_sequences)} / {train_stats['requested']}")
@@ -1802,18 +1307,6 @@ def main() -> None:
         f"weight={args.soft_recovery_weight}, topk={args.soft_recovery_topk}, "
         f"sigma_scale={args.soft_recovery_sigma_scale}, "
         f"only_wrong_prefix={not args.soft_recovery_include_correct_prefix}"
-    )
-    print(
-        "Audio posterior:  "
-        f"mode={audio_conditioning_mode}, prior_weight={args.audio_residual_prior_weight}, "
-        f"gate_init={args.audio_residual_gate_init}, topk={args.audio_residual_topk}"
-    )
-    print(
-        "Audio losses:     "
-        f"soft={args.audio_residual_soft_weight}, "
-        f"nll={args.audio_residual_nll_weight}, "
-        f"rank={args.audio_residual_rank_weight}, "
-        f"margin={args.audio_residual_rank_margin}"
     )
     print(
         f"Loss weights:     embed={args.embedding_loss_weight}, "
@@ -1874,12 +1367,6 @@ def main() -> None:
         soft_recovery_topk=args.soft_recovery_topk,
         soft_recovery_sigma_scale=args.soft_recovery_sigma_scale,
         soft_recovery_only_wrong_prefix=not args.soft_recovery_include_correct_prefix,
-        audio_residual_soft_weight=args.audio_residual_soft_weight,
-        audio_residual_nll_weight=args.audio_residual_nll_weight,
-        audio_residual_rank_weight=args.audio_residual_rank_weight,
-        audio_residual_topk=args.audio_residual_topk,
-        audio_residual_sigma_scale=args.audio_residual_sigma_scale,
-        audio_residual_rank_margin=args.audio_residual_rank_margin,
     )
 
     if args.dry_run_batches > 0:

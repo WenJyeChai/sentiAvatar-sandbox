@@ -130,66 +130,7 @@ def main() -> None:
             is_open=True,
         ),
         ws.Section(
-            name="04 Audio Residual Posterior",
-            panels=[
-                line(
-                    "Train oracle-pool NLL",
-                    [f"{train}/q{q}_audio_soft_nll" for q in QUANTIZERS],
-                ),
-                line(
-                    "Evaluation oracle-pool NLL",
-                    [f"{evaluation}/q{q}_audio_soft_nll" for q in QUANTIZERS],
-                ),
-                line(
-                    "Train Gaussian residual NLL",
-                    [f"{train}/q{q}_audio_residual_nll" for q in QUANTIZERS],
-                ),
-                line(
-                    "Evaluation Gaussian residual NLL",
-                    [f"{evaluation}/q{q}_audio_residual_nll" for q in QUANTIZERS],
-                ),
-                line(
-                    "Matched vs shuffled NLL margin",
-                    [f"{evaluation}/q{q}_audio_nll_margin" for q in QUANTIZERS],
-                ),
-                line(
-                    "Audio ranking loss",
-                    [f"{train}/q{q}_audio_rank_loss" for q in QUANTIZERS],
-                ),
-            ],
-            is_open=True,
-            pinned=True,
-        ),
-        ws.Section(
-            name="05 Audio Posterior by Part",
-            panels=[
-                line(
-                    f"q{q} confidence gate",
-                    [f"{evaluation}/{part}_q{q}_audio_gate" for part in PARTS],
-                )
-                for q in QUANTIZERS
-            ]
-            + [
-                line(
-                    f"q{q} predicted sigma",
-                    [f"{evaluation}/{part}_q{q}_audio_sigma" for part in PARTS],
-                )
-                for q in QUANTIZERS
-            ]
-            + [
-                line(
-                    f"q{q} canonical top-K recall",
-                    [
-                        f"{evaluation}/{part}_q{q}_audio_topk_canonical_recall"
-                        for part in PARTS
-                    ],
-                )
-                for q in QUANTIZERS
-            ],
-            is_open=False,
-        ),
-        ws.Section(
-            name="06 Hard Latent Quality",
+            name="04 Hard Latent Quality",
             panels=[
                 line("Hard latent RMSE", [f"{evaluation}/hard_latent_rmse"]),
                 line(
@@ -216,7 +157,7 @@ def main() -> None:
             pinned=True,
         ),
         ws.Section(
-            name="07 Gap Accuracy",
+            name="05 Gap Accuracy",
             panels=[
                 line(
                     "Short gaps",
@@ -234,7 +175,7 @@ def main() -> None:
             is_open=False,
         ),
         ws.Section(
-            name="08 Part Accuracy",
+            name="06 Part Accuracy",
             panels=[
                 line(
                     f"Evaluation q{q} accuracy by part",
