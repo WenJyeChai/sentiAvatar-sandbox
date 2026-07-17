@@ -149,7 +149,7 @@ class AudioConditioningRouter(nn.Module):
         self.part_embedding = nn.Embedding(num_parts, embedding_dim)
         self.quantizer_embedding = nn.Embedding(num_quantizers, embedding_dim)
         self.stage_embedding = nn.Embedding(num_quantizers + 1, embedding_dim)
-        self.uncertainty_sentinel = nn.Parameter(torch.zeros(embedding_dim))
+        self.uncertainty_sentinel = nn.Parameter(torch.zeros(1))
         self.uncertainty_projection = nn.Linear(1, embedding_dim)
         geometry_dim = 9
         input_dim = 4 * embedding_dim + geometry_dim
@@ -191,8 +191,8 @@ class AudioConditioningRouter(nn.Module):
         ).clamp(0.0, 1.0)
         gap_feature = gap_norm.unsqueeze(1).expand(-1, sequence)
         if uncertainty is None:
-            uncertainty_feature = self.uncertainty_sentinel.view(1, 1, -1).expand(
-                batch, sequence, -1
+            uncertainty = self.uncertainty_sentinel.view(1, 1).expand(
+                batch, sequence
             )
         else:
             uncertainty = torch.as_tensor(
@@ -202,9 +202,7 @@ class AudioConditioningRouter(nn.Module):
                 raise ValueError(
                     "audio uncertainty must have shape (batch, token_sequence)"
                 )
-            uncertainty_feature = self.uncertainty_projection(
-                uncertainty.unsqueeze(-1)
-            )
+        uncertainty_feature = self.uncertainty_projection(uncertainty.unsqueeze(-1))
         geometry = torch.stack(
             [
                 gap_feature,

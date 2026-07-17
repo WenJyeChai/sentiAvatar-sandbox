@@ -217,6 +217,29 @@ def test_zero_scale_adapter_receives_a_scale_gradient():
     assert float(gradient.abs()) > 0
 
 
+def test_routed_forward_connects_every_trainable_parameter_to_the_loss():
+    model = AudioMotionTransformer(routed_config()).train()
+    input_ids = torch.tensor(
+        [[0, 4, 8, 12, 16, 16, 16, 16, 2, 6, 10, 14]]
+    )
+    middle = torch.tensor([[0] * 4 + [1] * 4 + [0] * 4], dtype=torch.bool)
+    logits = model(
+        input_ids,
+        audio_features=torch.randn(1, 3, 3),
+        attention_mask=torch.ones_like(input_ids, dtype=torch.bool),
+        middle_mask=middle,
+        gap_lengths=torch.tensor([1]),
+        c2f_stage=0,
+    )
+    logits.square().mean().backward()
+    missing = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert missing == []
+
+
 def test_training_windows_resample_reproducibly_and_remain_clip_balanced():
     sequences = [
         synthetic_sequence("long", 20),
