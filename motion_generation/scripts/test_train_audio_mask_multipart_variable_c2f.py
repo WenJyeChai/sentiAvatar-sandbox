@@ -79,7 +79,6 @@ optimization:
   learning_rate: 1.0e-4
   bf16: true
   gradient_checkpointing: false
-  ddp_find_unused_parameters: true
 monitoring:
   wandb_tags: [yaml, c2f]
 """.strip(),
@@ -104,7 +103,6 @@ monitoring:
     assert args.learning_rate == 0.0002
     assert args.bf16 is False
     assert args.gradient_checkpointing is False
-    assert args.ddp_find_unused_parameters is True
 
 
 def test_training_windows_resample_reproducibly_and_remain_clip_balanced():
