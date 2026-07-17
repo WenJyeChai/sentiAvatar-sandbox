@@ -39,9 +39,6 @@ class InfillModelSpec:
     decoder: str
     allowed_gaps: tuple[int, ...]
     generate_steps: int = 1
-    audio_input_mode: str = "correct"
-    audio_ablation_seed: int = 42
-    audio_posterior_enabled: bool = True
 
     def supports_gap(self, gap: int) -> bool:
         return int(gap) in self.allowed_gaps
@@ -296,7 +293,6 @@ def _slot_constrained_c2f(
             output,
             audio_features=batch["audio_features"],
             attention_mask=batch["attention_mask"],
-            audio_prior_stage=quantizer,
         )
         for slot in range(quantizer, ntpf, num_quantizers):
             fill = middle & slots.view(1, -1).eq(slot)
@@ -304,64 +300,6 @@ def _slot_constrained_c2f(
             local = logits[..., start : start + codebook_size].argmax(dim=-1) + start
             output[fill] = local[fill]
     return output
-
-
-def apply_audio_input_mode(
-    audio_features: torch.Tensor,
-    records: Sequence[EvalWindowRecord],
-    *,
-    mode: str,
-    seed: int,
-) -> torch.Tensor:
-    """Apply a deterministic inference-only audio ablation to one batch."""
-    mode = str(mode).lower()
-    if mode == "correct":
-        return audio_features
-    if mode == "zero":
-        return torch.zeros_like(audio_features)
-    if mode != "temporal_shuffle":
-        raise ValueError(
-            "audio_input_mode must be correct, temporal_shuffle, or zero; "
-            f"got {mode!r}"
-        )
-
-    shuffled = audio_features.clone()
-    for row, record in enumerate(records):
-        frame_count = min(record.gap_frames + 2, shuffled.shape[1])
-        if frame_count < 2:
-            continue
-        local_seed = (
-            int(seed)
-            + int(record.sequence_idx) * 1_000_003
-            + int(record.left_idx) * 10_007
-            + int(record.gap_frames) * 1_009
-        ) % (2**63 - 1)
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(local_seed)
-        permutation = torch.randperm(frame_count, generator=generator).to(
-            audio_features.device
-        )
-        shuffled[row, :frame_count] = audio_features[row, permutation]
-    return shuffled
-
-
-def apply_model_inference_ablation(
-    model: AudioMotionTransformer,
-    spec: InfillModelSpec,
-) -> None:
-    """Configure same-weight inference ablations declared by a model spec."""
-    if spec.audio_posterior_enabled:
-        return
-    mode = str(model.config.audio_conditioning_mode)
-    if mode == "additive" and model.audio_residual_posterior is not None:
-        return
-    if mode != "additive_residual_posterior":
-        raise ValueError(
-            "Disabling only the posterior requires a hybrid "
-            "additive_residual_posterior checkpoint; "
-            f"got {mode!r}"
-        )
-    model.config.audio_conditioning_mode = "additive"
 
 
 @torch.no_grad()
@@ -381,7 +319,6 @@ def infer_window_records(
     codebook_size = int(model.config.codebook_size)
     offsets = np.arange(ntpf, dtype=np.int64) * codebook_size
     predictions: list[np.ndarray] = []
-    apply_model_inference_ablation(model, spec)
     model.eval()
     for start_idx in tqdm(
         range(0, len(records), batch_size),
@@ -391,12 +328,6 @@ def infer_window_records(
         chunk = records[start_idx : start_idx + batch_size]
         batch = collator([record.example for record in chunk])
         batch = {key: value.to(device) for key, value in batch.items()}
-        batch["audio_features"] = apply_audio_input_mode(
-            batch["audio_features"],
-            chunk,
-            mode=spec.audio_input_mode,
-            seed=spec.audio_ablation_seed,
-        )
         if spec.decoder == "c2f":
             if slot_constrained:
                 output = _slot_constrained_c2f(model, batch)
