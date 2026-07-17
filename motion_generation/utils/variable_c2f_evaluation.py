@@ -41,6 +41,7 @@ class InfillModelSpec:
     generate_steps: int = 1
     audio_input_mode: str = "correct"
     audio_ablation_seed: int = 42
+    disable_audio_adapters: bool = False
 
     def supports_gap(self, gap: int) -> bool:
         return int(gap) in self.allowed_gaps
@@ -391,6 +392,14 @@ def infer_window_records(
 ) -> list[np.ndarray]:
     if not records:
         return []
+    if spec.disable_audio_adapters:
+        if not model.audio_adapters:
+            raise ValueError(
+                f"{spec.name} requests disabled adapters but the model has none"
+            )
+        with torch.no_grad():
+            for adapter in model.audio_adapters.values():
+                adapter.residual_scale.zero_()
     collator = VariableGapC2FCollator(model.config)
     ntpf = int(model.config.num_tokens_per_frame)
     codebook_size = int(model.config.codebook_size)
@@ -655,6 +664,72 @@ def summarize_window_metrics(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
     return by_gap, macro
 
 
+def paired_bootstrap_window_differences(
+    frame: pd.DataFrame,
+    *,
+    reference_model: str,
+    candidate_models: Sequence[str],
+    metrics: Sequence[str],
+    iterations: int = 2000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Bootstrap paired per-clip metric differences against one reference model."""
+    if iterations < 1:
+        raise ValueError("iterations must be >= 1")
+    required = {"model", "sequence_idx", "left_idx", "gap", *metrics}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"Missing window metric columns: {', '.join(missing)}")
+
+    keys = ["sequence_idx", "left_idx", "gap"]
+    reference = frame.loc[frame["model"] == reference_model, keys + list(metrics)]
+    if reference.empty:
+        raise ValueError(f"Reference model not found: {reference_model}")
+    reference = reference.rename(columns={metric: f"{metric}_reference" for metric in metrics})
+    rows: list[Dict[str, Any]] = []
+    for candidate_name in candidate_models:
+        candidate = frame.loc[frame["model"] == candidate_name, keys + list(metrics)]
+        paired = candidate.merge(reference, on=keys, how="inner", validate="one_to_one")
+        if paired.empty:
+            continue
+        for gap, gap_frame in paired.groupby("gap", observed=True):
+            clip_ids = np.asarray(sorted(gap_frame["sequence_idx"].unique()))
+            if clip_ids.size == 0:
+                continue
+            rng = np.random.default_rng(
+                int(seed) + int(gap) * 1009 + sum(ord(char) for char in candidate_name)
+            )
+            for metric in metrics:
+                differences = (
+                    gap_frame.assign(
+                        difference=gap_frame[metric]
+                        - gap_frame[f"{metric}_reference"]
+                    )
+                    .groupby("sequence_idx", observed=True)["difference"]
+                    .mean()
+                    .reindex(clip_ids)
+                    .to_numpy(dtype=np.float64)
+                )
+                draws = rng.choice(
+                    differences,
+                    size=(int(iterations), len(differences)),
+                    replace=True,
+                ).mean(axis=1)
+                rows.append(
+                    {
+                        "reference": reference_model,
+                        "candidate": candidate_name,
+                        "gap": int(gap),
+                        "metric": metric,
+                        "clips": len(differences),
+                        "mean_difference": float(differences.mean()),
+                        "ci_low": float(np.quantile(draws, 0.025)),
+                        "ci_high": float(np.quantile(draws, 0.975)),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
 def assemble_tiled_token_sequences(
     sequences: Sequence[Mapping[str, Any]],
     records: Sequence[EvalWindowRecord],
@@ -835,6 +910,7 @@ def load_official_evaluator_helpers(evaluation_dir: Path) -> Dict[str, Any]:
         "extract_audio_beats",
         "extract_motion_beats",
         "extract_motion_beats_for_esd",
+        "velocity_onset_correlation",
     ]
     saved_path = list(sys.path)
     prefixes = ("models", "datasets", "evaluate_pred_motion_v2")
@@ -1091,32 +1167,152 @@ def seam_discontinuity_metrics(
     body = np.asarray(body, dtype=np.float64)
     acceleration: list[float] = []
     jerk: list[float] = []
+    interior_acceleration: list[float] = []
+    interior_jerk: list[float] = []
+    boundaries = set(range(boundary_stride, len(body), boundary_stride))
+
+    def acceleration_discontinuity(center: int) -> float:
+        left = body[center] - 2 * body[center - 1] + body[center - 2]
+        right = body[center + 2] - 2 * body[center + 1] + body[center]
+        return float(np.linalg.norm(right - left))
+
+    def jerk_discontinuity(center: int) -> float:
+        left = (
+            body[center]
+            - 3 * body[center - 1]
+            + 3 * body[center - 2]
+            - body[center - 3]
+        )
+        right = (
+            body[center + 3]
+            - 3 * body[center + 2]
+            + 3 * body[center + 1]
+            - body[center]
+        )
+        return float(np.linalg.norm(right - left))
+
     for boundary in range(boundary_stride, len(body), boundary_stride):
         if 2 <= boundary and boundary + 2 < len(body):
-            left = body[boundary] - 2 * body[boundary - 1] + body[boundary - 2]
-            right = body[boundary + 2] - 2 * body[boundary + 1] + body[boundary]
-            acceleration.append(float(np.linalg.norm(right - left)))
+            acceleration.append(acceleration_discontinuity(boundary))
         if 3 <= boundary and boundary + 3 < len(body):
-            left = (
-                body[boundary]
-                - 3 * body[boundary - 1]
-                + 3 * body[boundary - 2]
-                - body[boundary - 3]
-            )
-            right = (
-                body[boundary + 3]
-                - 3 * body[boundary + 2]
-                + 3 * body[boundary + 1]
-                - body[boundary]
-            )
-            jerk.append(float(np.linalg.norm(right - left)))
+            jerk.append(jerk_discontinuity(boundary))
+    for center in range(2, max(2, len(body) - 2)):
+        if center not in boundaries:
+            interior_acceleration.append(acceleration_discontinuity(center))
+    for center in range(3, max(3, len(body) - 3)):
+        if center not in boundaries:
+            interior_jerk.append(jerk_discontinuity(center))
+
+    acceleration_mean = float(np.mean(acceleration)) if acceleration else np.nan
+    jerk_mean = float(np.mean(jerk)) if jerk else np.nan
+    interior_acceleration_mean = (
+        float(np.mean(interior_acceleration)) if interior_acceleration else np.nan
+    )
+    interior_jerk_mean = float(np.mean(interior_jerk)) if interior_jerk else np.nan
     return {
-        "seam_accel_l2_mean": float(np.mean(acceleration)) if acceleration else np.nan,
+        "seam_accel_l2_mean": acceleration_mean,
         "seam_accel_l2_p95": float(np.percentile(acceleration, 95)) if acceleration else np.nan,
-        "seam_jerk_l2_mean": float(np.mean(jerk)) if jerk else np.nan,
+        "seam_jerk_l2_mean": jerk_mean,
         "seam_jerk_l2_p95": float(np.percentile(jerk, 95)) if jerk else np.nan,
+        "interior_accel_l2_mean": interior_acceleration_mean,
+        "interior_jerk_l2_mean": interior_jerk_mean,
+        "seam_accel_excess_ratio": acceleration_mean / max(interior_acceleration_mean, 1e-12),
+        "seam_jerk_excess_ratio": jerk_mean / max(interior_jerk_mean, 1e-12),
         "seam_count": max(len(acceleration), len(jerk)),
     }
+
+
+def generated_gap_dynamics_metrics(
+    body: np.ndarray,
+    *,
+    gap: int,
+    codec_unit_length: int,
+    feature_start: int = 3,
+) -> Dict[str, float]:
+    """Measure dynamics strictly inside generated token blocks, excluding anchors."""
+    body = np.asarray(body, dtype=np.float64)
+    if body.ndim != 2:
+        raise ValueError(f"Expected body shaped (frames, features), got {body.shape}")
+    if gap < 1 or codec_unit_length < 1:
+        raise ValueError("gap and codec_unit_length must be >= 1")
+    features = body[:, int(feature_start) :]
+    token_ids = np.arange(len(features)) // int(codec_unit_length)
+    generated = token_ids % (int(gap) + 1) != 0
+
+    def derivative_rms(order: int) -> tuple[float, int]:
+        if len(features) <= order:
+            return np.nan, 0
+        derivative = np.diff(features, n=order, axis=0)
+        valid = np.ones(len(derivative), dtype=bool)
+        for offset in range(order + 1):
+            valid &= generated[offset : offset + len(derivative)]
+        if not bool(valid.any()):
+            return np.nan, 0
+        squared_l2 = np.square(derivative[valid]).sum(axis=1)
+        return float(np.sqrt(squared_l2.mean())), int(valid.sum())
+
+    velocity_rms, velocity_frames = derivative_rms(1)
+    acceleration_rms, acceleration_frames = derivative_rms(2)
+    jerk_rms, jerk_frames = derivative_rms(3)
+    return {
+        "gap_velocity_l2_rms": velocity_rms,
+        "gap_acceleration_l2_rms": acceleration_rms,
+        "gap_jerk_l2_rms": jerk_rms,
+        "gap_velocity_frames": velocity_frames,
+        "gap_acceleration_frames": acceleration_frames,
+        "gap_jerk_frames": jerk_frames,
+    }
+
+
+def compute_gap_dynamics_table(
+    gap_root: Path,
+    model_names: Sequence[str],
+    *,
+    gap: int,
+    codec_unit_length: int,
+    feature_start: int = 3,
+) -> pd.DataFrame:
+    targets = [("mp_real_gt", Path(gap_root) / "gt", "gt")]
+    targets.extend(
+        (name, Path(gap_root) / name, "pred")
+        for name in ["mp_codec_gt", *model_names]
+    )
+    rows = []
+    for name, directory, suffix in targets:
+        metrics = [
+            generated_gap_dynamics_metrics(
+                load_evaluator_body(path)[1],
+                gap=gap,
+                codec_unit_length=codec_unit_length,
+                feature_start=feature_start,
+            )
+            for path in sorted(directory.glob(f"*_{suffix}.npy"))
+        ]
+        frame = pd.DataFrame(metrics)
+        if frame.empty:
+            continue
+        rows.append(
+            {
+                "model": name,
+                "num_clips": len(frame),
+                **{
+                    column: float(frame[column].mean())
+                    for column in frame.columns
+                },
+            }
+        )
+    result = pd.DataFrame(rows).set_index("model")
+    if "mp_codec_gt" in result.index:
+        for metric in (
+            "gap_velocity_l2_rms",
+            "gap_acceleration_l2_rms",
+            "gap_jerk_l2_rms",
+        ):
+            denominator = float(result.loc["mp_codec_gt", metric])
+            result[f"{metric}_ratio_to_codec"] = result[metric] / max(
+                denominator, 1e-12
+            )
+    return result
 
 
 def compute_seam_table(
@@ -1178,6 +1374,12 @@ def compute_beat_table(
         bas_values: list[float] = []
         bhr_values: list[float] = []
         esd_values: list[float] = []
+        audio_to_motion_values: list[float] = []
+        motion_to_audio_values: list[float] = []
+        audio_beat_counts: list[int] = []
+        motion_beat_counts: list[int] = []
+        esd_motion_beat_counts: list[int] = []
+        voc_values: list[float] = []
         used = 0
         for path in tqdm(sorted(directory.glob(f"*_{suffix}.npy")), desc=f"beat {name}", leave=False):
             clip_name, body = load_evaluator_body(path)
@@ -1189,9 +1391,34 @@ def compute_beat_table(
             bas, bhr = helpers["calculate_alignment_single"](
                 motion_beats, audio_beats, tolerance=tolerance
             )
-            esd = helpers["calculate_esd"](
-                audio_beats, helpers["extract_motion_beats_for_esd"](body, fps=fps)
+            esd_motion_beats = helpers["extract_motion_beats_for_esd"](
+                body, fps=fps
             )
+            esd = helpers["calculate_esd"](audio_beats, esd_motion_beats)
+            if len(audio_beats) and len(esd_motion_beats):
+                distances = np.abs(
+                    np.asarray(audio_beats)[:, None]
+                    - np.asarray(esd_motion_beats)[None, :]
+                )
+                audio_to_motion_values.append(float(distances.min(axis=1).mean()))
+                motion_to_audio_values.append(float(distances.min(axis=0).mean()))
+            elif len(audio_beats) == 0 and len(esd_motion_beats) == 0:
+                audio_to_motion_values.append(0.0)
+                motion_to_audio_values.append(0.0)
+            else:
+                audio_to_motion_values.append(2.0)
+                motion_to_audio_values.append(2.0)
+            audio_beat_counts.append(len(audio_beats))
+            motion_beat_counts.append(len(motion_beats))
+            esd_motion_beat_counts.append(len(esd_motion_beats))
+            try:
+                voc = helpers["velocity_onset_correlation"](
+                    body, str(wav_path), fps=fps
+                )
+                if voc is not None and np.isfinite(voc):
+                    voc_values.append(float(voc))
+            except Exception:
+                pass
             if bas is not None and not np.isnan(bas):
                 bas_values.append(float(bas))
             if bhr is not None:
@@ -1205,6 +1432,33 @@ def compute_beat_table(
                 "BAS_distance_lower_better": np.mean(bas_values) if bas_values else np.nan,
                 "BHR_higher_better": np.mean(bhr_values) if bhr_values else np.nan,
                 "ESD_lower_better": np.mean(esd_values) if esd_values else np.nan,
+                "ESD_audio_to_motion_lower_better": (
+                    np.mean(audio_to_motion_values)
+                    if audio_to_motion_values
+                    else np.nan
+                ),
+                "ESD_motion_to_audio_lower_better": (
+                    np.mean(motion_to_audio_values)
+                    if motion_to_audio_values
+                    else np.nan
+                ),
+                "audio_beats_per_clip": (
+                    np.mean(audio_beat_counts) if audio_beat_counts else np.nan
+                ),
+                "motion_beats_per_clip": (
+                    np.mean(motion_beat_counts) if motion_beat_counts else np.nan
+                ),
+                "esd_motion_beats_per_clip": (
+                    np.mean(esd_motion_beat_counts)
+                    if esd_motion_beat_counts
+                    else np.nan
+                ),
+                "motion_to_audio_beat_count_ratio": (
+                    np.sum(motion_beat_counts) / max(np.sum(audio_beat_counts), 1)
+                    if motion_beat_counts
+                    else np.nan
+                ),
+                "VOC_higher_better": np.mean(voc_values) if voc_values else np.nan,
             }
         )
     return pd.DataFrame(rows).set_index("model")

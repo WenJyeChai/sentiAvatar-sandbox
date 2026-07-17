@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import torch
 
 
@@ -14,6 +16,9 @@ from utils.variable_c2f_evaluation import (
     EvalWindowRecord,
     VariableGapMaskExample,
     apply_audio_input_mode,
+    generated_gap_dynamics_metrics,
+    paired_bootstrap_window_differences,
+    seam_discontinuity_metrics,
 )
 
 
@@ -85,3 +90,53 @@ def test_unknown_audio_control_is_rejected():
         assert "audio_input_mode" in str(error)
     else:
         raise AssertionError("Expected an invalid audio mode to raise ValueError")
+
+
+def test_generated_gap_dynamics_scale_with_motion_amplitude():
+    time = np.arange(48, dtype=np.float64)
+    body = np.stack([time, time**2, np.sin(time), np.cos(time)], axis=1)
+    base = generated_gap_dynamics_metrics(
+        body, gap=3, codec_unit_length=2, feature_start=0
+    )
+    doubled = generated_gap_dynamics_metrics(
+        2.0 * body, gap=3, codec_unit_length=2, feature_start=0
+    )
+    for metric in (
+        "gap_velocity_l2_rms",
+        "gap_acceleration_l2_rms",
+        "gap_jerk_l2_rms",
+    ):
+        assert np.isclose(doubled[metric], 2.0 * base[metric])
+
+
+def test_seam_metrics_report_an_interior_normalized_excess():
+    time = np.arange(60, dtype=np.float64)
+    body = np.stack([np.sin(time / 4), np.cos(time / 5)], axis=1)
+    body[20:] += 2.0
+    metrics = seam_discontinuity_metrics(body, boundary_stride=20)
+    assert metrics["seam_count"] == 2
+    assert np.isfinite(metrics["seam_accel_excess_ratio"])
+    assert np.isfinite(metrics["seam_jerk_excess_ratio"])
+    assert metrics["interior_accel_l2_mean"] > 0
+
+
+def test_paired_bootstrap_uses_clip_level_differences():
+    frame = pd.DataFrame(
+        [
+            {"model": "base", "sequence_idx": 0, "left_idx": 1, "gap": 3, "body_rmse": 1.0},
+            {"model": "base", "sequence_idx": 1, "left_idx": 2, "gap": 3, "body_rmse": 2.0},
+            {"model": "candidate", "sequence_idx": 0, "left_idx": 1, "gap": 3, "body_rmse": 2.0},
+            {"model": "candidate", "sequence_idx": 1, "left_idx": 2, "gap": 3, "body_rmse": 4.0},
+        ]
+    )
+    result = paired_bootstrap_window_differences(
+        frame,
+        reference_model="base",
+        candidate_models=["candidate"],
+        metrics=["body_rmse"],
+        iterations=200,
+        seed=7,
+    )
+    assert len(result) == 1
+    assert result.iloc[0]["mean_difference"] == 1.5
+    assert result.iloc[0]["ci_low"] <= 1.5 <= result.iloc[0]["ci_high"]
