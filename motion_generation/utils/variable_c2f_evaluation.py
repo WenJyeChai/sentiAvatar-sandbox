@@ -39,6 +39,8 @@ class InfillModelSpec:
     decoder: str
     allowed_gaps: tuple[int, ...]
     generate_steps: int = 1
+    audio_input_mode: str = "correct"
+    audio_ablation_seed: int = 42
 
     def supports_gap(self, gap: int) -> bool:
         return int(gap) in self.allowed_gaps
@@ -293,6 +295,9 @@ def _slot_constrained_c2f(
             output,
             audio_features=batch["audio_features"],
             attention_mask=batch["attention_mask"],
+            middle_mask=batch["middle_mask"],
+            gap_lengths=batch["gap_lengths"],
+            c2f_stage=quantizer,
         )
         for slot in range(quantizer, ntpf, num_quantizers):
             fill = middle & slots.view(1, -1).eq(slot)
@@ -300,6 +305,78 @@ def _slot_constrained_c2f(
             local = logits[..., start : start + codebook_size].argmax(dim=-1) + start
             output[fill] = local[fill]
     return output
+
+
+def apply_audio_input_mode(
+    audio_features: torch.Tensor,
+    chunk: Sequence[EvalWindowRecord],
+    all_records: Sequence[EvalWindowRecord],
+    *,
+    start_index: int,
+    mode: str,
+    seed: int,
+) -> torch.Tensor:
+    """Apply deterministic inference-only audio controls to a window batch."""
+    mode = str(mode).lower()
+    valid_modes = {
+        "correct",
+        "temporal_shift",
+        "temporal_shuffle",
+        "cross_clip",
+        "temporal_mean",
+        "zero",
+    }
+    if mode not in valid_modes:
+        raise ValueError(f"audio_input_mode must be one of {sorted(valid_modes)}")
+    if mode == "correct":
+        return audio_features
+    if mode == "zero":
+        return torch.zeros_like(audio_features)
+
+    transformed = audio_features.clone()
+    if mode == "cross_clip":
+        if len(all_records) < 2:
+            raise ValueError("cross_clip audio requires at least two evaluation records")
+        for row, record in enumerate(chunk):
+            global_index = start_index + row
+            donor = None
+            for distance in range(1, len(all_records)):
+                candidate = all_records[(global_index + distance) % len(all_records)]
+                if candidate.sequence_idx != record.sequence_idx:
+                    donor = candidate
+                    break
+            if donor is None:
+                donor = all_records[(global_index + 1) % len(all_records)]
+            donor_audio = donor.example.audio_features.to(
+                device=audio_features.device, dtype=audio_features.dtype
+            )
+            if donor_audio.shape != transformed[row].shape:
+                raise ValueError("cross_clip donor does not match the window audio shape")
+            transformed[row] = donor_audio
+        return transformed
+
+    for row, record in enumerate(chunk):
+        frame_count = min(record.gap_frames + 2, transformed.shape[1])
+        source = audio_features[row, :frame_count]
+        if mode == "temporal_mean":
+            transformed[row, :frame_count] = source.mean(dim=0, keepdim=True)
+        elif mode == "temporal_shift":
+            transformed[row, :frame_count] = source.roll(
+                shifts=max(1, frame_count // 2), dims=0
+            )
+        else:
+            local_seed = (
+                int(seed)
+                + int(record.sequence_idx) * 1_000_003
+                + int(record.left_idx) * 10_007
+                + int(record.gap_frames) * 1_009
+            ) % (2**63 - 1)
+            generator = torch.Generator(device="cpu").manual_seed(local_seed)
+            permutation = torch.randperm(frame_count, generator=generator).to(
+                audio_features.device
+            )
+            transformed[row, :frame_count] = source[permutation]
+    return transformed
 
 
 @torch.no_grad()
@@ -328,6 +405,14 @@ def infer_window_records(
         chunk = records[start_idx : start_idx + batch_size]
         batch = collator([record.example for record in chunk])
         batch = {key: value.to(device) for key, value in batch.items()}
+        batch["audio_features"] = apply_audio_input_mode(
+            batch["audio_features"],
+            chunk,
+            records,
+            start_index=start_idx,
+            mode=spec.audio_input_mode,
+            seed=spec.audio_ablation_seed,
+        )
         if spec.decoder == "c2f":
             if slot_constrained:
                 output = _slot_constrained_c2f(model, batch)
@@ -337,6 +422,7 @@ def infer_window_records(
                     batch["audio_features"],
                     middle_mask=batch["middle_mask"],
                     attention_mask=batch["attention_mask"],
+                    gap_lengths=batch["gap_lengths"],
                 )
         elif spec.decoder == "fixed_sbs":
             if slot_constrained:

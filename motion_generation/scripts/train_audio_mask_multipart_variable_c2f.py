@@ -502,6 +502,13 @@ class VariableGapC2FTrainer(Trainer):
             squared_errors.numel()
         )
 
+    def _record_audio_conditioning(self, model, metric_prefix: str) -> None:
+        base_model = model.module if hasattr(model, "module") else model
+        for key, value in getattr(
+            base_model, "last_audio_conditioning_stats", {}
+        ).items():
+            self._record(f"{metric_prefix}/audio_{key}", value)
+
     def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
         logs = dict(logs)
         for key, total in self._metric_sums.items():
@@ -558,6 +565,7 @@ class VariableGapC2FTrainer(Trainer):
         audio: torch.Tensor,
         attention_mask: torch.Tensor,
         middle_mask: torch.Tensor,
+        gap_lengths: torch.Tensor,
         stage: int,
         self_forced: bool,
     ) -> torch.Tensor:
@@ -576,6 +584,9 @@ class VariableGapC2FTrainer(Trainer):
                     input_ids=current,
                     audio_features=audio,
                     attention_mask=attention_mask,
+                    middle_mask=middle_mask,
+                    gap_lengths=gap_lengths,
+                    c2f_stage=prefix,
                 )
                 predictions = logits.argmax(dim=-1)
                 fill = self._stage_mask(middle_mask, prefix)
@@ -842,6 +853,7 @@ class VariableGapC2FTrainer(Trainer):
         audio: torch.Tensor,
         attention_mask: torch.Tensor,
         middle_mask: torch.Tensor,
+        gap_lengths: torch.Tensor,
         *,
         stage: int,
         adaptive: bool,
@@ -859,7 +871,11 @@ class VariableGapC2FTrainer(Trainer):
             input_ids=current_ids,
             audio_features=audio,
             attention_mask=attention_mask,
+            middle_mask=middle_mask,
+            gap_lengths=gap_lengths,
+            c2f_stage=stage,
         )
+        self._record_audio_conditioning(model, metric_prefix)
         ce_loss = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             targets.reshape(-1),
@@ -914,6 +930,7 @@ class VariableGapC2FTrainer(Trainer):
                 inputs["audio_features"],
                 inputs["attention_mask"],
                 inputs["middle_mask"],
+                inputs["gap_lengths"],
                 stage=stage,
                 adaptive=stage > 0 and self.adaptive_target_mode != "never",
                 soft_recovery=stage > 0 and self.soft_recovery_weight > 0,
@@ -962,6 +979,7 @@ class VariableGapC2FTrainer(Trainer):
             inputs["audio_features"],
             inputs["attention_mask"],
             inputs["middle_mask"],
+            inputs["gap_lengths"],
             stage,
             self_forced,
         )
@@ -972,6 +990,7 @@ class VariableGapC2FTrainer(Trainer):
             inputs["audio_features"],
             inputs["attention_mask"],
             inputs["middle_mask"],
+            inputs["gap_lengths"],
             stage=stage,
             adaptive=adaptive_targets,
             soft_recovery=soft_recovery,
@@ -1002,9 +1021,44 @@ def parse_float_list(text: str, expected: int, name: str) -> list[float]:
     return values
 
 
-def parse_args() -> argparse.Namespace:
+def parse_int_list(text: str | Sequence[int], name: str) -> list[int]:
+    if isinstance(text, str):
+        values = [int(value.strip()) for value in text.split(",") if value.strip()]
+    else:
+        values = [int(value) for value in text]
+    if len(set(values)) != len(values):
+        raise ValueError(f"{name} must not contain duplicate values")
+    return values
+
+
+def load_yaml_defaults(path: Path) -> Dict[str, Any]:
+    import yaml
+
+    with open(path, "r", encoding="utf-8") as handle:
+        document = yaml.safe_load(handle) or {}
+    if not isinstance(document, dict):
+        raise ValueError("Training YAML must contain a mapping at its root")
+    flattened: Dict[str, Any] = {}
+
+    def visit(value, prefix=""):
+        for key, item in value.items():
+            name = str(key)
+            if isinstance(item, dict):
+                visit(item, f"{prefix}{name}.")
+            else:
+                leaf = name
+                if leaf in flattened:
+                    raise ValueError(f"Duplicate YAML option: {leaf}")
+                flattened[leaf] = item
+
+    visit(document)
+    return flattened
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--output_dir", default=None)
     parser.add_argument("--model_name_or_path", default=None)
     parser.add_argument(
         "--data_dir",
@@ -1047,6 +1101,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_position_embeddings", type=int, default=512)
     parser.add_argument("--audio_feat_dim", type=int, default=768)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument(
+        "--audio_fusion_mode",
+        choices=(
+            "legacy_additive",
+            "routed_additive",
+            "routed_cross_attention",
+        ),
+        default="legacy_additive",
+    )
+    parser.add_argument(
+        "--audio_adapter_layers",
+        default="",
+        help="Comma-separated one-based encoder layers, for example 4 or 3,6.",
+    )
+    parser.add_argument("--audio_adapter_dim", type=int, default=256)
+    parser.add_argument("--audio_adapter_heads", type=int, default=8)
+    parser.add_argument("--audio_router_dim", type=int, default=64)
+    parser.add_argument("--audio_router_embedding_dim", type=int, default=16)
+    parser.add_argument("--audio_additive_gate_scale", type=float, default=0.5)
+    parser.add_argument("--audio_relative_bias_max_distance", type=int, default=16)
+    parser.add_argument(
+        "--audio_adapter_target_only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     parser.add_argument("--stage_weights", default="0.35,0.25,0.20,0.20")
     parser.add_argument("--self_forcing_warmup_ratio", type=float, default=0.10)
@@ -1107,7 +1186,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--wandb_tags", default=None)
     parser.add_argument("--wandb_mode", choices=["online", "offline", "disabled"], default=None)
-    return parser.parse_args()
+    preliminary, _ = parser.parse_known_args(argv)
+    if preliminary.config is not None:
+        defaults = load_yaml_defaults(preliminary.config)
+        valid = {action.dest for action in parser._actions}
+        unknown = sorted(set(defaults) - valid)
+        if unknown:
+            raise ValueError(f"Unknown YAML options: {', '.join(unknown)}")
+        if isinstance(defaults.get("audio_adapter_layers"), list):
+            defaults["audio_adapter_layers"] = ",".join(
+                str(value) for value in defaults["audio_adapter_layers"]
+            )
+        if isinstance(defaults.get("wandb_tags"), list):
+            defaults["wandb_tags"] = ",".join(str(value) for value in defaults["wandb_tags"])
+        if isinstance(defaults.get("gap_bucket_weights"), list):
+            defaults["gap_bucket_weights"] = ",".join(
+                str(value) for value in defaults["gap_bucket_weights"]
+            )
+        if isinstance(defaults.get("stage_weights"), list):
+            defaults["stage_weights"] = ",".join(
+                str(value) for value in defaults["stage_weights"]
+            )
+        parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
+    if not args.output_dir:
+        parser.error("--output_dir is required, either directly or through --config")
+    return args
+
+
+def load_pretrained_with_audio_fusion(
+    checkpoint: str | Path,
+    audio_config: Mapping[str, Any],
+) -> AudioMotionTransformer:
+    source_config = AudioMotionConfig.from_pretrained(
+        checkpoint, local_files_only=True
+    )
+    source_audio_mode = getattr(
+        source_config, "audio_fusion_mode", "legacy_additive"
+    )
+    model = AudioMotionTransformer.from_pretrained(
+        checkpoint,
+        local_files_only=True,
+        **dict(audio_config),
+    )
+    if (
+        source_audio_mode == "legacy_additive"
+        and audio_config["audio_fusion_mode"] != "legacy_additive"
+    ):
+        model._initialize_audio_identity()
+    return model
 
 
 def main() -> None:
@@ -1123,6 +1250,15 @@ def main() -> None:
         raise ValueError("soft_recovery_sigma_scale must be > 0")
     if args.min_gap_frames < 1 or args.max_gap_frames < args.min_gap_frames:
         raise ValueError("Invalid gap range")
+    adapter_layers = parse_int_list(
+        args.audio_adapter_layers, "audio_adapter_layers"
+    )
+    if args.audio_adapter_dim % args.audio_adapter_heads:
+        raise ValueError("audio_adapter_dim must be divisible by audio_adapter_heads")
+    if args.audio_fusion_mode == "routed_cross_attention" and not adapter_layers:
+        raise ValueError("routed_cross_attention requires audio_adapter_layers")
+    if args.audio_fusion_mode != "routed_cross_attention" and adapter_layers:
+        raise ValueError("audio_adapter_layers require routed_cross_attention")
 
     data_dir = Path(args.data_dir)
     token_dir = Path(
@@ -1213,9 +1349,23 @@ def main() -> None:
         if manifest and manifest.get("token_layout")
         else build_token_layout(part_order, num_quantizers)
     )
+    audio_config = {
+        "num_parts": len(part_order),
+        "num_quantizers_per_part": num_quantizers,
+        "max_gap_frames": args.max_gap_frames,
+        "audio_fusion_mode": args.audio_fusion_mode,
+        "audio_adapter_layers": adapter_layers,
+        "audio_adapter_dim": args.audio_adapter_dim,
+        "audio_adapter_heads": args.audio_adapter_heads,
+        "audio_router_dim": args.audio_router_dim,
+        "audio_router_embedding_dim": args.audio_router_embedding_dim,
+        "audio_additive_gate_scale": args.audio_additive_gate_scale,
+        "audio_relative_bias_max_distance": args.audio_relative_bias_max_distance,
+        "audio_adapter_target_only": args.audio_adapter_target_only,
+    }
     if args.model_name_or_path:
-        model = AudioMotionTransformer.from_pretrained(
-            args.model_name_or_path, local_files_only=True
+        model = load_pretrained_with_audio_fusion(
+            args.model_name_or_path, audio_config
         )
         if model.config.vocab_size != vocab_size or model.config.num_tokens_per_frame != ntpf:
             raise ValueError("Checkpoint vocabulary/token layout does not match multipart data")
@@ -1235,6 +1385,7 @@ def main() -> None:
             num_frames=args.max_gap_frames + 2,
             dropout=args.dropout,
             constrain_token_logits=True,
+            **audio_config,
         )
         model = AudioMotionTransformer(config)
     model.config.part_order = list(part_order)
@@ -1251,6 +1402,8 @@ def main() -> None:
     model.config.soft_recovery_topk = args.soft_recovery_topk
     model.config.soft_recovery_sigma_scale = args.soft_recovery_sigma_scale
     model.config.soft_recovery_only_wrong_prefix = not args.soft_recovery_include_correct_prefix
+    for key, value in audio_config.items():
+        setattr(model.config, key, value)
 
     checkpoint_paths = {part: Path(getattr(args, f"{part}_ckpt")) for part in part_order}
     codebooks = MultipartCodebookSet.from_checkpoints(
@@ -1296,6 +1449,12 @@ def main() -> None:
     print(f"Max sequence:     {max_seq_len} tokens ({args.max_gap_frames + 2} frames)")
     print(f"Gap weights:      {gap_weights}")
     print(f"Stage weights:    {stage_weights}")
+    print(
+        "Audio fusion:     "
+        f"mode={args.audio_fusion_mode}, layers={adapter_layers or 'none'}, "
+        f"adapter_dim={args.audio_adapter_dim}, heads={args.audio_adapter_heads}, "
+        f"target_only={args.audio_adapter_target_only}"
+    )
     print(
         "Self-forcing:     "
         f"warmup={args.self_forcing_warmup_ratio}, ramp={args.self_forcing_ramp_ratio}, "

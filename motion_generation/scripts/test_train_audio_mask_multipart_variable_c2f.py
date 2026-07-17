@@ -19,6 +19,8 @@ from scripts.train_audio_mask_multipart_variable_c2f import (
     VariableGapC2FTrainer,
     VariableGapMaskDataset,
     VariableGapMaskExample,
+    load_pretrained_with_audio_fusion,
+    parse_args,
 )
 from transformers import TrainingArguments
 
@@ -34,12 +36,13 @@ def tiny_config(*, max_positions: int = 32) -> AudioMotionConfig:
         codebook_size=4,
         audio_feat_dim=3,
         num_tokens_per_frame=4,
+        num_parts=2,
+        num_quantizers_per_part=2,
         num_frames=5,
         dropout=0.0,
         constrain_token_logits=True,
     )
     config.mask_token_id = 16
-    config.num_quantizers_per_part = 2
     config.part_order = ["upper", "lower"]
     return config
 
@@ -56,6 +59,162 @@ def synthetic_sequence(name: str, frames: int) -> dict:
         "audio_fps": 10.0,
         "motion_token_fps": 10.0,
     }
+
+
+def routed_config(*, adapter_layers=(1,), max_positions: int = 32) -> AudioMotionConfig:
+    return AudioMotionConfig(
+        hidden_size=16,
+        num_layers=1,
+        num_heads=2,
+        intermediate_size=32,
+        max_position_embeddings=max_positions,
+        vocab_size=17,
+        codebook_size=4,
+        audio_feat_dim=3,
+        num_tokens_per_frame=4,
+        num_parts=2,
+        num_quantizers_per_part=2,
+        num_frames=5,
+        max_gap_frames=3,
+        dropout=0.0,
+        constrain_token_logits=True,
+        audio_fusion_mode="routed_cross_attention",
+        audio_adapter_layers=list(adapter_layers),
+        audio_adapter_dim=8,
+        audio_adapter_heads=2,
+        audio_router_dim=8,
+        audio_router_embedding_dim=4,
+    )
+
+
+def test_audio_ablation_yaml_configs_parse_consistently():
+    names = {
+        "audio_c2f_additive_control.yaml": ("legacy_additive", ""),
+        "audio_c2f_routed_additive.yaml": ("routed_additive", ""),
+        "audio_c2f_crossattn_l4.yaml": ("routed_cross_attention", "4"),
+        "audio_c2f_crossattn_l3_l6.yaml": ("routed_cross_attention", "3,6"),
+    }
+    for name, expected in names.items():
+        args = parse_args(
+            ["--config", str(MOTION_GENERATION_DIR / "configs" / name)]
+        )
+        assert (args.audio_fusion_mode, args.audio_adapter_layers) == expected
+        assert args.self_forcing_max_prob == 0.0
+        assert args.adaptive_target_mode == "never"
+        assert args.soft_recovery_weight == 0.0
+
+
+def test_routed_audio_starts_as_an_exact_legacy_checkpoint_clone():
+    torch.manual_seed(101)
+    legacy = AudioMotionTransformer(tiny_config()).eval()
+    routed = AudioMotionTransformer(routed_config()).eval()
+    incompatible = routed.load_state_dict(legacy.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+
+    input_ids = torch.tensor(
+        [[0, 4, 8, 12, 16, 16, 16, 16, 2, 6, 10, 14]]
+    )
+    audio = torch.randn(1, 3, 3)
+    attention = torch.ones_like(input_ids, dtype=torch.bool)
+    middle = torch.tensor([[0] * 4 + [1] * 4 + [0] * 4], dtype=torch.bool)
+    with torch.no_grad():
+        legacy_logits = legacy(
+            input_ids, audio_features=audio, attention_mask=attention
+        )
+        routed_logits = routed(
+            input_ids,
+            audio_features=audio,
+            attention_mask=attention,
+            middle_mask=middle,
+            gap_lengths=torch.tensor([1]),
+            c2f_stage=0,
+        )
+    assert torch.equal(legacy_logits, routed_logits)
+
+
+def test_legacy_pretrained_warm_start_reapplies_identity_initialization(tmp_path):
+    legacy = AudioMotionTransformer(tiny_config()).eval()
+    legacy.save_pretrained(tmp_path)
+    routed = load_pretrained_with_audio_fusion(
+        tmp_path,
+        {
+            "num_parts": 2,
+            "num_quantizers_per_part": 2,
+            "max_gap_frames": 3,
+            "audio_fusion_mode": "routed_cross_attention",
+            "audio_adapter_layers": [1],
+            "audio_adapter_dim": 8,
+            "audio_adapter_heads": 2,
+            "audio_router_dim": 8,
+            "audio_router_embedding_dim": 4,
+            "audio_additive_gate_scale": 0.5,
+            "audio_relative_bias_max_distance": 3,
+            "audio_adapter_target_only": True,
+        },
+    ).eval()
+    assert torch.count_nonzero(routed.part_embedding.weight) == 0
+    assert torch.count_nonzero(routed.audio_router.output.weight) == 0
+    assert float(routed.audio_adapters["1"].residual_scale) == 0.0
+
+
+def test_two_audio_adapters_stay_within_the_parameter_budget():
+    config = AudioMotionConfig(
+        hidden_size=512,
+        num_layers=8,
+        num_heads=16,
+        intermediate_size=1536,
+        max_position_embeddings=512,
+        vocab_size=8193,
+        codebook_size=512,
+        audio_feat_dim=768,
+        num_tokens_per_frame=16,
+        num_parts=4,
+        num_quantizers_per_part=4,
+        max_gap_frames=15,
+        audio_fusion_mode="routed_cross_attention",
+        audio_adapter_layers=[3, 6],
+        audio_adapter_dim=256,
+        audio_adapter_heads=8,
+        audio_router_dim=64,
+        audio_router_embedding_dim=16,
+    )
+    model = AudioMotionTransformer(config)
+    added = sum(
+        parameter.numel()
+        for module in (
+            model.part_embedding,
+            model.quantizer_embedding,
+            model.stage_embedding,
+            model.audio_router,
+            model.audio_adapters,
+        )
+        for parameter in module.parameters()
+    )
+    assert 1_060_000 <= added <= 1_080_000
+
+
+def test_zero_scale_adapter_receives_a_scale_gradient():
+    torch.manual_seed(103)
+    model = AudioMotionTransformer(routed_config()).train()
+    model.gradient_checkpointing_enable()
+    input_ids = torch.tensor(
+        [[0, 4, 8, 12, 16, 16, 16, 16, 2, 6, 10, 14]]
+    )
+    audio = torch.randn(1, 3, 3)
+    attention = torch.ones_like(input_ids, dtype=torch.bool)
+    middle = torch.tensor([[0] * 4 + [1] * 4 + [0] * 4], dtype=torch.bool)
+    logits = model(
+        input_ids,
+        audio_features=audio,
+        attention_mask=attention,
+        middle_mask=middle,
+        gap_lengths=torch.tensor([1]),
+        c2f_stage=0,
+    )
+    logits[0, 4, :4].sum().backward()
+    gradient = model.audio_adapters["1"].residual_scale.grad
+    assert gradient is not None and torch.isfinite(gradient)
+    assert float(gradient.abs()) > 0
 
 
 def test_training_windows_resample_reproducibly_and_remain_clip_balanced():
@@ -176,6 +335,42 @@ def test_padding_mask_makes_valid_logits_invariant_to_padded_tail():
     assert torch.allclose(short_logits, padded_logits[:, :12], atol=1e-5, rtol=1e-5)
 
 
+def test_audio_adapter_ignores_padded_audio_frames():
+    torch.manual_seed(107)
+    model = AudioMotionTransformer(routed_config(max_positions=32)).eval()
+    model.audio_adapters["1"].residual_scale.data.fill_(0.25)
+    short_ids = torch.tensor([[0, 4, 8, 12, 16, 16, 16, 16, 2, 6, 10, 14]])
+    short_audio = torch.randn(1, 3, 3)
+    short_attention = torch.ones_like(short_ids, dtype=torch.bool)
+    short_middle = torch.tensor([[0] * 4 + [1] * 4 + [0] * 4], dtype=torch.bool)
+    padded_ids = torch.cat([short_ids, torch.full((1, 8), 16, dtype=torch.long)], dim=1)
+    padded_audio = torch.cat([short_audio, torch.randn(1, 2, 3)], dim=1)
+    padded_attention = torch.cat(
+        [short_attention, torch.zeros((1, 8), dtype=torch.bool)], dim=1
+    )
+    padded_middle = torch.cat(
+        [short_middle, torch.zeros((1, 8), dtype=torch.bool)], dim=1
+    )
+    with torch.no_grad():
+        short_logits = model(
+            short_ids,
+            audio_features=short_audio,
+            attention_mask=short_attention,
+            middle_mask=short_middle,
+            gap_lengths=torch.tensor([1]),
+            c2f_stage=0,
+        )
+        padded_logits = model(
+            padded_ids,
+            audio_features=padded_audio,
+            attention_mask=padded_attention,
+            middle_mask=padded_middle,
+            gap_lengths=torch.tensor([1]),
+            c2f_stage=0,
+        )
+    assert torch.allclose(short_logits, padded_logits[:, :12], atol=1e-5, rtol=1e-5)
+
+
 def test_padded_attention_supports_gradient_checkpointing_backward():
     torch.manual_seed(5)
     model = AudioMotionTransformer(tiny_config()).train()
@@ -198,8 +393,15 @@ def test_coarse_to_fine_generation_fills_q0_before_q1_and_skips_padding():
     config = tiny_config()
     model = AudioMotionTransformer(config).eval()
 
-    def fake_forward(self, input_ids, labels=None, audio_features=None, attention_mask=None):
-        del labels, audio_features, attention_mask
+    def fake_forward(
+        self,
+        input_ids,
+        labels=None,
+        audio_features=None,
+        attention_mask=None,
+        **kwargs,
+    ):
+        del labels, audio_features, attention_mask, kwargs
         logits = torch.full(
             (*input_ids.shape, self.config.vocab_size),
             -1000.0,

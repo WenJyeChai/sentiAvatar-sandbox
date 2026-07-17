@@ -1,0 +1,55 @@
+experiment:
+  output_dir: checkpoints/mask_multipart_audio_additive_control_gap1_15
+  model_name_or_path: checkpoints/mask_multipart_variable_c2f_fixed_targets_no_sf_gap1_15
+
+audio_conditioning:
+  audio_fusion_mode: legacy_additive
+  audio_adapter_layers: []
+  audio_adapter_target_only: true
+
+data:
+  data_dir: SuSuInterActs/SuSuInterActs
+  train_split_file: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  eval_split_file: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+  train_windows_per_sequence: 8
+  eval_windows_per_sequence: 4
+
+masking:
+  min_gap_frames: 1
+  max_gap_frames: 15
+  gap_bucket_weights: [0.35, 0.35, 0.30]
+  stage_weights: [0.35, 0.25, 0.20, 0.20]
+
+objectives:
+  adaptive_target_mode: never
+  self_forcing_warmup_ratio: 0.0
+  self_forcing_ramp_ratio: 0.0
+  self_forcing_max_prob: 0.0
+  embedding_loss_weight: 0.1
+  final_latent_loss_weight: 0.1
+  soft_recovery_weight: 0.0
+
+optimization:
+  num_train_epochs: 200
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  per_device_train_batch_size: 256
+  per_device_eval_batch_size: 256
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+
+monitoring:
+  logging_steps: 20
+  eval_steps: 1000
+  save_steps: 1000
+  save_total_limit: 3
+  report_to: wandb
+  wandb_project: sentiavatar-audio-conditioning
+  wandb_mode: online
+  wandb_run_name: audio_additive_control_gap1_15
+  wandb_tags: [audio_conditioning, additive_control, fixed_targets, no_sf]
+
