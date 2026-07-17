@@ -19,6 +19,7 @@ from scripts.train_audio_mask_multipart_variable_c2f import (
     VariableGapC2FTrainer,
     VariableGapMaskDataset,
     VariableGapMaskExample,
+    parse_args,
 )
 from transformers import TrainingArguments
 
@@ -56,6 +57,52 @@ def synthetic_sequence(name: str, frames: int) -> dict:
         "audio_fps": 10.0,
         "motion_token_fps": 10.0,
     }
+
+
+def tiny_codebooks() -> dict[str, torch.Tensor]:
+    return {
+        part: torch.randn(2, 4, 8)
+        for part in ("upper", "lower")
+    }
+
+
+def test_nested_yaml_config_loads_types_and_cli_overrides(tmp_path):
+    config_path = tmp_path / "train.yaml"
+    config_path.write_text(
+        """
+experiment:
+  output_dir: checkpoints/test-run
+masking:
+  gap_bucket_weights: [0.2, 0.3, 0.5]
+  stage_weights: [0.4, 0.3, 0.2, 0.1]
+optimization:
+  learning_rate: 1.0e-4
+  bf16: true
+  gradient_checkpointing: false
+monitoring:
+  wandb_tags: [yaml, c2f]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    args = parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--learning_rate",
+            "0.0002",
+            "--no-bf16",
+        ]
+    )
+
+    assert args.config == config_path
+    assert args.output_dir == "checkpoints/test-run"
+    assert args.gap_bucket_weights == "0.2,0.3,0.5"
+    assert args.stage_weights == "0.4,0.3,0.2,0.1"
+    assert args.wandb_tags == "yaml,c2f"
+    assert args.learning_rate == 0.0002
+    assert args.bf16 is False
+    assert args.gradient_checkpointing is False
 
 
 def test_training_windows_resample_reproducibly_and_remain_clip_balanced():
@@ -337,10 +384,20 @@ def test_trainer_self_forced_stage_builds_a_finite_backward_loss(tmp_path):
     assert not trainer._use_adaptive_targets(stage=1, self_forced=True)
     trainer.adaptive_target_mode = "self_forced"
 
+    forward_training_modes = []
+    original_forward = model.forward
+
+    def tracked_forward(self, *args, **kwargs):
+        forward_training_modes.append(self.training)
+        return original_forward(*args, **kwargs)
+
+    model.forward = MethodType(tracked_forward, model)
     loss = trainer.compute_loss(model, batch)
     loss.backward()
 
     assert torch.isfinite(loss)
+    assert forward_training_modes == [False, True]
+    assert model.training
     assert model.embed_tokens.weight.grad is not None
     assert torch.isfinite(model.embed_tokens.weight.grad).all()
 
@@ -480,3 +537,169 @@ def test_evaluation_loss_and_hard_latent_metrics_are_finite(tmp_path):
     assert torch.isfinite(torch.tensor(logged["eval_c2f/hard_latent_rmse"]))
     assert "eval_c2f/hard_latent_rmse_q0_wrong" in logged
     assert "eval_c2f/hard_latent_rmse_gap_1_3" in logged
+
+
+def test_audio_residual_posterior_is_audio_sensitive_and_slot_constrained():
+    torch.manual_seed(37)
+    config = tiny_config()
+    model = AudioMotionTransformer(config).eval()
+    books = tiny_codebooks()
+    model.configure_audio_residual_posterior(
+        books,
+        config.part_order,
+        config.num_quantizers_per_part,
+        mode="residual_posterior",
+        gate_init=2.0,
+    )
+    input_ids = torch.tensor(
+        [[0, 4, 8, 12, 16, 16, 16, 16, 2, 6, 10, 14]]
+    )
+    attention = torch.ones_like(input_ids, dtype=torch.bool)
+    audio = torch.randn(1, 3, 3)
+
+    with torch.no_grad():
+        first = model(
+            input_ids,
+            audio_features=audio,
+            attention_mask=attention,
+            audio_prior_stage=0,
+            negative_audio_features=audio.roll(1, dims=1),
+            return_audio_prior_details=True,
+        )
+        second = model(
+            input_ids,
+            audio_features=audio.flip(1),
+            attention_mask=attention,
+            audio_prior_stage=0,
+        )
+
+    assert set(first["audio_prior"]) == {(0, 0), (1, 0)}
+    details = first["audio_prior"][(0, 0)]
+    assert details["mu"].shape == (1, 3, 8)
+    assert details["prior_logits"].shape == (1, 3, 4)
+    assert details["negative_prior_logits"].shape == (1, 3, 4)
+    assert details["gate"].min() > 0 and details["gate"].max() < 1
+    assert not torch.allclose(first["logits"], second)
+    valid = model._slot_valid_mask(input_ids.shape[1], input_ids.device)
+    invalid_logits = first["logits"].masked_select(~valid.unsqueeze(0))
+    assert invalid_logits.eq(torch.finfo(first["logits"].dtype).min).all()
+    generated = model.generate_sbs(
+        input_ids,
+        audio,
+        attention_mask=attention,
+    )
+    assert not generated.eq(config.mask_token_id).any()
+
+
+def test_audio_residual_losses_train_posterior_on_self_forced_prefixes(tmp_path):
+    torch.manual_seed(41)
+    config = tiny_config()
+    model = AudioMotionTransformer(config).train()
+    collator = VariableGapC2FCollator(config)
+    books = tiny_codebooks()
+    model.configure_audio_residual_posterior(
+        books,
+        config.part_order,
+        config.num_quantizers_per_part,
+        mode="residual_posterior",
+        gate_init=-2.0,
+    )
+    batch = collator(
+        [
+            VariableGapMaskExample(
+                name="a",
+                left_idx=0,
+                right_idx=3,
+                gap_frames=2,
+                motion_tokens=[raw_frame(i) for i in range(4)],
+                audio_features=torch.randn(4, 3),
+            ),
+            VariableGapMaskExample(
+                name="b",
+                left_idx=0,
+                right_idx=3,
+                gap_frames=2,
+                motion_tokens=[raw_frame((i + 1) % 4) for i in range(4)],
+                audio_features=torch.randn(4, 3),
+            ),
+        ]
+    )
+    trainer = VariableGapC2FTrainer(
+        model=model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            per_device_train_batch_size=2,
+            report_to="none",
+            remove_unused_columns=False,
+        ),
+        target_builder=ResidualTargetBuilder(
+            books,
+            part_order=config.part_order,
+            codebook_size=4,
+            num_quantizers=2,
+        ),
+        stage_weights=(0.0, 1.0),
+        self_forcing_warmup_ratio=0.0,
+        self_forcing_ramp_ratio=0.0,
+        self_forcing_max_prob=1.0,
+        adaptive_target_mode="never",
+        embedding_loss_weight=0.1,
+        final_latent_loss_weight=0.1,
+        audio_residual_soft_weight=0.1,
+        audio_residual_nll_weight=0.05,
+        audio_residual_rank_weight=0.05,
+        audio_residual_topk=2,
+        audio_residual_rank_margin=0.2,
+    )
+    trainer.state.global_step = 1
+    trainer.state.max_steps = 1
+
+    loss = trainer.compute_loss(model, batch)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert "train_c2f/q1_audio_soft_nll" in trainer._metric_sums
+    assert "train_c2f/q1_audio_negative_nll" in trainer._metric_sums
+    assert "train_c2f/q1_audio_nll_margin" in trainer._metric_sums
+    head = model.audio_residual_posterior.heads["part0_q1"]
+    assert head.mu.weight.grad is not None
+    assert torch.isfinite(head.mu.weight.grad).all()
+    assert not model.audio_residual_posterior.codebook(0).requires_grad
+
+    model.eval()
+    with torch.no_grad():
+        eval_loss = trainer.compute_loss(model, batch)
+    assert torch.isfinite(eval_loss)
+    assert "eval_c2f/q0_audio_soft_nll" in trainer._metric_sums
+    assert "eval_c2f/q1_audio_nll_margin" in trainer._metric_sums
+
+
+def test_audio_residual_posterior_round_trips_through_pretrained_checkpoint(tmp_path):
+    torch.manual_seed(43)
+    config = tiny_config()
+    model = AudioMotionTransformer(config).eval()
+    books = tiny_codebooks()
+    model.configure_audio_residual_posterior(
+        books,
+        config.part_order,
+        config.num_quantizers_per_part,
+        mode="additive_residual_posterior",
+        prior_weight=0.7,
+        gate_init=-1.0,
+    )
+    input_ids = torch.tensor([[0, 4, 8, 12, 16, 16, 16, 16]])
+    audio = torch.randn(1, 2, 3)
+    with torch.no_grad():
+        expected = model(input_ids, audio_features=audio, audio_prior_stage=1)
+
+    model.save_pretrained(tmp_path)
+    loaded = AudioMotionTransformer.from_pretrained(
+        tmp_path, local_files_only=True
+    ).eval()
+    with torch.no_grad():
+        actual = loaded(input_ids, audio_features=audio, audio_prior_stage=1)
+
+    assert loaded.uses_audio_residual_posterior
+    assert loaded.config.audio_conditioning_mode == "additive_residual_posterior"
+    assert torch.equal(loaded.audio_residual_posterior.codebook(0), books["upper"])
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)

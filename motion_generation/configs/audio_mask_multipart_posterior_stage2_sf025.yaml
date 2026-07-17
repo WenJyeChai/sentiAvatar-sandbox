@@ -1,0 +1,76 @@
+experiment:
+  output_dir: checkpoints/mask_multipart_audio_residual_posterior_sf025_posttrain_gap1_15
+  model_name_or_path: checkpoints/mask_multipart_audio_residual_posterior_no_sf_gap1_15
+  seed: 42
+
+data:
+  data_dir: SuSuInterActs/SuSuInterActs
+  train_split_file: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  eval_split_file: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+  train_windows_per_sequence: 8
+  eval_windows_per_sequence: 4
+  audio_fps: 10.0
+  motion_fps: 20.0
+
+masking:
+  min_gap_frames: 1
+  max_gap_frames: 15
+  gap_bucket_weights: [0.35, 0.35, 0.30]
+  stage_weights: [0.35, 0.25, 0.20, 0.20]
+
+residual_recovery:
+  adaptive_target_mode: never
+  soft_recovery_weight: 0.0
+  self_forcing_warmup_ratio: 0.10
+  self_forcing_ramp_ratio: 0.30
+  self_forcing_max_prob: 0.25
+  embedding_loss_weight: 0.1
+  final_latent_loss_weight: 0.1
+
+audio_posterior:
+  audio_conditioning_mode: additive_residual_posterior
+  audio_residual_prior_weight: 1.0
+  audio_residual_gate_init: -4.0
+  audio_residual_log_sigma_min: -3.0
+  audio_residual_log_sigma_max: 3.0
+  audio_residual_soft_weight: 0.1
+  audio_residual_nll_weight: 0.05
+  audio_residual_rank_weight: 0.05
+  audio_residual_topk: 8
+  audio_residual_sigma_scale: 1.0
+  audio_residual_rank_margin: 0.2
+
+optimization:
+  num_train_epochs: 50
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  per_device_train_batch_size: 256
+  per_device_eval_batch_size: 256
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+
+evaluation_and_saving:
+  logging_steps: 20
+  eval_steps: 1000
+  save_steps: 1000
+  save_total_limit: 3
+  dataloader_num_workers: 0
+
+monitoring:
+  report_to: wandb
+  wandb_project: sentiavatar-variable-c2f
+  wandb_run_name: audio_residual_posterior_stage2_sf025
+  wandb_tags:
+    - variable_gap
+    - c2f
+    - additive_residual_posterior
+    - posterior_stage2
+    - inference_mode_rollout
+    - self_forcing
+    - sf025
+  wandb_mode: online
