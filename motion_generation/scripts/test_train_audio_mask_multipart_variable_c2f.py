@@ -100,18 +100,37 @@ def test_audio_ablation_yaml_configs_parse_consistently():
         assert args.soft_recovery_weight == 0.0
 
 
-def test_face_soft_recovery_yaml_preserves_current_objective():
-    args = parse_args(
+def test_face_two_stage_yaml_configs_preserve_training_contract():
+    base = parse_args(
         [
             "--config",
-            str(MOTION_GENERATION_DIR / "configs" / "audio_c2f_face_soft_recovery_sf05.yaml"),
+            str(
+                MOTION_GENERATION_DIR
+                / "configs"
+                / "audio_c2f_face_fixed_targets_no_sf_scratch.yaml"
+            ),
         ]
     )
-    assert args.motion_token_dir.endswith("motion_face_token_data_multipart_512x4")
-    assert Path(args.face_ckpt).name == "best.pth"
-    assert args.audio_fusion_mode == "legacy_additive"
-    assert args.self_forcing_max_prob == 0.5
-    assert args.soft_recovery_weight == 0.1
+    stage2 = parse_args(
+        [
+            "--config",
+            str(
+                MOTION_GENERATION_DIR
+                / "configs"
+                / "audio_c2f_face_soft_recovery_sf05_stage2.yaml"
+            ),
+        ]
+    )
+    assert base.model_name_or_path is None
+    assert base.motion_token_dir.endswith("motion_face_token_data_multipart_512x4")
+    assert Path(base.face_ckpt).name == "best.pth"
+    assert base.min_gap_frames == 1 and base.max_gap_frames == 15
+    assert base.adaptive_target_mode == "never"
+    assert base.self_forcing_max_prob == 0.0
+    assert base.soft_recovery_weight == 0.0
+    assert stage2.model_name_or_path == base.output_dir
+    assert stage2.self_forcing_max_prob == 0.5
+    assert stage2.soft_recovery_weight == 0.1
 
 
 def test_routed_audio_starts_as_an_exact_legacy_checkpoint_clone():

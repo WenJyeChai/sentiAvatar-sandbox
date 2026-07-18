@@ -1,6 +1,5 @@
 experiment:
-  output_dir: checkpoints/mask_multipart_face_variable_c2f_soft_recovery_sf05_gap1_15
-  model_name_or_path: checkpoints/mask_multipart_variable_c2f_soft_recovery_sf05_gap1_15
+  output_dir: checkpoints/mask_multipart_face_variable_c2f_fixed_targets_no_sf_scratch_gap1_15
 
 audio_conditioning:
   audio_fusion_mode: legacy_additive
@@ -22,19 +21,19 @@ masking:
 
 objectives:
   adaptive_target_mode: never
-  self_forcing_warmup_ratio: 0.10
-  self_forcing_ramp_ratio: 0.30
-  self_forcing_max_prob: 0.50
+  self_forcing_warmup_ratio: 0.0
+  self_forcing_ramp_ratio: 0.0
+  self_forcing_max_prob: 0.0
   embedding_loss_weight: 0.1
   final_latent_loss_weight: 0.1
-  soft_recovery_weight: 0.1
+  soft_recovery_weight: 0.0
   soft_recovery_topk: 8
   soft_recovery_sigma_scale: 1.0
   soft_recovery_include_correct_prefix: false
 
 optimization:
   num_train_epochs: 200
-  learning_rate: 5.0e-5
+  learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
@@ -53,5 +52,5 @@ monitoring:
   report_to: wandb
   wandb_project: sentiavatar-face-infill
   wandb_mode: online
-  wandb_run_name: face_variable_c2f_soft_recovery_sf05_gap1_15
-  wandb_tags: [face, multipart, variable_gap, c2f, soft_recovery, sf05]
+  wandb_run_name: face_variable_c2f_fixed_targets_no_sf_scratch_gap1_15
+  wandb_tags: [face, multipart, variable_gap, c2f, fixed_targets, no_sf, scratch]
