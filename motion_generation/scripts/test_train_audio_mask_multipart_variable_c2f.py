@@ -104,6 +104,30 @@ def test_audio_ablation_yaml_configs_parse_consistently():
         assert args.soft_recovery_weight == 0.0
 
 
+def test_combined_audio_soft_recovery_yaml_enables_sf05_objective():
+    args = parse_args(
+        [
+            "--config",
+            str(
+                MOTION_GENERATION_DIR
+                / "configs"
+                / "audio_c2f_crossattn_l3_l6_soft_recovery_sf05.yaml"
+            ),
+        ]
+    )
+
+    assert args.audio_fusion_mode == "routed_cross_attention"
+    assert args.audio_adapter_layers == "3,6"
+    assert args.adaptive_target_mode == "never"
+    assert args.self_forcing_warmup_ratio == 0.10
+    assert args.self_forcing_ramp_ratio == 0.30
+    assert args.self_forcing_max_prob == 0.50
+    assert args.soft_recovery_weight == 0.1
+    assert args.soft_recovery_topk == 8
+    assert args.soft_recovery_sigma_scale == 1.0
+    assert not args.soft_recovery_include_correct_prefix
+
+
 def test_routed_audio_starts_as_an_exact_legacy_checkpoint_clone():
     torch.manual_seed(101)
     legacy = AudioMotionTransformer(tiny_config()).eval()
