@@ -20,9 +20,12 @@ sys.path.insert(0, str(MODULE_DIR))
 
 from models.multipart_rvqvae import MultiPartRVQVAE  # noqa: E402
 from utils.multipart_motion import (  # noqa: E402
+    FACE_PART,
+    MULTIMODAL_PART_ORDER,
     PART_DIMS,
     PART_ORDER,
     PartNormalizer,
+    load_face_coefficients,
     load_motion_dict,
     load_name_list,
     motion_path_for_name,
@@ -59,7 +62,7 @@ class LoadedPartCodec:
 
 def infer_part_from_path(path: Path) -> Optional[str]:
     text = str(path).lower()
-    for part in PART_ORDER:
+    for part in MULTIMODAL_PART_ORDER:
         if part in text:
             return part
     return None
@@ -86,8 +89,9 @@ def load_part_codec(path: Path, device: torch.device) -> LoadedPartCodec:
     down_t = int(args.get("down_t", 1))
     stride_t = int(args.get("stride_t", 2))
 
+    checkpoint_part_dims = model_config.get("part_dims") or {}
     model = MultiPartRVQVAE(
-        part_dims=PART_DIMS,
+        part_dims={**PART_DIMS, **checkpoint_part_dims},
         part_order=[part],
         nb_code=codebook_size,
         code_dim=code_dim,
@@ -147,10 +151,21 @@ def encode_motion_parts(
     codecs: Mapping[str, LoadedPartCodec],
     device: torch.device,
     root_abs_threshold: float,
+    face: Optional[np.ndarray] = None,
+    part_order=PART_ORDER,
 ) -> tuple[list[list[int]], Dict[str, object]]:
     parts, meta = split_motion_parts(motion, abs_threshold=root_abs_threshold)
+    if FACE_PART in part_order:
+        if face is None:
+            raise ValueError("Face coefficients are required when face is in part_order")
+        parts[FACE_PART] = np.asarray(face, dtype=np.float32)
+    source_lengths = {part: int(parts[part].shape[0]) for part in part_order}
+    source_frames = min(source_lengths.values())
+    parts = {part: parts[part][:source_frames] for part in part_order}
+    meta["source_part_frames"] = source_lengths
+    meta["aligned_source_frames"] = source_frames
     code_by_part: Dict[str, np.ndarray] = {}
-    for part in PART_ORDER:
+    for part in part_order:
         loaded = codecs[part]
         x_np = loaded.normalizer.normalize(part, parts[part])
         x = torch.tensor(x_np, dtype=torch.float32, device=device).unsqueeze(0)
@@ -161,7 +176,7 @@ def encode_motion_parts(
     tokens: list[list[int]] = []
     for frame_idx in range(token_frames):
         frame = []
-        for part in PART_ORDER:
+        for part in part_order:
             frame.extend(int(v) for v in code_by_part[part][frame_idx].tolist())
         tokens.append(frame)
 
@@ -170,7 +185,7 @@ def encode_motion_parts(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export 16-token multipart RVQ-VAE motion token JSONs.",
+        description="Export multipart RVQ-VAE body tokens with an optional ARKit face stream.",
     )
     parser.add_argument(
         "--data_dir",
@@ -178,12 +193,19 @@ def parse_args() -> argparse.Namespace:
         default=PROJECT_DIR / "SuSuInterActs" / "SuSuInterActs",
     )
     parser.add_argument("--motion_dir", type=Path, default=None)
+    parser.add_argument("--face_dir", type=Path, default=None)
     parser.add_argument("--split_file", type=Path, default=None)
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--upper_ckpt", type=Path, required=True)
     parser.add_argument("--lower_ckpt", type=Path, required=True)
     parser.add_argument("--feet_ckpt", type=Path, required=True)
     parser.add_argument("--hands_ckpt", type=Path, required=True)
+    parser.add_argument(
+        "--face_ckpt",
+        type=Path,
+        default=None,
+        help="Optional face RVQ checkpoint. Adds four face slots after the 16 body slots.",
+    )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--motion_fps", type=float, default=20.0)
     parser.add_argument("--root_abs_threshold", type=float, default=10.0)
@@ -197,8 +219,14 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() or "cuda" not in args.device else "cpu")
     data_dir = args.data_dir.resolve()
     motion_dir = (args.motion_dir or data_dir / "motion_data").resolve()
+    face_dir = (args.face_dir or data_dir / "arkit_data").resolve()
     split_file = (args.split_file or data_dir / "split" / "all_file_list.txt").resolve()
-    output_dir = (args.output_dir or data_dir / "motion_token_data_multipart_512x4").resolve()
+    default_output_name = (
+        "motion_face_token_data_multipart_512x4"
+        if args.face_ckpt is not None
+        else "motion_token_data_multipart_512x4"
+    )
+    output_dir = (args.output_dir or data_dir / default_output_name).resolve()
 
     codecs = {
         "upper": load_part_codec(args.upper_ckpt, device),
@@ -206,6 +234,9 @@ def main() -> None:
         "feet": load_part_codec(args.feet_ckpt, device),
         "hands": load_part_codec(args.hands_ckpt, device),
     }
+    if args.face_ckpt is not None:
+        codecs[FACE_PART] = load_part_codec(args.face_ckpt, device)
+    part_order = MULTIMODAL_PART_ORDER if args.face_ckpt is not None else PART_ORDER
     for expected, loaded in codecs.items():
         if loaded.part != expected:
             raise ValueError(f"{expected}_ckpt loaded part '{loaded.part}', expected '{expected}'")
@@ -222,7 +253,7 @@ def main() -> None:
     codebook_size = next(iter(codebook_sizes))
     num_quantizers = next(iter(quantizer_counts))
     unit_length = next(iter(unit_lengths))
-    token_layout = build_token_layout(PART_ORDER, num_quantizers)
+    token_layout = build_token_layout(part_order, num_quantizers)
     token_fps = float(args.motion_fps) / float(unit_length)
 
     names = load_name_list(split_file)
@@ -233,20 +264,24 @@ def main() -> None:
     counts = {"exported": 0, "skipped_existing": 0, "missing": 0, "failed": 0}
     for index, name in enumerate(names, start=1):
         motion_path = motion_path_for_name(motion_dir, name)
+        face_path = motion_path_for_name(face_dir, name)
         out_path = output_json_path(output_dir, name)
         if out_path.exists() and not args.overwrite:
             counts["skipped_existing"] += 1
             continue
-        if not motion_path.exists():
+        if not motion_path.exists() or (FACE_PART in part_order and not face_path.exists()):
             counts["missing"] += 1
             continue
         try:
             motion = load_motion_dict(motion_path)
+            face = load_face_coefficients(face_path) if FACE_PART in part_order else None
             tokens, meta = encode_motion_parts(
                 motion,
                 codecs,
                 device,
                 root_abs_threshold=args.root_abs_threshold,
+                face=face,
+                part_order=part_order,
             )
             out_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
@@ -257,12 +292,13 @@ def main() -> None:
                 "motion_token_unit_length": unit_length,
                 "codebook_size": codebook_size,
                 "num_quantizers": num_quantizers,
-                "part_order": list(PART_ORDER),
-                "tokens_per_frame": len(PART_ORDER) * num_quantizers,
+                "part_order": list(part_order),
+                "tokens_per_frame": len(part_order) * num_quantizers,
                 "token_layout": token_layout,
                 "root_schema": meta.get("root_schema"),
                 "root_mean_norm": meta.get("root_mean_norm"),
                 "source_motion_path": str(motion_path),
+                "source_face_path": str(face_path) if FACE_PART in part_order else None,
                 "part_checkpoints": {part: str(loaded.checkpoint_path) for part, loaded in codecs.items()},
             }
             with open(out_path, "w", encoding="utf-8") as f:
@@ -287,7 +323,8 @@ def main() -> None:
                 "motion_token_unit_length": unit_length,
                 "codebook_size": codebook_size,
                 "num_quantizers": num_quantizers,
-                "part_order": list(PART_ORDER),
+                "part_order": list(part_order),
+                "tokens_per_frame": len(part_order) * num_quantizers,
                 "token_layout": token_layout,
             },
             f,

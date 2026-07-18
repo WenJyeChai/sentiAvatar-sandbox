@@ -13,7 +13,7 @@ from utils.multipart_motion import PART_DIMS, PART_ORDER
 
 
 class MultiPartRVQVAE(nn.Module):
-    """Separate RVQ codebooks for SentiAvatar upper/lower/feet/hands parts."""
+    """Independent RVQ codecs for selected SentiAvatar body or face streams."""
 
     def __init__(
         self,

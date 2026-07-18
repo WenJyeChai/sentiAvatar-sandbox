@@ -10,7 +10,7 @@ import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -33,11 +33,14 @@ sys.path.insert(0, str(MODULE_DIR))
 
 from models.multipart_rvqvae import MultiPartRVQVAE  # noqa: E402
 from utils.multipart_motion import (  # noqa: E402
+    FACE_PART,
+    MULTIMODAL_PART_ORDER,
     PART_DIMS,
     PART_ORDER,
     PartNormalizer,
-    compute_part_normalizer,
+    compute_selected_part_normalizer,
     crop_or_pad_parts,
+    load_face_coefficients,
     load_motion_dict,
     load_name_list,
     motion_path_for_name,
@@ -60,12 +63,21 @@ class MultipartMotionDataset(Dataset):
     ) -> None:
         self.data_root = data_root
         self.motion_dir = data_root / "motion_data"
+        self.face_dir = data_root / "arkit_data"
         self.split_file = split_file or data_root / "split" / f"{split}_file_list.txt"
         if not self.split_file.exists():
             raise FileNotFoundError(f"Split file not found: {self.split_file}")
 
         names = load_name_list(self.split_file)
-        existing = [name for name in names if motion_path_for_name(self.motion_dir, name).exists()]
+        self.part_order = tuple(part_order)
+        self.needs_motion = any(part in PART_ORDER for part in self.part_order)
+        self.needs_face = FACE_PART in self.part_order
+        existing = [
+            name
+            for name in names
+            if (not self.needs_motion or motion_path_for_name(self.motion_dir, name).exists())
+            and (not self.needs_face or motion_path_for_name(self.face_dir, name).exists())
+        ]
         if max_clips is not None:
             existing = existing[:max_clips]
         if not existing:
@@ -75,7 +87,6 @@ class MultipartMotionDataset(Dataset):
         self.normalizer = normalizer
         self.window_size = int(window_size)
         self.root_abs_threshold = float(root_abs_threshold)
-        self.part_order = tuple(part_order)
         self.train = bool(train)
 
     def __len__(self) -> int:
@@ -83,8 +94,20 @@ class MultipartMotionDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
         name = self.names[idx]
-        motion = load_motion_dict(motion_path_for_name(self.motion_dir, name))
-        parts, meta = split_motion_parts(motion, abs_threshold=self.root_abs_threshold)
+        parts: Dict[str, np.ndarray] = {}
+        meta: Dict[str, object] = {"root_schema": "not_applicable"}
+        if self.needs_motion:
+            motion = load_motion_dict(motion_path_for_name(self.motion_dir, name))
+            motion_parts, meta = split_motion_parts(
+                motion, abs_threshold=self.root_abs_threshold
+            )
+            parts.update(
+                {part: motion_parts[part] for part in self.part_order if part in PART_ORDER}
+            )
+        if self.needs_face:
+            parts[FACE_PART] = load_face_coefficients(
+                motion_path_for_name(self.face_dir, name)
+            )
         frames = min(value.shape[0] for value in parts.values())
 
         if self.train and frames > self.window_size:
@@ -480,7 +503,6 @@ def init_wandb(args: argparse.Namespace, run_dir: Path):
 
 def prepare_normalizer(args: argparse.Namespace, run_dir: Path) -> PartNormalizer:
     data_root = args.data_root.resolve()
-    motion_dir = data_root / "motion_data"
     split_file = (
         args.train_split_file.resolve()
         if args.train_split_file is not None
@@ -503,9 +525,10 @@ def prepare_normalizer(args: argparse.Namespace, run_dir: Path) -> PartNormalize
         return normalizer
 
     print("Computing part normalizer from training split...")
-    normalizer, metadata = compute_part_normalizer(
-        motion_dir=motion_dir,
+    normalizer, metadata = compute_selected_part_normalizer(
+        data_root=data_root,
         names=names,
+        part_order=args.parts,
         abs_threshold=args.root_abs_threshold,
         max_clips=args.max_stat_clips,
     )
@@ -513,20 +536,48 @@ def prepare_normalizer(args: argparse.Namespace, run_dir: Path) -> PartNormalize
         {
             "source_data_root": str(data_root),
             "train_split": args.train_split,
-            "note": "Root channel canonicalized to per-frame delta before stats.",
+            "note": (
+                "Root channel canonicalized to per-frame delta before stats."
+                if any(part in PART_ORDER for part in args.parts)
+                else "ARKit blendshape coefficients normalized per channel."
+            ),
         }
     )
     normalizer.save(normalizer_path, metadata=metadata)
     print(f"Saved normalizer: {normalizer_path}")
-    print(f"Root schema counts: {metadata['schema_counts']}")
+    print(f"Data audit counts: {metadata['schema_counts']}")
     barrier(args)
     return normalizer
 
 
-def parse_args() -> argparse.Namespace:
+def load_yaml_defaults(path: Path) -> Dict[str, Any]:
+    import yaml
+
+    with open(path, "r", encoding="utf-8") as handle:
+        document = yaml.safe_load(handle) or {}
+    if not isinstance(document, dict):
+        raise ValueError("Training YAML must contain a mapping at its root")
+    flattened: Dict[str, Any] = {}
+
+    def visit(value: Mapping[str, Any]) -> None:
+        for key, item in value.items():
+            name = str(key)
+            if isinstance(item, dict):
+                visit(item)
+            else:
+                if name in flattened:
+                    raise ValueError(f"Duplicate YAML option: {name}")
+                flattened[name] = item
+
+    visit(document)
+    return flattened
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a multi-part RVQ-VAE for SentiAvatar motion.",
+        description="Train a multipart RVQ-VAE for SentiAvatar motion or ARKit face data.",
     )
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument(
         "--data_root",
         type=Path,
@@ -549,8 +600,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=list(PART_ORDER),
         help=(
-            "Motion parts to train. Use one or more of: upper lower feet hands, "
-            "or use 'all'. Examples: --parts hands  |  --parts upper lower"
+            "Parts to train. Use one or more of: upper lower feet hands face. "
+            "'all' retains the four body parts; 'all_with_face' selects all five."
         ),
     )
     parser.add_argument("--normalizer_path", type=Path, default=None)
@@ -631,19 +682,40 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ask W&B to watch gradients/parameters. Useful but can slow training.",
     )
-    return parser.parse_args()
+    preliminary, _ = parser.parse_known_args(argv)
+    if preliminary.config is not None:
+        defaults = load_yaml_defaults(preliminary.config)
+        actions = {action.dest: action for action in parser._actions}
+        unknown = sorted(set(defaults) - set(actions))
+        if unknown:
+            raise ValueError(f"Unknown YAML options: {', '.join(unknown)}")
+        if isinstance(defaults.get("wandb_tags"), list):
+            defaults["wandb_tags"] = ",".join(str(tag) for tag in defaults["wandb_tags"])
+        if isinstance(defaults.get("report_to"), str):
+            defaults["report_to"] = [defaults["report_to"]]
+        for name, value in list(defaults.items()):
+            action = actions[name]
+            if value is not None and action.type is not None and not isinstance(value, list):
+                defaults[name] = action.type(value)
+        parser.set_defaults(**defaults)
+    return parser.parse_args(argv)
 
 
 def normalize_parts(parts) -> list[str]:
     if not parts:
         return list(PART_ORDER)
     lowered = [str(part).lower() for part in parts]
+    if "all_with_face" in lowered:
+        return list(MULTIMODAL_PART_ORDER)
     if "all" in lowered:
         return list(PART_ORDER)
-    valid = set(PART_ORDER)
+    valid = set(MULTIMODAL_PART_ORDER)
     unknown = [part for part in lowered if part not in valid]
     if unknown:
-        raise ValueError(f"Unknown --parts value(s): {unknown}. Valid values: {list(PART_ORDER)} or all")
+        raise ValueError(
+            f"Unknown --parts value(s): {unknown}. Valid values: "
+            f"{list(MULTIMODAL_PART_ORDER)}, all, or all_with_face"
+        )
     deduped = []
     for part in lowered:
         if part not in deduped:

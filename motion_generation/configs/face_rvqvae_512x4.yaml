@@ -1,0 +1,55 @@
+experiment:
+  output_dir: checkpoints/multipart_rvqvae
+  experiment_name: rvq_face_512x4_bs256_cosine
+
+data:
+  data_root: SuSuInterActs/SuSuInterActs
+  train_split_file: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  eval_split_file: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+  parts: [face]
+  window_size: 64
+  per_device_train_batch_size: 256
+  per_device_eval_batch_size: 256
+  num_workers: 8
+
+codec:
+  codebook_size: 512
+  num_quantizers: 4
+  code_dim: 512
+  down_t: 1
+  stride_t: 2
+  width: 512
+  depth: 3
+  dilation_growth_rate: 3
+  activation: relu
+  vq_cnn_depth: 3
+  mu: 0.99
+
+objectives:
+  rec_weight: 1.0
+  vel_weight: 1.0
+  commit_weight: 0.02
+
+optimization:
+  num_train_epochs: 100
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.05
+  grad_clip: 1.0
+  bf16: true
+
+checkpointing:
+  save_every: 0
+  save_steps: 1000
+  eval_steps: 1000
+  save_total_limit: 3
+
+monitoring:
+  logging_steps: 20
+  report_to: [wandb]
+  wandb_project: sentiavatar-rvqvae
+  wandb_run_name: rvq_face_512x4_bs256_cosine
+  wandb_tags: [face, arkit, rvqvae, 512x4, cosine, bs256]
+  wandb_mode: online

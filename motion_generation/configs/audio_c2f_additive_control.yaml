@@ -4,8 +4,6 @@ experiment:
 
 audio_conditioning:
   audio_fusion_mode: legacy_additive
-  audio_adapter_layers: []
-  audio_adapter_target_only: true
 
 data:
   data_dir: SuSuInterActs/SuSuInterActs
@@ -52,4 +50,3 @@ monitoring:
   wandb_mode: online
   wandb_run_name: audio_additive_control_gap1_15
   wandb_tags: [audio_conditioning, additive_control, fixed_targets, no_sf]
-

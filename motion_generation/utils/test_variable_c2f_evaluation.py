@@ -16,6 +16,7 @@ from utils.variable_c2f_evaluation import (
     EvalWindowRecord,
     VariableGapMaskExample,
     apply_audio_input_mode,
+    decoded_face_group_metrics,
     generated_gap_dynamics_metrics,
     paired_bootstrap_window_differences,
     seam_discontinuity_metrics,
@@ -107,6 +108,18 @@ def test_generated_gap_dynamics_scale_with_motion_amplitude():
         "gap_jerk_l2_rms",
     ):
         assert np.isclose(doubled[metric], 2.0 * base[metric])
+
+
+def test_face_metrics_report_lip_and_non_lip_groups():
+    gt = np.zeros((5, 51), dtype=np.float32)
+    pred = gt.copy()
+    pred[:, 24] = 1.0
+    pred[:, 0] = 0.5
+    metrics = decoded_face_group_metrics(gt, pred)
+    assert metrics["face_rmse"] > 0
+    assert metrics["face_lip_rmse"] > 0
+    assert metrics["face_non_lip_rmse"] > 0
+    assert metrics["face_velocity_rmse"] == 0
 
 
 def test_seam_metrics_report_an_interior_normalized_excess():

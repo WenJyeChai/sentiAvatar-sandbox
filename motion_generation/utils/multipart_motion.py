@@ -12,6 +12,24 @@ from utils.constants import LEFT_HAND_JOINTS_ID, RIGHT_HAND_JOINTS_ID
 
 
 PART_ORDER: Tuple[str, ...] = ("upper", "lower", "feet", "hands")
+FACE_PART = "face"
+MULTIMODAL_PART_ORDER: Tuple[str, ...] = (*PART_ORDER, FACE_PART)
+ARKIT_BLENDSHAPE_NAMES: Tuple[str, ...] = (
+    "browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft",
+    "browOuterUpRight", "cheekPuff", "cheekSquintLeft", "cheekSquintRight",
+    "eyeBlinkLeft", "eyeBlinkRight", "eyeLookDownLeft", "eyeLookDownRight",
+    "eyeLookInLeft", "eyeLookInRight", "eyeLookOutLeft", "eyeLookOutRight",
+    "eyeLookUpLeft", "eyeLookUpRight", "eyeSquintLeft", "eyeSquintRight",
+    "eyeWideLeft", "eyeWideRight", "jawForward", "jawLeft", "jawOpen",
+    "jawRight", "mouthClose", "mouthDimpleLeft", "mouthDimpleRight",
+    "mouthFrownLeft", "mouthFrownRight", "mouthFunnel", "mouthLeft",
+    "mouthLowerDownLeft", "mouthLowerDownRight", "mouthPressLeft",
+    "mouthPressRight", "mouthPucker", "mouthRight", "mouthRollLower",
+    "mouthRollUpper", "mouthShrugLower", "mouthShrugUpper", "mouthSmileLeft",
+    "mouthSmileRight", "mouthStretchLeft", "mouthStretchRight",
+    "mouthUpperUpLeft", "mouthUpperUpRight", "noseSneerLeft", "noseSneerRight",
+)
+ARKIT_LIP_INDICES: Tuple[int, ...] = (24, 26, 31, 33, 34, 37, 39, 40, 41, 42, 47, 48)
 
 # Body feature layout is root(3) + 25 body joints * 6D rotation.
 LOWER_BODY_JOINTS: Tuple[int, ...] = (0, 1, 2, 5, 6)
@@ -40,6 +58,7 @@ PART_DIMS: Dict[str, int] = {
     "lower": 3 + len(LOWER_BODY_JOINTS) * 6,
     "feet": len(FEET_JOINTS) * 6,
     "hands": (len(LEFT_HAND_JOINTS_ID) - 1 + len(RIGHT_HAND_JOINTS_ID) - 1) * 6,
+    FACE_PART: 51,
 }
 
 
@@ -64,6 +83,18 @@ def load_motion_dict(path: Path) -> Dict[str, np.ndarray]:
         if key not in data:
             raise KeyError(f"Motion file missing key '{key}': {path}")
     return data
+
+
+def load_face_coefficients(path: Path) -> np.ndarray:
+    """Load one 51D ARKit coefficient sequence."""
+    value = np.asarray(np.load(path), dtype=np.float32)
+    if value.ndim != 2 or value.shape[1] != PART_DIMS[FACE_PART]:
+        raise ValueError(f"Expected face shape (T, 51), got {value.shape}: {path}")
+    if value.shape[0] == 0:
+        raise ValueError(f"Face sequence is empty: {path}")
+    if not np.isfinite(value).all():
+        raise ValueError(f"Face sequence contains NaN or Inf: {path}")
+    return value
 
 
 def classify_root_channel(
@@ -231,7 +262,9 @@ class PartNormalizer:
     def save(self, path: Path, metadata: Optional[Mapping[str, object]] = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {}
-        for part in PART_ORDER:
+        if set(self.mean) != set(self.std):
+            raise ValueError("Normalizer mean/std keys do not match")
+        for part in self.mean:
             payload[f"{part}_mean"] = self.mean[part].astype(np.float32)
             payload[f"{part}_std"] = self.std[part].astype(np.float32)
         np.savez(path, **payload)
@@ -242,9 +275,92 @@ class PartNormalizer:
     @classmethod
     def load(cls, path: Path) -> "PartNormalizer":
         data = np.load(path)
-        mean = {part: data[f"{part}_mean"].astype(np.float32) for part in PART_ORDER}
-        std = {part: data[f"{part}_std"].astype(np.float32) for part in PART_ORDER}
+        parts = [key[: -len("_mean")] for key in data.files if key.endswith("_mean")]
+        if not parts:
+            raise ValueError(f"No normalizer statistics found in {path}")
+        missing_std = [part for part in parts if f"{part}_std" not in data.files]
+        if missing_std:
+            raise ValueError(f"Missing std statistics for {missing_std} in {path}")
+        mean = {part: data[f"{part}_mean"].astype(np.float32) for part in parts}
+        std = {part: data[f"{part}_std"].astype(np.float32) for part in parts}
         return cls(mean=mean, std=std)
+
+
+def compute_selected_part_normalizer(
+    data_root: Path,
+    names: Sequence[str],
+    part_order: Sequence[str],
+    abs_threshold: float = 10.0,
+    max_clips: Optional[int] = None,
+) -> Tuple[PartNormalizer, Dict[str, object]]:
+    """Compute statistics for any body-part subset and/or the ARKit face stream."""
+    order = tuple(str(part) for part in part_order)
+    unknown = [part for part in order if part not in PART_DIMS]
+    if unknown:
+        raise ValueError(f"Unknown part(s): {unknown}")
+    needs_motion = any(part in PART_ORDER for part in order)
+    needs_face = FACE_PART in order
+    motion_dir = Path(data_root) / "motion_data"
+    face_dir = Path(data_root) / "arkit_data"
+    sums = {part: np.zeros(PART_DIMS[part], dtype=np.float64) for part in order}
+    sums_sq = {part: np.zeros(PART_DIMS[part], dtype=np.float64) for part in order}
+    counts = {part: 0 for part in order}
+    status: MutableMapping[str, int] = {
+        "absolute": 0,
+        "delta": 0,
+        "missing": 0,
+        "failed": 0,
+        "length_mismatch": 0,
+    }
+
+    selected = list(names[:max_clips] if max_clips is not None else names)
+    for name in selected:
+        motion_path = motion_path_for_name(motion_dir, name)
+        face_path = motion_path_for_name(face_dir, name)
+        if (needs_motion and not motion_path.exists()) or (needs_face and not face_path.exists()):
+            status["missing"] += 1
+            continue
+        try:
+            values: Dict[str, np.ndarray] = {}
+            if needs_motion:
+                motion_parts, meta = split_motion_parts(
+                    load_motion_dict(motion_path), abs_threshold=abs_threshold
+                )
+                status[str(meta["root_schema"])] += 1
+                values.update({part: motion_parts[part] for part in order if part in PART_ORDER})
+            if needs_face:
+                values[FACE_PART] = load_face_coefficients(face_path)
+            frames = min(value.shape[0] for value in values.values())
+            if any(value.shape[0] != frames for value in values.values()):
+                status["length_mismatch"] += 1
+        except Exception:
+            status["failed"] += 1
+            continue
+        for part in order:
+            value64 = np.asarray(values[part][:frames], dtype=np.float64)
+            sums[part] += value64.sum(axis=0)
+            sums_sq[part] += np.square(value64).sum(axis=0)
+            counts[part] += value64.shape[0]
+
+    mean: Dict[str, np.ndarray] = {}
+    std: Dict[str, np.ndarray] = {}
+    for part in order:
+        if counts[part] == 0:
+            raise RuntimeError(f"No frames available while computing stats for part '{part}'")
+        part_mean = sums[part] / counts[part]
+        variance = np.maximum(sums_sq[part] / counts[part] - np.square(part_mean), 1e-8)
+        mean[part] = part_mean.astype(np.float32)
+        std[part] = np.maximum(np.sqrt(variance), 1e-4).astype(np.float32)
+
+    metadata: Dict[str, object] = {
+        "part_order": list(order),
+        "part_dims": {part: PART_DIMS[part] for part in order},
+        "root_abs_threshold": abs_threshold,
+        "schema_counts": dict(status),
+        "num_requested_clips": len(selected),
+        "frame_counts": counts,
+    }
+    return PartNormalizer(mean=mean, std=std), metadata
 
 
 def compute_part_normalizer(

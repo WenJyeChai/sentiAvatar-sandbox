@@ -45,7 +45,7 @@ from scripts.train_audio_mask_multipart import (  # noqa: E402
     read_split_file,
 )
 from utils.msd.multipart_adapter import MultipartCodebookSet  # noqa: E402
-from utils.multipart_motion import PART_ORDER  # noqa: E402
+from utils.multipart_motion import MULTIMODAL_PART_ORDER, PART_ORDER  # noqa: E402
 
 
 IGNORE_INDEX = -100
@@ -1021,16 +1021,6 @@ def parse_float_list(text: str, expected: int, name: str) -> list[float]:
     return values
 
 
-def parse_int_list(text: str | Sequence[int], name: str) -> list[int]:
-    if isinstance(text, str):
-        values = [int(value.strip()) for value in text.split(",") if value.strip()]
-    else:
-        values = [int(value) for value in text]
-    if len(set(values)) != len(values):
-        raise ValueError(f"{name} must not contain duplicate values")
-    return values
-
-
 def load_yaml_defaults(path: Path) -> Dict[str, Any]:
     import yaml
 
@@ -1087,7 +1077,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--num_quantizers_per_part", type=int, default=None)
     parser.add_argument("--num_tokens_per_frame", type=int, default=None)
     codec_root = PROJECT_DIR / "checkpoints" / "multipart_rvqvae"
-    for part in PART_ORDER:
+    for part in MULTIMODAL_PART_ORDER:
         parser.add_argument(
             f"--{part}_ckpt",
             type=Path,
@@ -1106,26 +1096,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=(
             "legacy_additive",
             "routed_additive",
-            "routed_cross_attention",
         ),
         default="legacy_additive",
     )
-    parser.add_argument(
-        "--audio_adapter_layers",
-        default="",
-        help="Comma-separated one-based encoder layers, for example 4 or 3,6.",
-    )
-    parser.add_argument("--audio_adapter_dim", type=int, default=256)
-    parser.add_argument("--audio_adapter_heads", type=int, default=8)
     parser.add_argument("--audio_router_dim", type=int, default=64)
     parser.add_argument("--audio_router_embedding_dim", type=int, default=16)
     parser.add_argument("--audio_additive_gate_scale", type=float, default=0.5)
-    parser.add_argument("--audio_relative_bias_max_distance", type=int, default=16)
-    parser.add_argument(
-        "--audio_adapter_target_only",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
 
     parser.add_argument("--stage_weights", default="0.35,0.25,0.20,0.20")
     parser.add_argument("--self_forcing_warmup_ratio", type=float, default=0.10)
@@ -1193,10 +1169,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         unknown = sorted(set(defaults) - valid)
         if unknown:
             raise ValueError(f"Unknown YAML options: {', '.join(unknown)}")
-        if isinstance(defaults.get("audio_adapter_layers"), list):
-            defaults["audio_adapter_layers"] = ",".join(
-                str(value) for value in defaults["audio_adapter_layers"]
-            )
         if isinstance(defaults.get("wandb_tags"), list):
             defaults["wandb_tags"] = ",".join(str(value) for value in defaults["wandb_tags"])
         if isinstance(defaults.get("gap_bucket_weights"), list):
@@ -1237,6 +1209,121 @@ def load_pretrained_with_audio_fusion(
     return model
 
 
+def load_pretrained_with_layout_expansion(
+    checkpoint: str | Path,
+    audio_config: Mapping[str, Any],
+    *,
+    target_part_order: Sequence[str],
+    target_vocab_size: int,
+    target_tokens_per_frame: int,
+    codebook_size: int,
+) -> AudioMotionTransformer:
+    """Expand an appended-part checkpoint while preserving existing body slots."""
+    source_config = AudioMotionConfig.from_pretrained(
+        checkpoint, local_files_only=True
+    )
+    source_parts = list(
+        getattr(source_config, "part_order", None)
+        or list(target_part_order)[: int(source_config.num_parts)]
+    )
+    target_parts = [str(part) for part in target_part_order]
+    if target_parts[: len(source_parts)] != source_parts:
+        raise ValueError(
+            "Layout expansion only supports appending parts. "
+            f"Source={source_parts}, target={target_parts}"
+        )
+    if int(source_config.codebook_size) != int(codebook_size):
+        raise ValueError("Source and target codebook sizes differ")
+    source_ntpf = int(source_config.num_tokens_per_frame)
+    source_vocab = int(source_config.vocab_size)
+    expected_source_vocab = source_ntpf * int(codebook_size) + 1
+    if source_vocab != expected_source_vocab:
+        raise ValueError(
+            f"Unexpected source vocabulary {source_vocab}; expected {expected_source_vocab}"
+        )
+
+    source_model = AudioMotionTransformer.from_pretrained(
+        checkpoint, local_files_only=True
+    )
+    config_values = source_config.to_dict()
+    config_values.update(dict(audio_config))
+    config_values.update(
+        {
+            "vocab_size": int(target_vocab_size),
+            "num_tokens_per_frame": int(target_tokens_per_frame),
+            "num_parts": len(target_parts),
+            "part_order": target_parts,
+        }
+    )
+    target_config = AudioMotionConfig(**config_values)
+    target_model = AudioMotionTransformer(target_config)
+    source_state = source_model.state_dict()
+    target_state = target_model.state_dict()
+    special = {
+        "embed_tokens.weight",
+        "out_head.weight",
+        "position_emb.position_embeddings.weight",
+        "part_embedding.weight",
+        "audio_router.part_embedding.weight",
+    }
+
+    with torch.no_grad():
+        for key, source_value in source_state.items():
+            if key in special or key not in target_state:
+                continue
+            if target_state[key].shape == source_value.shape:
+                target_state[key].copy_(source_value)
+
+        old_motion_rows = source_ntpf * int(codebook_size)
+        target_state["embed_tokens.weight"][:old_motion_rows].copy_(
+            source_state["embed_tokens.weight"][:old_motion_rows]
+        )
+        target_state["out_head.weight"][:old_motion_rows].copy_(
+            source_state["out_head.weight"][:old_motion_rows]
+        )
+        target_mask = int(target_vocab_size) - 1
+        source_mask = source_vocab - 1
+        target_state["embed_tokens.weight"][target_mask].copy_(
+            source_state["embed_tokens.weight"][source_mask]
+        )
+        target_state["out_head.weight"][target_mask].copy_(
+            source_state["out_head.weight"][source_mask]
+        )
+
+        source_position = source_state["position_emb.position_embeddings.weight"]
+        target_position = target_state["position_emb.position_embeddings.weight"]
+        quantizers = int(source_config.num_quantizers_per_part)
+        source_part_count = source_ntpf // quantizers
+        for target_index in range(target_position.shape[0]):
+            frame, slot = divmod(target_index, int(target_tokens_per_frame))
+            if slot < source_ntpf:
+                source_index = frame * source_ntpf + slot
+                if source_index < source_position.shape[0]:
+                    target_position[target_index].copy_(source_position[source_index])
+            else:
+                quantizer = slot % quantizers
+                source_indices = [
+                    frame * source_ntpf + part * quantizers + quantizer
+                    for part in range(source_part_count)
+                ]
+                source_indices = [
+                    index for index in source_indices if index < source_position.shape[0]
+                ]
+                if source_indices:
+                    target_position[target_index].copy_(
+                        source_position[source_indices].mean(dim=0)
+                    )
+
+        for key in ("part_embedding.weight", "audio_router.part_embedding.weight"):
+            if key in source_state and key in target_state:
+                rows = min(source_state[key].shape[0], target_state[key].shape[0])
+                target_state[key][:rows].copy_(source_state[key][:rows])
+
+    target_model.load_state_dict(target_state)
+    del source_model, source_state, target_state
+    return target_model
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -1250,16 +1337,6 @@ def main() -> None:
         raise ValueError("soft_recovery_sigma_scale must be > 0")
     if args.min_gap_frames < 1 or args.max_gap_frames < args.min_gap_frames:
         raise ValueError("Invalid gap range")
-    adapter_layers = parse_int_list(
-        args.audio_adapter_layers, "audio_adapter_layers"
-    )
-    if args.audio_adapter_dim % args.audio_adapter_heads:
-        raise ValueError("audio_adapter_dim must be divisible by audio_adapter_heads")
-    if args.audio_fusion_mode == "routed_cross_attention" and not adapter_layers:
-        raise ValueError("routed_cross_attention requires audio_adapter_layers")
-    if args.audio_fusion_mode != "routed_cross_attention" and adapter_layers:
-        raise ValueError("audio_adapter_layers require routed_cross_attention")
-
     data_dir = Path(args.data_dir)
     token_dir = Path(
         args.motion_token_dir or data_dir / "motion_token_data_multipart_512x4"
@@ -1354,21 +1431,30 @@ def main() -> None:
         "num_quantizers_per_part": num_quantizers,
         "max_gap_frames": args.max_gap_frames,
         "audio_fusion_mode": args.audio_fusion_mode,
-        "audio_adapter_layers": adapter_layers,
-        "audio_adapter_dim": args.audio_adapter_dim,
-        "audio_adapter_heads": args.audio_adapter_heads,
         "audio_router_dim": args.audio_router_dim,
         "audio_router_embedding_dim": args.audio_router_embedding_dim,
         "audio_additive_gate_scale": args.audio_additive_gate_scale,
-        "audio_relative_bias_max_distance": args.audio_relative_bias_max_distance,
-        "audio_adapter_target_only": args.audio_adapter_target_only,
     }
     if args.model_name_or_path:
-        model = load_pretrained_with_audio_fusion(
-            args.model_name_or_path, audio_config
+        source_config = AudioMotionConfig.from_pretrained(
+            args.model_name_or_path, local_files_only=True
         )
-        if model.config.vocab_size != vocab_size or model.config.num_tokens_per_frame != ntpf:
-            raise ValueError("Checkpoint vocabulary/token layout does not match multipart data")
+        if (
+            int(source_config.vocab_size) == vocab_size
+            and int(source_config.num_tokens_per_frame) == ntpf
+        ):
+            model = load_pretrained_with_audio_fusion(
+                args.model_name_or_path, audio_config
+            )
+        else:
+            model = load_pretrained_with_layout_expansion(
+                args.model_name_or_path,
+                audio_config,
+                target_part_order=part_order,
+                target_vocab_size=vocab_size,
+                target_tokens_per_frame=ntpf,
+                codebook_size=codebook_size,
+            )
         if model.config.max_position_embeddings < max_seq_len:
             raise ValueError("Checkpoint position table is too short for max_gap_frames")
     else:
@@ -1451,9 +1537,7 @@ def main() -> None:
     print(f"Stage weights:    {stage_weights}")
     print(
         "Audio fusion:     "
-        f"mode={args.audio_fusion_mode}, layers={adapter_layers or 'none'}, "
-        f"adapter_dim={args.audio_adapter_dim}, heads={args.audio_adapter_heads}, "
-        f"target_only={args.audio_adapter_target_only}"
+        f"mode={args.audio_fusion_mode}"
     )
     print(
         "Self-forcing:     "

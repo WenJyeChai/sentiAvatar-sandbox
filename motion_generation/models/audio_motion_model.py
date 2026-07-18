@@ -16,7 +16,6 @@ import random
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers.modeling_utils import PreTrainedModel
 from transformers.integrations import use_kernel_forward_from_hub
@@ -48,14 +47,9 @@ class AudioMotionConfig(PretrainedConfig):
         num_quantizers_per_part=4,
         max_gap_frames=15,
         audio_fusion_mode="legacy_additive",
-        audio_adapter_layers=None,
-        audio_adapter_dim=256,
-        audio_adapter_heads=8,
         audio_router_dim=64,
         audio_router_embedding_dim=16,
         audio_additive_gate_scale=0.5,
-        audio_relative_bias_max_distance=16,
-        audio_adapter_target_only=True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -82,16 +76,9 @@ class AudioMotionConfig(PretrainedConfig):
         self.num_quantizers_per_part = int(num_quantizers_per_part)
         self.max_gap_frames = int(max_gap_frames)
         self.audio_fusion_mode = str(audio_fusion_mode)
-        self.audio_adapter_layers = list(audio_adapter_layers or [])
-        self.audio_adapter_dim = int(audio_adapter_dim)
-        self.audio_adapter_heads = int(audio_adapter_heads)
         self.audio_router_dim = int(audio_router_dim)
         self.audio_router_embedding_dim = int(audio_router_embedding_dim)
         self.audio_additive_gate_scale = float(audio_additive_gate_scale)
-        self.audio_relative_bias_max_distance = int(
-            audio_relative_bias_max_distance
-        )
-        self.audio_adapter_target_only = bool(audio_adapter_target_only)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -142,7 +129,6 @@ class AudioConditioningRouter(nn.Module):
         num_quantizers,
         embedding_dim,
         hidden_dim,
-        num_adapter_gates,
     ):
         super().__init__()
         self.num_quantizers = int(num_quantizers)
@@ -159,7 +145,7 @@ class AudioConditioningRouter(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
         )
-        self.output = nn.Linear(hidden_dim, 1 + num_adapter_gates)
+        self.output = nn.Linear(hidden_dim, 1)
 
     def forward(
         self,
@@ -224,89 +210,6 @@ class AudioConditioningRouter(nn.Module):
                 )
             )
         )
-
-
-class LowRankTemporalAudioAdapter(nn.Module):
-    """Low-rank multi-head cross-attention over temporally aligned audio memory."""
-
-    def __init__(
-        self,
-        hidden_size,
-        bottleneck_dim,
-        num_heads,
-        relative_bias_max_distance,
-    ):
-        super().__init__()
-        if bottleneck_dim % num_heads != 0:
-            raise ValueError("audio_adapter_dim must be divisible by audio_adapter_heads")
-        self.bottleneck_dim = int(bottleneck_dim)
-        self.num_heads = int(num_heads)
-        self.head_dim = self.bottleneck_dim // self.num_heads
-        self.max_distance = int(relative_bias_max_distance)
-        self.query_norm = nn.LayerNorm(hidden_size)
-        self.memory_norm = nn.LayerNorm(hidden_size)
-        self.query = nn.Linear(hidden_size, bottleneck_dim)
-        self.key = nn.Linear(hidden_size, bottleneck_dim)
-        self.value = nn.Linear(hidden_size, bottleneck_dim)
-        self.output = nn.Linear(bottleneck_dim, hidden_size)
-        self.relative_bias = nn.Embedding(2 * self.max_distance + 1, num_heads)
-        self.residual_scale = nn.Parameter(torch.zeros(()))
-
-    def project_memory(self, memory):
-        normalized = self.memory_norm(memory)
-        batch, frames, _ = normalized.shape
-        key = self.key(normalized).reshape(
-            batch, frames, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        value = self.value(normalized).reshape(
-            batch, frames, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        return key, value
-
-    def forward(
-        self,
-        hidden_states,
-        audio_memory,
-        token_frame_ids,
-        audio_frame_mask,
-        gate,
-        query_mask,
-        projected_memory=None,
-    ):
-        batch, sequence, _ = hidden_states.shape
-        query = self.query(self.query_norm(hidden_states)).reshape(
-            batch, sequence, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key, value = (
-            projected_memory
-            if projected_memory is not None
-            else self.project_memory(audio_memory)
-        )
-        audio_frames = key.shape[2]
-        audio_ids = torch.arange(audio_frames, device=hidden_states.device)
-        offsets = token_frame_ids[:, None] - audio_ids[None, :]
-        offsets = offsets.clamp(-self.max_distance, self.max_distance)
-        bias = self.relative_bias(offsets + self.max_distance).permute(2, 0, 1)
-        attention_bias = bias.unsqueeze(0).expand(batch, -1, -1, -1).to(query.dtype)
-        attention_bias = attention_bias.masked_fill(
-            ~audio_frame_mask[:, None, None, :],
-            torch.finfo(query.dtype).min,
-        )
-        attended = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_bias,
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        attended = attended.transpose(1, 2).reshape(
-            batch, sequence, self.bottleneck_dim
-        )
-        residual = self.output(attended)
-        residual = residual * (2.0 * torch.sigmoid(gate)).unsqueeze(-1)
-        residual = residual * query_mask.unsqueeze(-1).to(residual.dtype)
-        return hidden_states + self.residual_scale.to(residual.dtype) * residual
 
 
 class PositionEmbedding(nn.Module):
@@ -377,7 +280,6 @@ class AudioMotionTransformer(PreTrainedModel):
         self.quantizer_embedding = None
         self.stage_embedding = None
         self.audio_router = None
-        self.audio_adapters = nn.ModuleDict()
         if config.audio_fusion_mode != "legacy_additive":
             self.part_embedding = nn.Embedding(config.num_parts, config.hidden_size)
             self.quantizer_embedding = nn.Embedding(
@@ -386,22 +288,12 @@ class AudioMotionTransformer(PreTrainedModel):
             self.stage_embedding = nn.Embedding(
                 config.num_quantizers_per_part + 1, config.hidden_size
             )
-            adapter_layers = list(config.audio_adapter_layers)
             self.audio_router = AudioConditioningRouter(
                 config.num_parts,
                 config.num_quantizers_per_part,
                 config.audio_router_embedding_dim,
                 config.audio_router_dim,
-                len(adapter_layers),
             )
-            if config.audio_fusion_mode == "routed_cross_attention":
-                for layer_number in adapter_layers:
-                    self.audio_adapters[str(layer_number)] = LowRankTemporalAudioAdapter(
-                        config.hidden_size,
-                        config.audio_adapter_dim,
-                        config.audio_adapter_heads,
-                        config.audio_relative_bias_max_distance,
-                    )
 
         # Output head
         self.out_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -419,7 +311,6 @@ class AudioMotionTransformer(PreTrainedModel):
         modes = {
             "legacy_additive",
             "routed_additive",
-            "routed_cross_attention",
         }
         if self.config.audio_fusion_mode not in modes:
             raise ValueError(f"audio_fusion_mode must be one of {sorted(modes)}")
@@ -432,15 +323,6 @@ class AudioMotionTransformer(PreTrainedModel):
                 "num_tokens_per_frame must equal num_parts * "
                 "num_quantizers_per_part"
             )
-        layers = [int(value) for value in self.config.audio_adapter_layers]
-        if len(set(layers)) != len(layers):
-            raise ValueError("audio_adapter_layers must not contain duplicates")
-        if any(value < 1 or value > int(self.config.num_layers) for value in layers):
-            raise ValueError("audio_adapter_layers use one-based encoder layer numbers")
-        if self.config.audio_fusion_mode != "routed_cross_attention" and layers:
-            raise ValueError(
-                "audio_adapter_layers require audio_fusion_mode=routed_cross_attention"
-            )
 
     def _initialize_audio_identity(self):
         if self.part_embedding is not None:
@@ -449,9 +331,6 @@ class AudioMotionTransformer(PreTrainedModel):
             nn.init.zeros_(self.stage_embedding.weight)
             nn.init.zeros_(self.audio_router.output.weight)
             nn.init.zeros_(self.audio_router.output.bias)
-        for adapter in self.audio_adapters.values():
-            nn.init.zeros_(adapter.relative_bias.weight)
-            nn.init.zeros_(adapter.residual_scale)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         del gradient_checkpointing_kwargs
@@ -464,11 +343,6 @@ class AudioMotionTransformer(PreTrainedModel):
         self,
         x,
         attention_mask=None,
-        audio_memory=None,
-        audio_frame_mask=None,
-        adapter_gates=None,
-        adapter_query_mask=None,
-        adapter_memory_cache=None,
     ):
         encoder_mask = None
         key_padding_mask = None
@@ -484,43 +358,18 @@ class AudioMotionTransformer(PreTrainedModel):
                 # transformer mask rather than a batch padding mask.
                 encoder_mask = attention_mask
 
-        use_manual_layers = bool(self.audio_adapters)
-        if (self.gradient_checkpointing and self.training) or use_manual_layers:
+        if self.gradient_checkpointing and self.training:
             hidden_states = x
-            adapter_index = {
-                int(layer_number): index
-                for index, layer_number in enumerate(self.config.audio_adapter_layers)
-            }
-            for layer_number, layer in enumerate(self.encoder.layers, start=1):
-                if self.gradient_checkpointing and self.training:
-                    hidden_states = checkpoint(
-                        lambda states, layer=layer: layer(
-                            states,
-                            src_mask=encoder_mask,
-                            src_key_padding_mask=key_padding_mask,
-                        ),
-                        hidden_states,
-                        use_reentrant=False,
-                    )
-                else:
-                    hidden_states = layer(
-                        hidden_states,
+            for layer in self.encoder.layers:
+                hidden_states = checkpoint(
+                    lambda states, layer=layer: layer(
+                        states,
                         src_mask=encoder_mask,
                         src_key_padding_mask=key_padding_mask,
-                    )
-                key = str(layer_number)
-                if key in self.audio_adapters:
-                    if audio_memory is None or adapter_gates is None:
-                        raise ValueError("Audio adapters require encoded audio and gates")
-                    hidden_states = self.audio_adapters[key](
-                        hidden_states,
-                        audio_memory,
-                        self._token_frame_ids(hidden_states.shape[1], hidden_states.device),
-                        audio_frame_mask,
-                        adapter_gates[..., adapter_index[layer_number]],
-                        adapter_query_mask,
-                        projected_memory=(adapter_memory_cache or {}).get(key),
-                    )
+                    ),
+                    hidden_states,
+                    use_reentrant=False,
+                )
             if self.encoder.norm is not None:
                 hidden_states = self.encoder.norm(hidden_states)
             return hidden_states
@@ -586,26 +435,6 @@ class AudioMotionTransformer(PreTrainedModel):
                 f"Audio expands to {expanded.shape[1]} tokens but input has {seq_len}"
             )
         return expanded
-
-    def _adapter_query_mask(
-        self,
-        attention_mask,
-        middle_mask,
-        quantizer_ids,
-        stage_ids,
-        input_ids,
-    ):
-        valid = (
-            torch.ones_like(input_ids, dtype=torch.bool)
-            if attention_mask is None
-            else attention_mask.to(dtype=torch.bool)
-        )
-        if not self.config.audio_adapter_target_only:
-            return valid
-        if middle_mask is None:
-            return valid
-        target_quantizer = quantizer_ids.unsqueeze(0).eq(stage_ids.unsqueeze(1))
-        return valid & middle_mask.to(dtype=torch.bool) & target_quantizer
 
     def _slot_valid_mask(self, seq_len, device):
         """Return valid vocab ids for each motion-token slot.
@@ -675,7 +504,6 @@ class AudioMotionTransformer(PreTrainedModel):
         c2f_stage=None,
         audio_uncertainty=None,
         encoded_audio=None,
-        adapter_memory_cache=None,
     ):
         """
         Args:
@@ -716,7 +544,7 @@ class AudioMotionTransformer(PreTrainedModel):
                 + self.quantizer_embedding(quantizer_ids).unsqueeze(0)
                 + self.stage_embedding(stage_ids).unsqueeze(1)
             )
-            audio_frame_mask, gaps = self._frame_masks_and_gaps(
+            _, gaps = self._frame_masks_and_gaps(
                 input_ids, attention_mask, gap_lengths
             )
             frame_ids = self._token_frame_ids(input_ids.shape[1], input_ids.device)
@@ -736,42 +564,14 @@ class AudioMotionTransformer(PreTrainedModel):
                 x = x + additive_gate.unsqueeze(-1) * self._expand_audio_memory(
                     audio_memory, x.shape[1]
                 )
-            adapter_gates = gate_logits[..., 1:] if self.audio_adapters else None
-            adapter_query_mask = (
-                self._adapter_query_mask(
-                    attention_mask,
-                    middle_mask,
-                    quantizer_ids,
-                    stage_ids,
-                    input_ids,
-                )
-                if self.audio_adapters
-                else None
-            )
             with torch.no_grad():
                 self.last_audio_conditioning_stats["additive_gate_mean"] = (
                     additive_gate.detach().float().mean()
                 )
-                for index, layer_number in enumerate(self.config.audio_adapter_layers):
-                    gate = 2.0 * torch.sigmoid(adapter_gates[..., index])
-                    self.last_audio_conditioning_stats[
-                        f"adapter_layer{layer_number}_gate_mean"
-                    ] = gate.detach().float().mean()
-                    self.last_audio_conditioning_stats[
-                        f"adapter_layer{layer_number}_scale"
-                    ] = self.audio_adapters[str(layer_number)].residual_scale.detach().float()
 
         # Normalize and encode
         x = self.norm(x)
-        output = self._run_encoder(
-            x,
-            attention_mask,
-            audio_memory=audio_memory,
-            audio_frame_mask=(audio_frame_mask if self.audio_adapters else None),
-            adapter_gates=(adapter_gates if self.audio_adapters else None),
-            adapter_query_mask=(adapter_query_mask if self.audio_adapters else None),
-            adapter_memory_cache=adapter_memory_cache,
-        )
+        output = self._run_encoder(x, attention_mask)
 
         # Get logits
         logits = self.out_head(output)  # (B, seq_len, vocab_size)
@@ -850,10 +650,6 @@ class AudioMotionTransformer(PreTrainedModel):
                 gap_lengths, dtype=torch.long, device=device
             )
         encoded_audio = self.audio_encoder(audio_features)
-        adapter_memory_cache = {
-            key: adapter.project_memory(encoded_audio)
-            for key, adapter in self.audio_adapters.items()
-        }
 
         ntpf = int(self.config.num_tokens_per_frame)
         quantizers = int(getattr(self.config, "num_quantizers_per_part", 1))
@@ -881,7 +677,6 @@ class AudioMotionTransformer(PreTrainedModel):
                 gap_lengths=gap_lengths,
                 c2f_stage=quantizer,
                 encoded_audio=encoded_audio,
-                adapter_memory_cache=adapter_memory_cache,
             )
             predictions = logits.argmax(dim=-1)
             output_ids[fill] = predictions[fill]

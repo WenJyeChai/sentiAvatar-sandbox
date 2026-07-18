@@ -20,8 +20,11 @@ from tqdm.auto import tqdm
 
 from models.audio_motion_model import AudioMotionConfig, AudioMotionTransformer
 from utils.multipart_motion import (
+    ARKIT_LIP_INDICES,
+    FACE_PART,
     PART_ORDER,
     canonicalize_body_root,
+    load_face_coefficients,
     merge_parts_to_legacy_motion,
     motion_path_for_name,
 )
@@ -41,7 +44,6 @@ class InfillModelSpec:
     generate_steps: int = 1
     audio_input_mode: str = "correct"
     audio_ablation_seed: int = 42
-    disable_audio_adapters: bool = False
 
     def supports_gap(self, gap: int) -> bool:
         return int(gap) in self.allowed_gaps
@@ -392,14 +394,6 @@ def infer_window_records(
 ) -> list[np.ndarray]:
     if not records:
         return []
-    if spec.disable_audio_adapters:
-        if not model.audio_adapters:
-            raise ValueError(
-                f"{spec.name} requests disabled adapters but the model has none"
-            )
-        with torch.no_grad():
-            for adapter in model.audio_adapters.values():
-                adapter.residual_scale.zero_()
     collator = VariableGapC2FCollator(model.config)
     ntpf = int(model.config.num_tokens_per_frame)
     codebook_size = int(model.config.codebook_size)
@@ -453,14 +447,15 @@ def infer_window_records(
 
 
 @torch.no_grad()
-def decode_multipart_token_batch(
+def decode_multipart_part_batch(
     frame_batch: Sequence[Sequence[Sequence[int]]] | np.ndarray,
     codecs: Mapping[str, LoadedPartCodec],
     device: torch.device,
     *,
-    part_order: Sequence[str] = PART_ORDER,
+    part_order: Optional[Sequence[str]] = None,
     clip_invalid: bool = True,
-) -> list[np.ndarray]:
+) -> Dict[str, np.ndarray]:
+    part_order = tuple(part_order or codecs.keys())
     arr = np.asarray(frame_batch, dtype=np.int64)
     if arr.ndim != 3:
         raise ValueError(f"Expected token frames shaped (B, T, slots), got {arr.shape}")
@@ -482,12 +477,37 @@ def decode_multipart_token_batch(
         reconstructed = loaded.model.decode({part: indices})[part]
         reconstructed = loaded.normalizer.denormalize_tensor(part, reconstructed)
         part_features[part] = reconstructed.float().cpu().numpy()
+    return part_features
+
+
+def merge_decoded_part_batch(part_features: Mapping[str, np.ndarray]) -> list[np.ndarray]:
+    batch_size = next(iter(part_features.values())).shape[0]
     return [
         merge_parts_to_legacy_motion(
             {part: values[batch_idx] for part, values in part_features.items()}
         )["body"].astype(np.float32)
-        for batch_idx in range(arr.shape[0])
+        for batch_idx in range(batch_size)
     ]
+
+
+@torch.no_grad()
+def decode_multipart_token_batch(
+    frame_batch: Sequence[Sequence[Sequence[int]]] | np.ndarray,
+    codecs: Mapping[str, LoadedPartCodec],
+    device: torch.device,
+    *,
+    part_order: Optional[Sequence[str]] = None,
+    clip_invalid: bool = True,
+) -> list[np.ndarray]:
+    part_order = tuple(part_order or codecs.keys())
+    part_features = decode_multipart_part_batch(
+        frame_batch,
+        codecs,
+        device,
+        part_order=part_order,
+        clip_invalid=clip_invalid,
+    )
+    return merge_decoded_part_batch(part_features)
 
 
 @torch.no_grad()
@@ -496,7 +516,7 @@ def decode_multipart_tokens(
     codecs: Mapping[str, LoadedPartCodec],
     device: torch.device,
     *,
-    part_order: Sequence[str] = PART_ORDER,
+    part_order: Optional[Sequence[str]] = None,
     clip_invalid: bool = True,
 ) -> np.ndarray:
     arr = np.asarray(frames, dtype=np.int64)
@@ -516,22 +536,24 @@ def invalid_token_fraction(frames: np.ndarray, codebook_size: int) -> float:
     return float(np.mean((arr < 0) | (arr >= codebook_size)))
 
 
-def decoded_feature_metrics(gt: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
+def decoded_feature_metrics(
+    gt: np.ndarray, pred: np.ndarray, *, prefix: str = "body"
+) -> Dict[str, float]:
     gt64 = np.asarray(gt, dtype=np.float64)
     pred64 = np.asarray(pred, dtype=np.float64)
     length = min(len(gt64), len(pred64))
     gt64, pred64 = gt64[:length], pred64[:length]
     diff = pred64 - gt64
     result = {
-        "body_mae": float(np.mean(np.abs(diff))),
-        "body_rmse": float(np.sqrt(np.mean(np.square(diff)))),
+        f"{prefix}_mae": float(np.mean(np.abs(diff))),
+        f"{prefix}_rmse": float(np.sqrt(np.mean(np.square(diff)))),
     }
     for order, label in ((1, "velocity"), (2, "acceleration"), (3, "jerk")):
         if length > order:
             delta = np.diff(pred64, n=order, axis=0) - np.diff(gt64, n=order, axis=0)
-            result[f"body_{label}_rmse"] = float(np.sqrt(np.mean(np.square(delta))))
+            result[f"{prefix}_{label}_rmse"] = float(np.sqrt(np.mean(np.square(delta))))
         else:
-            result[f"body_{label}_rmse"] = np.nan
+            result[f"{prefix}_{label}_rmse"] = np.nan
     return result
 
 
@@ -542,10 +564,13 @@ def window_metric_row(
     device: torch.device,
     *,
     model_name: str,
-    part_order: Sequence[str] = PART_ORDER,
+    part_order: Optional[Sequence[str]] = None,
     decoded_gt: Optional[np.ndarray] = None,
     decoded_pred: Optional[np.ndarray] = None,
+    decoded_face_gt: Optional[np.ndarray] = None,
+    decoded_face_pred: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
+    part_order = tuple(part_order or codecs.keys())
     gt = np.asarray(record.example.motion_tokens[1:-1], dtype=np.int64)
     predicted = np.asarray(predicted, dtype=np.int64)
     codebook_size = int(next(iter(codecs.values())).codebook_size)
@@ -574,7 +599,56 @@ def window_metric_row(
             predicted, codecs, device, part_order=part_order
         )
     row.update(decoded_feature_metrics(decoded_gt, decoded_pred))
+    if FACE_PART in part_order:
+        if decoded_face_gt is None or decoded_face_pred is None:
+            decoded_parts = decode_multipart_part_batch(
+                np.stack([gt, predicted]),
+                codecs,
+                device,
+                part_order=part_order,
+            )
+            decoded_face_gt, decoded_face_pred = decoded_parts[FACE_PART]
+        row.update(decoded_face_group_metrics(decoded_face_gt, decoded_face_pred))
     return row
+
+
+@torch.no_grad()
+def evaluate_face_codec_reconstruction(
+    sequences: Sequence[Mapping[str, Any]],
+    codecs: Mapping[str, LoadedPartCodec],
+    face_dir: Path,
+    device: torch.device,
+    *,
+    part_order: Optional[Sequence[str]] = None,
+    max_clips: Optional[int] = None,
+) -> pd.DataFrame:
+    """Compare decoded face tokens with the released 20 FPS ARKit coefficients."""
+    part_order = tuple(part_order or codecs.keys())
+    if FACE_PART not in part_order:
+        raise ValueError("Face codec reconstruction requires a face part")
+    rows: list[Dict[str, Any]] = []
+    selected = sequences[:max_clips] if max_clips is not None else sequences
+    for item in tqdm(selected, desc="face codec reconstruction", leave=False):
+        path = motion_path_for_name(Path(face_dir), str(item["name"]))
+        if not path.exists():
+            continue
+        raw = load_face_coefficients(path)
+        token_frames = np.asarray(item["motion_tokens"], dtype=np.int64)
+        decoded = decode_multipart_part_batch(
+            token_frames[None], codecs, device, part_order=part_order
+        )[FACE_PART][0]
+        length = min(len(raw), len(decoded))
+        if length < 2:
+            continue
+        row: Dict[str, Any] = {
+            "name": item["name"],
+            "raw_frames": len(raw),
+            "decoded_frames": len(decoded),
+            "compared_frames": length,
+        }
+        row.update(decoded_face_group_metrics(raw[:length], decoded[:length]))
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def evaluate_model_windows(
@@ -589,7 +663,9 @@ def evaluate_model_windows(
     windows_per_clip: int = 1,
     seed: int = 42,
     slot_constrained: bool = False,
+    part_order: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
+    part_order = tuple(part_order or codecs.keys())
     rows: list[Dict[str, Any]] = []
     for gap in gaps:
         if not spec.supports_gap(gap):
@@ -619,9 +695,11 @@ def evaluate_model_windows(
                 [np.asarray(record.example.motion_tokens[1:-1]) for record in record_batch]
             )
             pred_batch = np.stack(prediction_batch)
-            decoded = decode_multipart_token_batch(
-                np.concatenate([gt_batch, pred_batch], axis=0), codecs, device
+            combined_tokens = np.concatenate([gt_batch, pred_batch], axis=0)
+            decoded_parts = decode_multipart_part_batch(
+                combined_tokens, codecs, device, part_order=part_order
             )
+            decoded = merge_decoded_part_batch(decoded_parts)
             split = len(record_batch)
             rows.extend(
                 window_metric_row(
@@ -630,8 +708,19 @@ def evaluate_model_windows(
                     codecs,
                     device,
                     model_name=spec.name,
+                    part_order=part_order,
                     decoded_gt=decoded[row_idx],
                     decoded_pred=decoded[split + row_idx],
+                    decoded_face_gt=(
+                        decoded_parts[FACE_PART][row_idx]
+                        if FACE_PART in part_order
+                        else None
+                    ),
+                    decoded_face_pred=(
+                        decoded_parts[FACE_PART][split + row_idx]
+                        if FACE_PART in part_order
+                        else None
+                    ),
                 )
                 for row_idx, (record, prediction) in enumerate(
                     zip(record_batch, prediction_batch)
@@ -1312,6 +1401,27 @@ def compute_gap_dynamics_table(
             result[f"{metric}_ratio_to_codec"] = result[metric] / max(
                 denominator, 1e-12
             )
+    return result
+
+
+def decoded_face_group_metrics(gt: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
+    gt_arr = np.asarray(gt)
+    pred_arr = np.asarray(pred)
+    lip_set = set(ARKIT_LIP_INDICES)
+    lip = np.asarray(ARKIT_LIP_INDICES, dtype=np.int64)
+    non_lip = np.asarray(
+        [index for index in range(gt_arr.shape[-1]) if index not in lip_set],
+        dtype=np.int64,
+    )
+    result = decoded_feature_metrics(gt_arr, pred_arr, prefix=FACE_PART)
+    result.update(
+        decoded_feature_metrics(gt_arr[:, lip], pred_arr[:, lip], prefix="face_lip")
+    )
+    result.update(
+        decoded_feature_metrics(
+            gt_arr[:, non_lip], pred_arr[:, non_lip], prefix="face_non_lip"
+        )
+    )
     return result
 
 

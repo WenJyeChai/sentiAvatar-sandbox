@@ -4,11 +4,9 @@ experiment:
 
 audio_conditioning:
   audio_fusion_mode: routed_additive
-  audio_adapter_layers: []
   audio_router_dim: 64
   audio_router_embedding_dim: 16
   audio_additive_gate_scale: 0.5
-  audio_adapter_target_only: true
 
 data:
   data_dir: SuSuInterActs/SuSuInterActs
@@ -55,4 +53,3 @@ monitoring:
   wandb_mode: online
   wandb_run_name: audio_routed_additive_gap1_15
   wandb_tags: [audio_conditioning, routed_additive, fixed_targets, no_sf]
-
