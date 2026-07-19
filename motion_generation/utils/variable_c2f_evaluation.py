@@ -1036,9 +1036,14 @@ def load_evaluator_motion_encoder(
     evaluator_config: Path,
     device: torch.device,
 ):
+    evaluator_config = require_path(evaluator_config, "evaluator config").resolve()
+    project_root = evaluator_config.parent.parent.parent
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+
     from evaluation.models.actor import ACTORStyleEncoder
 
-    cfg = load_yaml_namespace(require_path(evaluator_config, "evaluator config"))
+    cfg = load_yaml_namespace(evaluator_config)
     encoder = ACTORStyleEncoder(
         cfg.motion_encoder.nfeats,
         cfg.motion_encoder.vae,
