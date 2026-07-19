@@ -648,10 +648,6 @@ def save_face_infill_animation(
     high = finite.max(axis=0) if len(finite) else np.array([1.0, 1.0])
     center = (low + high) / 2
     radius = max(float(np.max(high - low)) * 0.55, 0.5)
-    face_low, face_high = _face_limits(comparison.faces)
-    selected = [ARKIT_BLENDSHAPE_NAMES.index(name) for name in DISPLAY_FACE_CHANNELS]
-    lip_set = set(ARKIT_LIP_INDICES)
-    bar_colors = ["#d95f59" if idx in lip_set else "#4c78a8" for idx in selected]
     edges = _skeleton_edges()
 
     fig, axes = plt.subplots(2, len(variants), figsize=(4.0 * len(variants), 7.0))
@@ -872,6 +868,190 @@ def plot_tiled_full_clip_summary(
     return fig
 
 
+class _ArkitFaceGlyph:
+    """Lightweight 2D diagnostic driven directly by 51 ARKit coefficients."""
+
+    def __init__(self, axis: Any) -> None:
+        from matplotlib.patches import Ellipse, Polygon
+
+        self.axis = axis
+        axis.set_xlim(-1.0, 1.0)
+        axis.set_ylim(-1.15, 1.15)
+        axis.set_aspect("equal")
+        axis.set_xticks([])
+        axis.set_yticks([])
+        axis.set_title("Schematic ARKit face", fontsize=9)
+
+        skin = "#f1c7a5"
+        self.head = Ellipse((0.0, 0.0), 1.62, 2.08, facecolor=skin, edgecolor="#3a302b", linewidth=1.8)
+        self.left_cheek = Ellipse((-0.56, -0.05), 0.30, 0.22, facecolor="#e98f88", edgecolor="none", alpha=0.0)
+        self.right_cheek = Ellipse((0.56, -0.05), 0.30, 0.22, facecolor="#e98f88", edgecolor="none", alpha=0.0)
+        self.left_eye = Ellipse((-0.35, 0.30), 0.34, 0.13, facecolor="white", edgecolor="#292929", linewidth=1.4)
+        self.right_eye = Ellipse((0.35, 0.30), 0.34, 0.13, facecolor="white", edgecolor="#292929", linewidth=1.4)
+        self.left_pupil = Ellipse((-0.35, 0.30), 0.075, 0.075, facecolor="#202020", edgecolor="none")
+        self.right_pupil = Ellipse((0.35, 0.30), 0.075, 0.075, facecolor="#202020", edgecolor="none")
+        self.mouth = Polygon(
+            [(-0.32, -0.43), (0.0, -0.38), (0.32, -0.43), (0.0, -0.48)],
+            closed=True,
+            facecolor="#4a1518",
+            edgecolor="#9b3f48",
+            linewidth=2.0,
+        )
+        for patch in (
+            self.head,
+            self.left_cheek,
+            self.right_cheek,
+            self.left_eye,
+            self.right_eye,
+            self.left_pupil,
+            self.right_pupil,
+            self.mouth,
+        ):
+            axis.add_patch(patch)
+
+        self.left_brow = axis.plot([], [], color="#4a342a", linewidth=3.0, solid_capstyle="round")[0]
+        self.right_brow = axis.plot([], [], color="#4a342a", linewidth=3.0, solid_capstyle="round")[0]
+        self.nose = axis.plot([0.0, -0.04, 0.0, 0.06], [0.18, -0.02, -0.12, -0.14], color="#8c6652", linewidth=1.4)[0]
+        self.mouth_midline = axis.plot([], [], color="#e7a0a4", linewidth=1.0)[0]
+        self.status = axis.text(
+            0.0,
+            -1.06,
+            "",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            color="#333333",
+        )
+        self.artists = [
+            self.head,
+            self.left_cheek,
+            self.right_cheek,
+            self.left_eye,
+            self.right_eye,
+            self.left_pupil,
+            self.right_pupil,
+            self.mouth,
+            self.left_brow,
+            self.right_brow,
+            self.nose,
+            self.mouth_midline,
+            self.status,
+        ]
+
+    @staticmethod
+    def _values(coefficients: np.ndarray) -> Dict[str, float]:
+        value = np.asarray(coefficients, dtype=np.float32)
+        return {
+            name: max(0.0, float(value[idx]))
+            for idx, name in enumerate(ARKIT_BLENDSHAPE_NAMES)
+        }
+
+    def update(self, coefficients: np.ndarray) -> list[Any]:
+        values = self._values(coefficients)
+
+        puff = min(1.5, values["cheekPuff"])
+        self.head.set_width(1.62 + 0.08 * puff)
+        self.left_cheek.set_alpha(min(0.55, 0.08 + 0.40 * puff + 0.20 * values["cheekSquintLeft"]))
+        self.right_cheek.set_alpha(min(0.55, 0.08 + 0.40 * puff + 0.20 * values["cheekSquintRight"]))
+
+        eye_specs = (
+            (
+                self.left_eye,
+                self.left_pupil,
+                -0.35,
+                values["eyeBlinkLeft"],
+                values["eyeWideLeft"],
+                values["eyeSquintLeft"],
+                values["eyeLookOutLeft"] - values["eyeLookInLeft"],
+                values["eyeLookUpLeft"] - values["eyeLookDownLeft"],
+            ),
+            (
+                self.right_eye,
+                self.right_pupil,
+                0.35,
+                values["eyeBlinkRight"],
+                values["eyeWideRight"],
+                values["eyeSquintRight"],
+                values["eyeLookInRight"] - values["eyeLookOutRight"],
+                values["eyeLookUpRight"] - values["eyeLookDownRight"],
+            ),
+        )
+        for eye, pupil, base_x, blink, wide, squint, gaze_x, gaze_y in eye_specs:
+            aperture = np.clip(0.13 * (1.0 - blink) + 0.08 * wide - 0.05 * squint, 0.012, 0.24)
+            eye.set_center((base_x, 0.30))
+            eye.set_height(float(aperture))
+            pupil.set_center((base_x + 0.055 * np.clip(gaze_x, -1, 1), 0.30 + 0.045 * np.clip(gaze_y, -1, 1)))
+            pupil.set_height(float(min(0.075, aperture * 0.75)))
+            pupil.set_alpha(float(np.clip((aperture - 0.01) / 0.07, 0.0, 1.0)))
+
+        brow_inner = values["browInnerUp"]
+        left_outer_y = 0.57 + 0.15 * values["browOuterUpLeft"] - 0.13 * values["browDownLeft"]
+        right_outer_y = 0.57 + 0.15 * values["browOuterUpRight"] - 0.13 * values["browDownRight"]
+        left_inner_y = 0.56 + 0.17 * brow_inner - 0.10 * values["browDownLeft"]
+        right_inner_y = 0.56 + 0.17 * brow_inner - 0.10 * values["browDownRight"]
+        self.left_brow.set_data([-0.60, -0.14], [left_outer_y, left_inner_y])
+        self.right_brow.set_data([0.14, 0.60], [right_inner_y, right_outer_y])
+
+        jaw_open = values["jawOpen"]
+        mouth_close = values["mouthClose"]
+        funnel = values["mouthFunnel"]
+        pucker = values["mouthPucker"]
+        stretch = 0.5 * (values["mouthStretchLeft"] + values["mouthStretchRight"])
+        smile_left = values["mouthSmileLeft"]
+        smile_right = values["mouthSmileRight"]
+        frown_left = values["mouthFrownLeft"]
+        frown_right = values["mouthFrownRight"]
+        mouth_shift = 0.10 * (values["mouthRight"] - values["mouthLeft"])
+        mouth_shift += 0.08 * (values["jawRight"] - values["jawLeft"])
+        width = np.clip(
+            0.62 + 0.25 * stretch + 0.08 * (smile_left + smile_right) - 0.27 * pucker - 0.20 * funnel,
+            0.22,
+            0.92,
+        )
+        height = np.clip(
+            0.045 + 0.34 * jaw_open + 0.14 * funnel - 0.10 * mouth_close,
+            0.018,
+            0.48,
+        )
+        center_y = -0.42 - 0.08 * jaw_open
+        left_y = center_y + 0.14 * smile_left - 0.13 * frown_left
+        right_y = center_y + 0.14 * smile_right - 0.13 * frown_right
+        upper_y = center_y + height / 2 + 0.06 * (
+            values["mouthUpperUpLeft"] + values["mouthUpperUpRight"]
+        )
+        lower_y = center_y - height / 2 - 0.06 * (
+            values["mouthLowerDownLeft"] + values["mouthLowerDownRight"]
+        )
+        left_x, right_x = mouth_shift - width / 2, mouth_shift + width / 2
+        self.mouth.set_xy(
+            np.asarray(
+                [
+                    [left_x, left_y],
+                    [mouth_shift, upper_y],
+                    [right_x, right_y],
+                    [mouth_shift, lower_y],
+                ]
+            )
+        )
+        self.mouth_midline.set_data(
+            [left_x + 0.05 * width, mouth_shift, right_x - 0.05 * width],
+            [left_y, center_y, right_y],
+        )
+
+        sneer = values["noseSneerLeft"] - values["noseSneerRight"]
+        self.nose.set_data(
+            [0.0, -0.04, 0.0, 0.06],
+            [0.18, -0.02, -0.12 + 0.03 * sneer, -0.14 - 0.03 * sneer],
+        )
+        ranked = np.argsort(np.asarray(coefficients, dtype=np.float32))[-3:][::-1]
+        active = " | ".join(
+            f"{ARKIT_BLENDSHAPE_NAMES[idx]} {float(coefficients[idx]):.2f}"
+            for idx in ranked
+        )
+        self.status.set_text(active)
+        return self.artists
+
+
 def save_tiled_full_clip_video(
     comparison: FullClipFaceInfillComparison,
     output_path: Path,
@@ -912,7 +1092,7 @@ def save_tiled_full_clip_video(
     face_axes = [fig.add_subplot(grid[1, col]) for col in range(len(variants))]
     timeline_axis = fig.add_subplot(grid[2, :])
     body_lines: Dict[str, list[Any]] = {}
-    face_bars: Dict[str, Any] = {}
+    face_glyphs: Dict[str, _ArkitFaceGlyph] = {}
     for col, label in enumerate(variants):
         body_axis = body_axes[col]
         body_axis.set_xlim(center[0] - radius, center[0] + radius)
@@ -935,15 +1115,7 @@ def save_tiled_full_clip_video(
         ]
 
         face_axis = face_axes[col]
-        face_bars[label] = face_axis.barh(
-            np.arange(len(selected)), np.zeros(len(selected)), color=bar_colors
-        )
-        face_axis.set_xlim(face_low, face_high)
-        face_axis.set_yticks(np.arange(len(selected)))
-        face_axis.set_yticklabels(DISPLAY_FACE_CHANNELS, fontsize=7)
-        face_axis.invert_yaxis()
-        face_axis.grid(axis="x", alpha=0.2)
-        face_axis.set_xlabel("ARKit coefficient")
+        face_glyphs[label] = _ArkitFaceGlyph(face_axis)
 
     x = np.arange(comparison.frames)
     envelope = _audio_rms_envelope(
@@ -990,10 +1162,7 @@ def save_tiled_full_clip_video(
             for line, (parent, child) in zip(body_lines[label], edges):
                 line.set_data(points[[parent, child], 0], points[[parent, child], 1])
                 artists.append(line)
-            values = comparison.faces[label][frame_idx, selected]
-            for bar, value in zip(face_bars[label], values):
-                bar.set_width(float(value))
-                artists.append(bar)
+            artists.extend(face_glyphs[label].update(comparison.faces[label][frame_idx]))
             background = "#fff0ed" if generated else "#f5f5f3"
             body_axes[col].set_facecolor(background)
             face_axes[col].set_facecolor(background)
