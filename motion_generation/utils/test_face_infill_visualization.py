@@ -14,7 +14,9 @@ if str(MOTION_GENERATION_DIR) not in sys.path:
 
 from utils.face_infill_visualization import (
     FaceInfillVisualComparison,
+    FullClipFaceInfillComparison,
     plot_face_infill_summary,
+    plot_tiled_full_clip_summary,
     save_face_infill_animation,
     select_representative_clip_row,
     select_representative_window_rows,
@@ -110,3 +112,33 @@ def test_static_and_animated_visualizations_write_files(tmp_path):
     assert png_path.exists() and png_path.stat().st_size > 0
     save_face_infill_animation(comparison, gif_path, frame_step=2)
     assert gif_path.exists() and gif_path.stat().st_size > 0
+
+
+def test_tiled_full_clip_summary_supports_body_only(tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    frames = 8
+    variants = ("Raw GT", "Codec GT", "Body soft recovery")
+    positions = {
+        label: np.zeros((frames, 63, 3), dtype=np.float32)
+        for label in variants
+    }
+    body_features = {
+        label: np.zeros((frames, 153), dtype=np.float32)
+        for label in variants
+    }
+    comparison = FullClipFaceInfillComparison(
+        name="session/body_only",
+        gap=3,
+        fps=20,
+        source_token_frames=4,
+        positions=positions,
+        faces={},
+        body_features=body_features,
+        metrics={label: {"body_rmse": 0.0} for label in variants},
+        generated_mask=np.asarray([False, False, True, True, True, True, False, False]),
+    )
+    output_path = tmp_path / "body_only.png"
+    figure = plot_tiled_full_clip_summary(comparison, output_path=output_path)
+    assert figure is not None
+    assert output_path.exists() and output_path.stat().st_size > 0

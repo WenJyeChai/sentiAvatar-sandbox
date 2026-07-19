@@ -21,7 +21,6 @@ from utils.constants import (
 from utils.fk_model import WorldPosFromQuat
 from utils.multipart_motion import (
     ARKIT_BLENDSHAPE_NAMES,
-    ARKIT_LIP_INDICES,
     FACE_PART,
     MULTIMODAL_PART_ORDER,
     canonicalize_body_root,
@@ -350,14 +349,15 @@ def prepare_tiled_full_clip_comparison(
     device: torch.device,
     template_bvh: Path,
     motion_dir: Path,
-    face_dir: Path,
+    face_dir: Path | None = None,
     batch_size: int = 32,
     fps: int = 20,
     part_order: Sequence[str] = MULTIMODAL_PART_ORDER,
 ) -> FullClipFaceInfillComparison:
-    """Generate every tiled interior gap while retaining anchors and clip tail."""
-    if FACE_PART not in part_order:
-        raise ValueError("Full-clip face visualization requires the face RVQ part")
+    """Generate tiled body or body+face infills while retaining anchors and clip tail."""
+    face_enabled = FACE_PART in part_order
+    if face_enabled and face_dir is None:
+        raise ValueError("face_dir is required when face is present in part_order")
     sequence = [item]
     records = tiled_gap_windows(sequence, int(gap))
     if not records:
@@ -415,23 +415,31 @@ def prepare_tiled_full_clip_comparison(
         )
         for idx, label in enumerate(labels)
     }
-    decoded_faces = {
-        label: np.asarray(decoded_parts[FACE_PART][idx], dtype=np.float32)
-        for idx, label in enumerate(labels)
-    }
+    decoded_faces = (
+        {
+            label: np.asarray(decoded_parts[FACE_PART][idx], dtype=np.float32)
+            for idx, label in enumerate(labels)
+        }
+        if face_enabled
+        else {}
+    )
 
     name = str(item["name"])
     raw_motion = load_motion_dict(motion_path_for_name(Path(motion_dir), name))
     canonical_body, _, _ = canonicalize_body_root(raw_motion["body"])
-    raw_face = load_face_coefficients(motion_path_for_name(Path(face_dir), name))
-    frames = min(
+    frame_limits = [
         min(len(value["body"]) for value in decoded_motions.values()),
-        min(len(value) for value in decoded_faces.values()),
         len(canonical_body),
         len(raw_motion["left"]),
         len(raw_motion["right"]),
-        len(raw_face),
-    )
+    ]
+    raw_face: np.ndarray | None = None
+    if face_enabled:
+        raw_face = load_face_coefficients(motion_path_for_name(Path(face_dir), name))
+        frame_limits.extend(
+            [min(len(value) for value in decoded_faces.values()), len(raw_face)]
+        )
+    frames = min(frame_limits)
     if frames < 2:
         raise ValueError(f"Not enough aligned full-clip frames for {name}")
 
@@ -442,16 +450,17 @@ def prepare_tiled_full_clip_comparison(
     }
     motions: Dict[str, Mapping[str, np.ndarray]] = {"Raw GT": raw_gt_motion}
     body_features: Dict[str, np.ndarray] = {"Raw GT": raw_gt_motion["body"]}
-    faces: Dict[str, np.ndarray] = {
-        "Raw GT": np.asarray(raw_face[:frames], dtype=np.float32)
-    }
+    faces: Dict[str, np.ndarray] = {}
+    if raw_face is not None:
+        faces["Raw GT"] = np.asarray(raw_face[:frames], dtype=np.float32)
     for label in labels:
         motions[label] = {
             key: np.asarray(value[:frames], dtype=np.float32)
             for key, value in decoded_motions[label].items()
         }
         body_features[label] = motions[label]["body"]
-        faces[label] = decoded_faces[label][:frames]
+        if face_enabled:
+            faces[label] = decoded_faces[label][:frames]
 
     positions = _motion_positions(
         motions,
@@ -459,14 +468,18 @@ def prepare_tiled_full_clip_comparison(
         device=device,
     )
     raw_body_value = body_features["Raw GT"]
-    raw_face_value = faces["Raw GT"]
-    metrics = {
-        label: {
-            "body_rmse": 0.0 if label == "Raw GT" else _rmse(raw_body_value, body_features[label]),
-            "face_rmse": 0.0 if label == "Raw GT" else _rmse(raw_face_value, faces[label]),
+    metrics: Dict[str, Dict[str, float]] = {}
+    for label in positions:
+        value = {
+            "body_rmse": 0.0
+            if label == "Raw GT"
+            else _rmse(raw_body_value, body_features[label])
         }
-        for label in positions
-    }
+        if face_enabled:
+            value["face_rmse"] = (
+                0.0 if label == "Raw GT" else _rmse(faces["Raw GT"], faces[label])
+            )
+        metrics[label] = value
 
     token_generated = np.zeros(len(codec_gt), dtype=bool)
     for record in records:
@@ -772,7 +785,7 @@ def plot_tiled_full_clip_summary(
     keyframes: int = 7,
     output_path: Path | None = None,
 ):
-    """Plot body keyframes and full-clip ARKit heatmaps for one gap setting."""
+    """Plot body keyframes and, when available, full-clip ARKit heatmaps."""
     import matplotlib.pyplot as plt
 
     variants = comparison.variants
@@ -788,20 +801,28 @@ def plot_tiled_full_clip_summary(
     high = finite.max(axis=0) if len(finite) else np.array([1.0, 1.0])
     center = (low + high) / 2
     radius = max(float(np.max(high - low)) * 0.55, 0.5)
-    face_low, face_high = _face_limits(comparison.faces)
+    has_face = bool(comparison.faces)
+    face_low, face_high = _face_limits(comparison.faces) if has_face else (0.0, 1.0)
     edges = _skeleton_edges()
     generated_runs = _true_runs(comparison.generated_mask)
 
-    fig = plt.figure(figsize=(3.5 * keyframes + 7.0, 3.0 * len(variants)))
+    extra_columns = 1 if has_face else 0
+    fig = plt.figure(
+        figsize=(3.5 * keyframes + (7.0 if has_face else 0.0), 3.0 * len(variants))
+    )
     grid = fig.add_gridspec(
         len(variants),
-        keyframes + 1,
-        width_ratios=[1.0] * keyframes + [2.5],
+        keyframes + extra_columns,
+        width_ratios=[1.0] * keyframes + ([2.5] if has_face else []),
         hspace=0.28,
         wspace=0.12,
     )
     heatmap = None
-    selected = [ARKIT_BLENDSHAPE_NAMES.index(name) for name in DISPLAY_FACE_CHANNELS]
+    selected = (
+        [ARKIT_BLENDSHAPE_NAMES.index(name) for name in DISPLAY_FACE_CHANNELS]
+        if has_face
+        else []
+    )
     for row, label in enumerate(variants):
         for col, frame_idx in enumerate(frame_indices):
             axis = fig.add_subplot(grid[row, col])
@@ -829,28 +850,32 @@ def plot_tiled_full_clip_summary(
                 )
             if col == 0:
                 metrics = comparison.metrics[label]
+                metric_lines = [f"body {metrics['body_rmse']:.4f}"]
+                if "face_rmse" in metrics:
+                    metric_lines.append(f"face {metrics['face_rmse']:.4f}")
                 axis.set_ylabel(
-                    f"{label}\nbody {metrics['body_rmse']:.4f}\nface {metrics['face_rmse']:.4f}",
+                    f"{label}\n" + "\n".join(metric_lines),
                     fontsize=9,
                 )
 
-        axis = fig.add_subplot(grid[row, -1])
-        heatmap = axis.imshow(
-            comparison.faces[label].T,
-            aspect="auto",
-            origin="lower",
-            interpolation="nearest",
-            cmap="magma",
-            vmin=face_low,
-            vmax=face_high,
-        )
-        for start, end in generated_runs:
-            axis.axvspan(start - 0.5, end - 0.5, color="#4db6ac", alpha=0.12)
-        axis.set_yticks(selected)
-        axis.set_yticklabels(DISPLAY_FACE_CHANNELS, fontsize=7)
-        axis.set_xlabel("20 FPS frame")
-        if row == 0:
-            axis.set_title("Full-clip 51D ARKit coefficients")
+        if has_face:
+            axis = fig.add_subplot(grid[row, -1])
+            heatmap = axis.imshow(
+                comparison.faces[label].T,
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                cmap="magma",
+                vmin=face_low,
+                vmax=face_high,
+            )
+            for start, end in generated_runs:
+                axis.axvspan(start - 0.5, end - 0.5, color="#4db6ac", alpha=0.12)
+            axis.set_yticks(selected)
+            axis.set_yticklabels(DISPLAY_FACE_CHANNELS, fontsize=7)
+            axis.set_xlabel("20 FPS frame")
+            if row == 0:
+                axis.set_title("Full-clip 51D ARKit coefficients")
 
     if heatmap is not None:
         fig.colorbar(heatmap, ax=fig.axes, fraction=0.012, pad=0.01, label="coefficient")
@@ -1059,7 +1084,7 @@ def save_tiled_full_clip_video(
     audio_path: Path | None = None,
     frame_step: int = 2,
 ) -> Path:
-    """Render a full-clip MP4 and mux its original audio when available."""
+    """Render a body or body+face full-clip MP4 and mux original audio."""
     import matplotlib as mpl
     import matplotlib.pyplot as plt
     from matplotlib.animation import FFMpegWriter, FuncAnimation
@@ -1080,17 +1105,23 @@ def save_tiled_full_clip_video(
     high = finite.max(axis=0) if len(finite) else np.array([1.0, 1.0])
     center = (low + high) / 2
     radius = max(float(np.max(high - low)) * 0.55, 0.5)
-    face_low, face_high = _face_limits(comparison.faces)
-    selected = [ARKIT_BLENDSHAPE_NAMES.index(name) for name in DISPLAY_FACE_CHANNELS]
-    lip_set = set(ARKIT_LIP_INDICES)
-    bar_colors = ["#d95f59" if idx in lip_set else "#4c78a8" for idx in selected]
+    has_face = bool(comparison.faces)
     edges = _skeleton_edges()
 
-    fig = plt.figure(figsize=(4.0 * len(variants), 7.6))
-    grid = fig.add_gridspec(3, len(variants), height_ratios=[3.3, 2.5, 0.65])
+    fig = plt.figure(figsize=(4.0 * len(variants), 7.6 if has_face else 5.2))
+    if has_face:
+        grid = fig.add_gridspec(3, len(variants), height_ratios=[3.3, 2.5, 0.65])
+        timeline_row = 2
+    else:
+        grid = fig.add_gridspec(2, len(variants), height_ratios=[3.3, 0.65])
+        timeline_row = 1
     body_axes = [fig.add_subplot(grid[0, col]) for col in range(len(variants))]
-    face_axes = [fig.add_subplot(grid[1, col]) for col in range(len(variants))]
-    timeline_axis = fig.add_subplot(grid[2, :])
+    face_axes = (
+        [fig.add_subplot(grid[1, col]) for col in range(len(variants))]
+        if has_face
+        else []
+    )
+    timeline_axis = fig.add_subplot(grid[timeline_row, :])
     body_lines: Dict[str, list[Any]] = {}
     face_glyphs: Dict[str, _ArkitFaceGlyph] = {}
     for col, label in enumerate(variants):
@@ -1101,8 +1132,11 @@ def save_tiled_full_clip_video(
         body_axis.set_xticks([])
         body_axis.set_yticks([])
         metrics = comparison.metrics[label]
+        metric_text = f"body RMSE {metrics['body_rmse']:.4f}"
+        if "face_rmse" in metrics:
+            metric_text += f" | face RMSE {metrics['face_rmse']:.4f}"
         body_axis.set_title(
-            f"{label}\nbody RMSE {metrics['body_rmse']:.4f} | face RMSE {metrics['face_rmse']:.4f}",
+            f"{label}\n{metric_text}",
             fontsize=9,
         )
         body_lines[label] = [
@@ -1114,8 +1148,9 @@ def save_tiled_full_clip_video(
             for _ in edges
         ]
 
-        face_axis = face_axes[col]
-        face_glyphs[label] = _ArkitFaceGlyph(face_axis)
+        if has_face:
+            face_axis = face_axes[col]
+            face_glyphs[label] = _ArkitFaceGlyph(face_axis)
 
     x = np.arange(comparison.frames)
     envelope = _audio_rms_envelope(
@@ -1162,10 +1197,12 @@ def save_tiled_full_clip_video(
             for line, (parent, child) in zip(body_lines[label], edges):
                 line.set_data(points[[parent, child], 0], points[[parent, child], 1])
                 artists.append(line)
-            artists.extend(face_glyphs[label].update(comparison.faces[label][frame_idx]))
+            if has_face:
+                artists.extend(face_glyphs[label].update(comparison.faces[label][frame_idx]))
             background = "#fff0ed" if generated else "#f5f5f3"
             body_axes[col].set_facecolor(background)
-            face_axes[col].set_facecolor(background)
+            if has_face:
+                face_axes[col].set_facecolor(background)
         return artists
 
     animation = FuncAnimation(
