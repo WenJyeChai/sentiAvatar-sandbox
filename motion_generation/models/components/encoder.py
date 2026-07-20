@@ -11,6 +11,7 @@
 '''
 
 import torch.nn as nn
+from .causal_conv import CausalConv1d
 from .resnet import Resnet1D
 
 
@@ -32,7 +33,8 @@ class Encoder(nn.Module):
         dilation_growth_rate: int = 3,
         activation: str = 'relu',
         norm: str = None,
-        vq_cnn_depth: int = 2
+        vq_cnn_depth: int = 2,
+        causal: bool = False,
     ):
         """
         初始化编码器
@@ -52,12 +54,14 @@ class Encoder(nn.Module):
         super().__init__()
         
         self.vq_cnn_depth = vq_cnn_depth
+        self.causal = bool(causal)
         
         blocks = []
         filter_t, pad_t = stride_t * 2, stride_t // 2
+        conv_cls = CausalConv1d if causal else nn.Conv1d
         
         # 输入卷积
-        blocks.append(nn.Conv1d(input_dim, width, 3, 1, 1))
+        blocks.append(conv_cls(input_dim, width, 3, 1, 0 if causal else 1))
         blocks.append(nn.ReLU())
         
         # 额外的 CNN 层
@@ -66,13 +70,14 @@ class Encoder(nn.Module):
         
         for _ in range(cnn_depth):
             block = nn.Sequential(
-                nn.Conv1d(width, width, 3, 1, 1),
+                conv_cls(width, width, 3, 1, 0 if causal else 1),
                 Resnet1D(
                     width,
                     depth,
                     dilation_growth_rate,
                     activation=activation,
-                    norm=norm
+                    norm=norm,
+                    causal=causal,
                 ),
             )
             blocks.append(block)
@@ -80,19 +85,31 @@ class Encoder(nn.Module):
         # 下采样层
         for i in range(down_t):
             block = nn.Sequential(
-                nn.Conv1d(width, width, filter_t, stride_t, pad_t),
+                (
+                    CausalConv1d(
+                        width,
+                        width,
+                        filter_t,
+                        stride_t,
+                        0,
+                        stride_end_aligned=True,
+                    )
+                    if causal
+                    else nn.Conv1d(width, width, filter_t, stride_t, pad_t)
+                ),
                 Resnet1D(
                     width,
                     depth,
                     dilation_growth_rate,
                     activation=activation,
-                    norm=norm
+                    norm=norm,
+                    causal=causal,
                 ),
             )
             blocks.append(block)
         
         # 输出卷积
-        blocks.append(nn.Conv1d(width, output_dim, 3, 1, 1))
+        blocks.append(conv_cls(width, output_dim, 3, 1, 0 if causal else 1))
         
         self.model = nn.Sequential(*blocks)
     

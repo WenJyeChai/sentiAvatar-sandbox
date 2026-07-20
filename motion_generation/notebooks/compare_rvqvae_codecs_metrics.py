@@ -350,6 +350,7 @@ class LoadedMultipartModel:
     nb_code: int
     num_quantizers: int
     unit_length: int
+    causal: bool
 
 
 def infer_part_from_path(path: Path) -> Optional[str]:
@@ -381,6 +382,7 @@ def load_multipart_checkpoint(checkpoint_path: Path, device: torch.device) -> Lo
     num_quantizers = int(args.get("num_quantizers", model_config.get("num_quantizers", 4)))
     down_t = int(args.get("down_t", 1))
     stride_t = int(args.get("stride_t", 2))
+    causal = bool(model_config.get("causal", args.get("causal", False)))
 
     model = MultiPartRVQVAE(
         part_dims=PART_DIMS,
@@ -400,6 +402,7 @@ def load_multipart_checkpoint(checkpoint_path: Path, device: torch.device) -> Lo
         quantize_dropout_prob=float(args.get("quantize_dropout_prob", 0.0)),
         quantize_dropout_cutoff_index=int(args.get("quantize_dropout_cutoff_index", 1)),
         mu=float(args.get("mu", 0.99)),
+        causal=causal,
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device).eval()
@@ -416,7 +419,13 @@ def load_multipart_checkpoint(checkpoint_path: Path, device: torch.device) -> Lo
         normalizer=normalizer,
         nb_code=nb_code,
         num_quantizers=num_quantizers,
-        unit_length=down_t * stride_t,
+        unit_length=int(
+            model_config.get(
+                "unit_length",
+                stride_t ** down_t if causal else down_t * stride_t,
+            )
+        ),
+        causal=causal,
     )
 
 

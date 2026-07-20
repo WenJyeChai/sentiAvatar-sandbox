@@ -83,10 +83,60 @@ class Quantizer(nn.Module):
     
     def reset_codebook(self):
         """重置码本"""
-        self.init = False
-        self.code_sum = None
-        self.code_count = None
         self.register_buffer('codebook', torch.zeros(self.nb_code, self.code_dim, requires_grad=False))
+        self.register_buffer('code_sum', torch.zeros(self.nb_code, self.code_dim, requires_grad=False))
+        self.register_buffer('code_count', torch.zeros(self.nb_code, requires_grad=False))
+        self.register_buffer('initialized', torch.tensor(False, dtype=torch.bool))
+
+    @property
+    def init(self) -> bool:
+        """Backward-compatible view of the checkpointed initialization flag."""
+        return bool(self.initialized.item())
+
+    @init.setter
+    def init(self, value: bool) -> None:
+        self.initialized.fill_(bool(value))
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Load old checkpoints that only stored the EMA codebook itself."""
+        codebook_key = prefix + "codebook"
+        code_sum_key = prefix + "code_sum"
+        code_count_key = prefix + "code_count"
+        initialized_key = prefix + "initialized"
+        if codebook_key in state_dict:
+            saved_codebook = state_dict[codebook_key]
+            if code_sum_key not in state_dict:
+                state_dict[code_sum_key] = saved_codebook.clone()
+            if code_count_key not in state_dict:
+                state_dict[code_count_key] = torch.ones(
+                    self.nb_code,
+                    dtype=saved_codebook.dtype,
+                    device=saved_codebook.device,
+                )
+            if initialized_key not in state_dict:
+                state_dict[initialized_key] = torch.tensor(
+                    bool(torch.count_nonzero(saved_codebook).item()),
+                    dtype=torch.bool,
+                    device=saved_codebook.device,
+                )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
     
     def _tile(self, x):
         """扩展输入以匹配码本大小"""
@@ -100,14 +150,15 @@ class Quantizer(nn.Module):
             out = x
         return out
     
+    @torch.no_grad()
     def init_codebook(self, x):
         """初始化码本"""
         out = self._tile(x)
-        self.codebook = out[:self.nb_code]
+        self.codebook.copy_(out[:self.nb_code])
         if dist.is_available() and dist.is_initialized():
             dist.broadcast(self.codebook, src=0)
-        self.code_sum = self.codebook.clone()
-        self.code_count = torch.ones(self.nb_code, device=self.codebook.device)
+        self.code_sum.copy_(self.codebook)
+        self.code_count.fill_(1.0)
         self.init = True
     
     def quantize(self, x, sample_codebook_temp=0.):
@@ -175,15 +226,17 @@ class Quantizer(nn.Module):
         
         out = self._tile(x)
         code_rand = out[:self.nb_code]
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast(code_rand, src=0)
         
         # EMA 更新
-        self.code_sum = self.mu * self.code_sum + (1. - self.mu) * code_sum
-        self.code_count = self.mu * self.code_count + (1. - self.mu) * code_count
+        self.code_sum.mul_(self.mu).add_(code_sum, alpha=1. - self.mu)
+        self.code_count.mul_(self.mu).add_(code_count, alpha=1. - self.mu)
         
         # 重置未使用的码本
         usage = (self.code_count.view(self.nb_code, 1) >= 1.0).float()
         code_update = self.code_sum.view(self.nb_code, self.code_dim) / self.code_count.view(self.nb_code, 1)
-        self.codebook = usage * code_update + (1 - usage) * code_rand
+        self.codebook.copy_(usage * code_update + (1 - usage) * code_rand)
         
         prob = code_count / torch.sum(code_count)
         perplexity = torch.exp(-torch.sum(prob * torch.log(prob + 1e-7)))
@@ -257,12 +310,12 @@ class QuantizerEMA(Quantizer):
             dist.all_reduce(code_count, op=dist.ReduceOp.SUM)
         
         # EMA 更新
-        self.code_sum = self.mu * self.code_sum + (1. - self.mu) * code_sum
-        self.code_count = self.mu * self.code_count + (1. - self.mu) * code_count
+        self.code_sum.mul_(self.mu).add_(code_sum, alpha=1. - self.mu)
+        self.code_count.mul_(self.mu).add_(code_count, alpha=1. - self.mu)
         
         usage = (self.code_count.view(self.nb_code, 1) >= 1.0).float()
         code_update = self.code_sum.view(self.nb_code, self.code_dim) / self.code_count.view(self.nb_code, 1)
-        self.codebook = usage * code_update + (1 - usage) * self.codebook
+        self.codebook.copy_(usage * code_update + (1 - usage) * self.codebook)
         
         prob = code_count / torch.sum(code_count)
         perplexity = torch.exp(-torch.sum(prob * torch.log(prob + 1e-7)))

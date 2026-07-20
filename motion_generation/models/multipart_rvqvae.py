@@ -34,6 +34,7 @@ class MultiPartRVQVAE(nn.Module):
         quantize_dropout_prob: float = 0.0,
         quantize_dropout_cutoff_index: int = 1,
         mu: float = 0.99,
+        causal: bool = False,
     ) -> None:
         super().__init__()
         source_dims = dict(part_dims or PART_DIMS)
@@ -45,7 +46,10 @@ class MultiPartRVQVAE(nn.Module):
         self.nb_code = int(nb_code)
         self.code_dim = int(code_dim)
         self.num_quantizers = int(num_quantizers)
-        self.unit_length = int(down_t * stride_t)
+        self.down_t = int(down_t)
+        self.stride_t = int(stride_t)
+        self.causal = bool(causal)
+        self.unit_length = int(stride_t ** down_t if causal else down_t * stride_t)
 
         self.encoders = nn.ModuleDict()
         self.decoders = nn.ModuleDict()
@@ -64,6 +68,7 @@ class MultiPartRVQVAE(nn.Module):
                 activation=activation,
                 norm=norm,
                 vq_cnn_depth=vq_cnn_depth,
+                causal=causal,
             )
             self.decoders[part] = Decoder(
                 input_dim=input_dim,
@@ -76,6 +81,7 @@ class MultiPartRVQVAE(nn.Module):
                 activation=activation,
                 norm=norm,
                 vq_cnn_depth=vq_cnn_depth,
+                causal=causal,
             )
             self.quantizers[part] = ResidualVQ(
                 num_quantizers=num_quantizers,
@@ -112,13 +118,26 @@ class MultiPartRVQVAE(nn.Module):
 
         for part in self.part_order:
             x = inputs[part]
+            if self.causal:
+                complete_frames = (x.shape[1] // self.unit_length) * self.unit_length
+                if complete_frames == 0:
+                    raise ValueError(
+                        f"Causal codec needs at least {self.unit_length} source frames, "
+                        f"got {x.shape[1]} for part '{part}'"
+                    )
+                x = x[:, :complete_frames]
             latent = self.encoders[part](self.preprocess(x))
             quantized, indices, loss, ppl = self.quantizers[part](
                 latent,
                 sample_codebook_temp=0.5,
             )
             decoded = self.decoders[part](quantized)
-            rec[part] = self._match_length(decoded, x.shape[1])
+            if self.causal and decoded.shape[1] != x.shape[1]:
+                raise RuntimeError(
+                    f"Causal codec length contract failed for '{part}': "
+                    f"input={x.shape[1]}, decoded={decoded.shape[1]}"
+                )
+            rec[part] = decoded if self.causal else self._match_length(decoded, x.shape[1])
             code_idx[part] = indices
             commit_loss[part] = loss
             perplexity[part] = ppl
@@ -136,7 +155,13 @@ class MultiPartRVQVAE(nn.Module):
     def encode(self, inputs: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         code_idx: Dict[str, torch.Tensor] = {}
         for part in self.part_order:
-            latent = self.encoders[part](self.preprocess(inputs[part]))
+            x = inputs[part]
+            if self.causal and x.shape[1] < self.unit_length:
+                raise ValueError(
+                    f"Causal codec needs at least {self.unit_length} source frames, "
+                    f"got {x.shape[1]} for part '{part}'"
+                )
+            latent = self.encoders[part](self.preprocess(x))
             code_idx[part] = self.quantizers[part].quantize(latent)
         return code_idx
 
@@ -158,4 +183,8 @@ class MultiPartRVQVAE(nn.Module):
             "code_dim": self.code_dim,
             "num_quantizers": self.num_quantizers,
             "unit_length": self.unit_length,
+            "down_t": self.down_t,
+            "stride_t": self.stride_t,
+            "causal": self.causal,
+            "temporal_alignment": "completed_stride_chunk" if self.causal else "symmetric",
         }

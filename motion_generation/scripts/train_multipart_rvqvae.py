@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import pathlib
 import random
 import sys
 import time
@@ -46,6 +47,20 @@ from utils.multipart_motion import (  # noqa: E402
     motion_path_for_name,
     split_motion_parts,
 )
+
+
+def torch_load_trusted(path: Path, map_location=None):
+    """Load this project's trusted training checkpoints across PyTorch/OS versions."""
+    saved_posix_path = pathlib.PosixPath
+    if os.name == "nt":
+        pathlib.PosixPath = pathlib.WindowsPath
+    try:
+        try:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location=map_location)
+    finally:
+        pathlib.PosixPath = saved_posix_path
 
 
 class MultipartMotionDataset(Dataset):
@@ -116,6 +131,7 @@ class MultipartMotionDataset(Dataset):
             start = max(0, (frames - self.window_size) // 2)
 
         cropped = crop_or_pad_parts(parts, self.window_size, start=start)
+        valid_frames = min(self.window_size, frames - start)
         tensors = {
             part: torch.from_numpy(self.normalizer.normalize(part, cropped[part]))
             for part in self.part_order
@@ -124,6 +140,7 @@ class MultipartMotionDataset(Dataset):
             "parts": tensors,
             "name": name,
             "root_schema": meta["root_schema"],
+            "valid_frames": int(valid_frames),
         }
 
 
@@ -207,10 +224,35 @@ def move_parts(parts: Mapping[str, torch.Tensor], device: torch.device) -> Dict[
     return {part: value.to(device, non_blocking=True) for part, value in parts.items()}
 
 
-def part_velocity_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def masked_smooth_l1_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    valid_frames: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    elementwise = F.smooth_l1_loss(pred, target, reduction="none")
+    if valid_frames is None:
+        return elementwise.mean()
+    frame_ids = torch.arange(pred.shape[1], device=pred.device).view(1, -1, 1)
+    mask = frame_ids < valid_frames.view(-1, 1, 1)
+    denominator = mask.sum().clamp_min(1) * pred.shape[-1]
+    return (elementwise * mask).sum() / denominator
+
+
+def part_velocity_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    valid_frames: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     if pred.shape[1] < 2 or target.shape[1] < 2:
         return pred.new_tensor(0.0)
-    return F.smooth_l1_loss(pred[:, 1:] - pred[:, :-1], target[:, 1:] - target[:, :-1])
+    velocity_valid_frames = None
+    if valid_frames is not None:
+        velocity_valid_frames = (valid_frames - 1).clamp_min(0)
+    return masked_smooth_l1_loss(
+        pred[:, 1:] - pred[:, :-1],
+        target[:, 1:] - target[:, :-1],
+        valid_frames=velocity_valid_frames,
+    )
 
 
 def compute_losses(
@@ -220,6 +262,7 @@ def compute_losses(
     vel_weight: float,
     commit_weight: float,
     part_order,
+    valid_frames: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     rec = output["rec"]
     commit = output["commit_loss"]
@@ -235,8 +278,9 @@ def compute_losses(
         frames = min(pred.shape[1], target.shape[1])
         pred = pred[:, :frames]
         target = target[:, :frames]
-        part_rec = F.smooth_l1_loss(pred, target)
-        part_vel = part_velocity_loss(pred, target)
+        part_valid_frames = valid_frames.clamp_max(frames) if valid_frames is not None else None
+        part_rec = masked_smooth_l1_loss(pred, target, part_valid_frames)
+        part_vel = part_velocity_loss(pred, target, part_valid_frames)
         part_commit = commit[part]
         part_total = rec_weight * part_rec + vel_weight * part_vel + commit_weight * part_commit
         rec_terms.append(part_rec)
@@ -285,6 +329,11 @@ def run_epoch(
     use_bf16 = bool(args.bf16 and device.type == "cuda")
     for step, batch in enumerate(loader, start=1):
         inputs = move_parts(batch["parts"], device)
+        valid_frames = batch.get("valid_frames")
+        if valid_frames is not None:
+            valid_frames = valid_frames.to(device, non_blocking=True)
+            if model_core.causal:
+                valid_frames = valid_frames - valid_frames.remainder(model_core.unit_length)
         with torch.set_grad_enabled(is_train):
             amp_context = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -300,6 +349,7 @@ def run_epoch(
                     vel_weight=args.vel_weight,
                     commit_weight=args.commit_weight,
                     part_order=model_core.part_order,
+                    valid_frames=valid_frames,
                 )
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -433,6 +483,7 @@ def build_model(args: argparse.Namespace) -> MultiPartRVQVAE:
         quantize_dropout_prob=args.quantize_dropout_prob,
         quantize_dropout_cutoff_index=args.quantize_dropout_cutoff_index,
         mu=args.mu,
+        causal=args.causal,
     )
 
 
@@ -632,6 +683,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--quantize_dropout_prob", type=float, default=0.0)
     parser.add_argument("--quantize_dropout_cutoff_index", type=int, default=1)
     parser.add_argument("--mu", type=float, default=0.99)
+    parser.add_argument(
+        "--causal",
+        action="store_true",
+        help=(
+            "Use a strictly causal encoder and decoder. Strided encoder outputs are "
+            "aligned to completed input chunks. Intended for the new body codecs only."
+        ),
+    )
 
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--num_train_epochs", type=int, default=None)
@@ -744,13 +803,26 @@ def reconcile_cli_aliases(args: argparse.Namespace) -> argparse.Namespace:
     args.report_to = report_to
     if "wandb" in args.report_to:
         args.wandb = True
+    if args.causal:
+        if FACE_PART in args.parts:
+            raise ValueError(
+                "Phase 0 leaves the face codec unchanged. Do not include 'face' with --causal."
+            )
+        if args.norm in {"BN", "GN"}:
+            raise ValueError("Strictly causal codecs support norm=None or norm='LN', not BN/GN")
+        unit_length = int(args.stride_t ** args.down_t)
+        if args.window_size % unit_length != 0:
+            raise ValueError(
+                f"Causal window_size ({args.window_size}) must be divisible by the codec "
+                f"unit length ({unit_length})"
+            )
     return args
 
 
 def main() -> None:
     args = parse_args()
-    args = reconcile_cli_aliases(args)
     args.parts = normalize_parts(args.parts)
+    args = reconcile_cli_aliases(args)
     seed_all(args.seed)
     device = setup_distributed(args)
 
@@ -842,7 +914,7 @@ def main() -> None:
     state = {"global_step": 0}
 
     if args.resume is not None:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch_load_trusted(args.resume, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer_state = checkpoint.get("optimizer_state_dict")
         scheduler_state = checkpoint.get("scheduler_state_dict")
@@ -892,6 +964,9 @@ def main() -> None:
             print(f"Val steps/eval: {eval_loader_steps} per rank")
         selected_part_dims = {part: PART_DIMS[part] for part in args.parts}
         print(f"Parts: {selected_part_dims}")
+        print(
+            f"Temporal codec: {'strictly causal, completed-chunk aligned' if args.causal else 'noncausal'}"
+        )
         print(
             f"Codebooks: {args.codebook_size} codes x {args.num_quantizers} quantizers "
             f"x {len(args.parts)} parts"

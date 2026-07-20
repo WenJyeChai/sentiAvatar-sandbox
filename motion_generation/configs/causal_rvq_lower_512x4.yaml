@@ -1,0 +1,61 @@
+experiment:
+  output_dir: checkpoints/causal_multipart_rvqvae
+  experiment_name: causal_rvq_lower_512x4_scratch
+
+data:
+  data_root: SuSuInterActs/SuSuInterActs
+  train_split_file: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  eval_split_file: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+  parts: [lower]
+  window_size: 128
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 64
+  num_workers: 8
+
+codec:
+  causal: true
+  codebook_size: 512
+  num_quantizers: 4
+  code_dim: 512
+  down_t: 1
+  stride_t: 2
+  width: 512
+  depth: 3
+  dilation_growth_rate: 3
+  activation: relu
+  norm: null
+  vq_cnn_depth: 3
+  shared_codebook: false
+  quantize_dropout_prob: 0.0
+  quantize_dropout_cutoff_index: 1
+  mu: 0.99
+
+objectives:
+  rec_weight: 1.0
+  vel_weight: 1.0
+  commit_weight: 0.02
+
+optimization:
+  num_train_epochs: 100
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.05
+  grad_clip: 1.0
+  bf16: true
+
+checkpointing:
+  save_every: 0
+  save_steps: 1000
+  eval_steps: 1000
+  save_total_limit: 3
+
+monitoring:
+  logging_steps: 20
+  report_to: [wandb]
+  wandb_project: sentiavatar-causal-rvqvae
+  wandb_run_name: causal_rvq_lower_512x4_scratch
+  wandb_tags: [phase0, causal, body, lower, rvqvae, 512x4, scratch]
+  wandb_mode: online
+

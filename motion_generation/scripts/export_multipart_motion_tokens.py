@@ -58,6 +58,7 @@ class LoadedPartCodec:
     codebook_size: int
     num_quantizers: int
     unit_length: int
+    causal: bool
 
 
 def infer_part_from_path(path: Path) -> Optional[str]:
@@ -88,6 +89,7 @@ def load_part_codec(path: Path, device: torch.device) -> LoadedPartCodec:
     num_quantizers = int(args.get("num_quantizers", model_config.get("num_quantizers", 4)))
     down_t = int(args.get("down_t", 1))
     stride_t = int(args.get("stride_t", 2))
+    causal = bool(model_config.get("causal", args.get("causal", False)))
 
     checkpoint_part_dims = model_config.get("part_dims") or {}
     model = MultiPartRVQVAE(
@@ -108,6 +110,7 @@ def load_part_codec(path: Path, device: torch.device) -> LoadedPartCodec:
         quantize_dropout_prob=float(args.get("quantize_dropout_prob", 0.0)),
         quantize_dropout_cutoff_index=int(args.get("quantize_dropout_cutoff_index", 1)),
         mu=float(args.get("mu", 0.99)),
+        causal=causal,
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device).eval()
@@ -126,7 +129,13 @@ def load_part_codec(path: Path, device: torch.device) -> LoadedPartCodec:
         checkpoint_path=path,
         codebook_size=codebook_size,
         num_quantizers=num_quantizers,
-        unit_length=down_t * stride_t,
+        unit_length=int(
+            model_config.get(
+                "unit_length",
+                stride_t ** down_t if causal else down_t * stride_t,
+            )
+        ),
+        causal=causal,
     )
 
 
@@ -300,6 +309,8 @@ def main() -> None:
                 "source_motion_path": str(motion_path),
                 "source_face_path": str(face_path) if FACE_PART in part_order else None,
                 "part_checkpoints": {part: str(loaded.checkpoint_path) for part, loaded in codecs.items()},
+                "causal_by_part": {part: loaded.causal for part, loaded in codecs.items()},
+                "body_causal": all(codecs[part].causal for part in PART_ORDER),
             }
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
@@ -326,6 +337,8 @@ def main() -> None:
                 "part_order": list(part_order),
                 "tokens_per_frame": len(part_order) * num_quantizers,
                 "token_layout": token_layout,
+                "causal_by_part": {part: loaded.causal for part, loaded in codecs.items()},
+                "body_causal": all(codecs[part].causal for part in PART_ORDER),
             },
             f,
             indent=2,

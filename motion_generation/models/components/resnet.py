@@ -13,6 +13,8 @@
 import torch
 import torch.nn as nn
 
+from .causal_conv import CausalConv1d
+
 
 class Nonlinearity(nn.Module):
     """Swish/SiLU 激活函数"""
@@ -36,7 +38,8 @@ class ResBlock(nn.Module):
         dilation: int = 1,
         activation: str = 'relu',
         norm: str = None,
-        dropout: float = 0.2
+        dropout: float = 0.2,
+        causal: bool = False,
     ):
         """
         初始化残差块
@@ -51,8 +54,14 @@ class ResBlock(nn.Module):
         """
         super().__init__()
         
-        padding = dilation
+        if causal and norm in {"BN", "GN"}:
+            raise ValueError(
+                f"{norm} aggregates over time and is invalid in a strictly causal codec. "
+                "Use norm=None or norm='LN'."
+            )
+        padding = 0 if causal else dilation
         self.norm_type = norm
+        self.causal = bool(causal)
         
         # 归一化层
         if norm == "LN":
@@ -83,7 +92,8 @@ class ResBlock(nn.Module):
             self.activation2 = nn.ReLU()
         
         # 卷积层
-        self.conv1 = nn.Conv1d(n_in, n_state, 3, 1, padding, dilation)
+        conv_cls = CausalConv1d if causal else nn.Conv1d
+        self.conv1 = conv_cls(n_in, n_state, 3, 1, padding, dilation)
         self.conv2 = nn.Conv1d(n_state, n_in, 1, 1, 0)
         self.dropout = nn.Dropout(dropout)
     
@@ -131,7 +141,8 @@ class Resnet1D(nn.Module):
         dilation_growth_rate: int = 1,
         reverse_dilation: bool = True,
         activation: str = 'relu',
-        norm: str = None
+        norm: str = None,
+        causal: bool = False,
     ):
         """
         初始化 1D ResNet
@@ -152,7 +163,8 @@ class Resnet1D(nn.Module):
                 n_in,
                 dilation=dilation_growth_rate ** depth,
                 activation=activation,
-                norm=norm
+                norm=norm,
+                causal=causal,
             )
             for depth in range(n_depth)
         ]

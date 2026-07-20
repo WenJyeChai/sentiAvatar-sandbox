@@ -11,6 +11,7 @@
 '''
 
 import torch.nn as nn
+from .causal_conv import CausalConv1d
 from .resnet import Resnet1D
 
 
@@ -32,7 +33,8 @@ class Decoder(nn.Module):
         dilation_growth_rate: int = 3,
         activation: str = 'relu',
         norm: str = None,
-        vq_cnn_depth: int = 2
+        vq_cnn_depth: int = 2,
+        causal: bool = False,
     ):
         """
         初始化解码器
@@ -52,11 +54,13 @@ class Decoder(nn.Module):
         super().__init__()
         
         self.vq_cnn_depth = vq_cnn_depth
+        self.causal = bool(causal)
         
         blocks = []
+        conv_cls = CausalConv1d if causal else nn.Conv1d
         
         # 输入卷积
-        blocks.append(nn.Conv1d(output_dim, width, 3, 1, 1))
+        blocks.append(conv_cls(output_dim, width, 3, 1, 0 if causal else 1))
         blocks.append(nn.ReLU())
         
         # 上采样层
@@ -68,10 +72,11 @@ class Decoder(nn.Module):
                     dilation_growth_rate,
                     reverse_dilation=True,
                     activation=activation,
-                    norm=norm
+                    norm=norm,
+                    causal=causal,
                 ),
-                nn.Upsample(scale_factor=2, mode='nearest'),
-                nn.Conv1d(width, width, 3, 1, 1)
+                nn.Upsample(scale_factor=stride_t, mode='nearest'),
+                conv_cls(width, width, 3, 1, 0 if causal else 1)
             )
             blocks.append(block)
         
@@ -86,16 +91,17 @@ class Decoder(nn.Module):
                     depth,
                     dilation_growth_rate,
                     activation=activation,
-                    norm=norm
+                    norm=norm,
+                    causal=causal,
                 ),
-                nn.Conv1d(width, width, 3, 1, 1),
+                conv_cls(width, width, 3, 1, 0 if causal else 1),
             )
             blocks.append(block)
         
         # 输出卷积
-        blocks.append(nn.Conv1d(width, width, 3, 1, 1))
+        blocks.append(conv_cls(width, width, 3, 1, 0 if causal else 1))
         blocks.append(nn.ReLU())
-        blocks.append(nn.Conv1d(width, input_dim, 3, 1, 1))
+        blocks.append(conv_cls(width, input_dim, 3, 1, 0 if causal else 1))
         
         self.model = nn.Sequential(*blocks)
     
