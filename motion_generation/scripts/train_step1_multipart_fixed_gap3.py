@@ -319,8 +319,15 @@ def save_checkpoint(
     distributed: bool,
     rank: int,
     final: bool = False,
+    checkpoint_name: Optional[str] = None,
+    best_eval_loss: float = math.inf,
+    epochs_without_improvement: int = 0,
 ) -> Path:
-    checkpoint_dir = output_dir / ("final" if final else f"checkpoint-{global_step}")
+    if final and checkpoint_name is not None:
+        raise ValueError("final and checkpoint_name cannot both be set")
+    checkpoint_dir = output_dir / (
+        checkpoint_name or ("final" if final else f"checkpoint-{global_step}")
+    )
     if is_main(rank):
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
@@ -333,6 +340,8 @@ def save_checkpoint(
                 "global_step": global_step,
                 "epoch": epoch,
                 "batch_in_epoch": batch_in_epoch,
+                "best_eval_loss": float(best_eval_loss),
+                "epochs_without_improvement": int(epochs_without_improvement),
             },
             checkpoint_dir / "training_state.pt",
         )
@@ -350,9 +359,9 @@ def load_training_state(
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     device: torch.device,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, float, int]:
     if checkpoint is None:
-        return 0, 0, 0
+        return 0, 0, 0, math.inf, 0
     state_path = checkpoint.resolve() / "training_state.pt"
     if not state_path.is_file():
         raise FileNotFoundError(f"Resume training state not found: {state_path}")
@@ -363,7 +372,13 @@ def load_training_state(
             if torch.is_tensor(value):
                 optimizer_state[key] = value.to(device)
     scheduler.load_state_dict(state["scheduler"])
-    return int(state["global_step"]), int(state["epoch"]), int(state["batch_in_epoch"])
+    return (
+        int(state["global_step"]),
+        int(state["epoch"]),
+        int(state["batch_in_epoch"]),
+        float(state.get("best_eval_loss", math.inf)),
+        int(state.get("epochs_without_improvement", 0)),
+    )
 
 
 def initialize_wandb(
@@ -508,7 +523,13 @@ def main() -> None:
         eps=float(training.get("adam_epsilon", 1e-8)),
     )
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    global_step, start_epoch, resume_batch = load_training_state(resume, optimizer, scheduler, device)
+    (
+        global_step,
+        start_epoch,
+        resume_batch,
+        best_eval_loss,
+        epochs_without_improvement,
+    ) = load_training_state(resume, optimizer, scheduler, device)
 
     if is_main(rank):
         trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
@@ -531,6 +552,13 @@ def main() -> None:
     log_steps = int(training.get("logging_steps", 20))
     eval_steps = int(training.get("eval_steps", 500))
     save_steps = int(training.get("save_steps", 500))
+    save_best = bool(training.get("save_best", True))
+    early_stopping_patience = int(training.get("early_stopping_patience", 0))
+    early_stopping_min_delta = float(training.get("early_stopping_min_delta", 0.0))
+    if early_stopping_patience < 0:
+        raise ValueError("early_stopping_patience must be non-negative")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be non-negative")
     max_grad_norm = float(training.get("max_grad_norm", 1.0))
     autocast_enabled = use_bf16 and device.type == "cuda"
     model.train()
@@ -538,6 +566,8 @@ def main() -> None:
     running = torch.zeros(3 + 2 * len(BODY_SLOTS), dtype=torch.float64, device=device)
     run_start = time.perf_counter()
 
+    completed_epochs = start_epoch
+    stopped_early = False
     for epoch in range(start_epoch, epochs):
         train_dataset.set_epoch(epoch)
         if train_sampler is not None:
@@ -641,6 +671,8 @@ def main() -> None:
                     source_config=config,
                     distributed=distributed,
                     rank=rank,
+                    best_eval_loss=best_eval_loss,
+                    epochs_without_improvement=epochs_without_improvement,
                 )
         resume_batch = 0
 
@@ -671,6 +703,53 @@ def main() -> None:
                 )
                 wandb_run.log(wandb_payload, step=global_step)
 
+        completed_epochs = epoch + 1
+        improved = eval_metrics["loss"] < best_eval_loss - early_stopping_min_delta
+        if improved:
+            best_eval_loss = float(eval_metrics["loss"])
+            epochs_without_improvement = 0
+            if save_best:
+                save_checkpoint(
+                    model,
+                    tokenizer,
+                    optimizer,
+                    scheduler,
+                    output_dir=paths["output_dir"],
+                    global_step=global_step,
+                    epoch=completed_epochs,
+                    batch_in_epoch=0,
+                    source_config=config,
+                    distributed=distributed,
+                    rank=rank,
+                    checkpoint_name="best",
+                    best_eval_loss=best_eval_loss,
+                    epochs_without_improvement=epochs_without_improvement,
+                )
+        else:
+            epochs_without_improvement += 1
+        if is_main(rank):
+            print(
+                f"[early stopping] best_loss={best_eval_loss:.5f} "
+                f"epochs_without_improvement={epochs_without_improvement}/"
+                f"{early_stopping_patience or 'disabled'}"
+            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "eval/best_loss": best_eval_loss,
+                        "eval/epochs_without_improvement": epochs_without_improvement,
+                    },
+                    step=global_step,
+                )
+        if (
+            early_stopping_patience > 0
+            and epochs_without_improvement >= early_stopping_patience
+        ):
+            stopped_early = True
+            if is_main(rank):
+                print(f"Early stopping after {completed_epochs} completed epochs")
+            break
+
     save_checkpoint(
         model,
         tokenizer,
@@ -678,15 +757,18 @@ def main() -> None:
         scheduler,
         output_dir=paths["output_dir"],
         global_step=global_step,
-        epoch=epochs,
+        epoch=completed_epochs,
         batch_in_epoch=0,
         source_config=config,
         distributed=distributed,
         rank=rank,
         final=True,
+        best_eval_loss=best_eval_loss,
+        epochs_without_improvement=epochs_without_improvement,
     )
     if is_main(rank):
-        print(f"Training complete in {time.perf_counter() - run_start:.1f}s")
+        suffix = " (early stopped)" if stopped_early else ""
+        print(f"Training complete{suffix} in {time.perf_counter() - run_start:.1f}s")
         if wandb_run is not None:
             wandb_run.finish()
     barrier(distributed)

@@ -1,11 +1,11 @@
 paths:
   base_model: checkpoints/llm
-  output_dir: checkpoints/step1_multipart_fixed_gap3
+  output_dir: checkpoints/step1_multipart_fixed_gap3_smoke512
   data_dir: SuSuInterActs/SuSuInterActs
   motion_token_dir: SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4
   mimi_token_dir: SuSuInterActs/SuSuInterActs/audio_tokens_mimi_12p5hz_8cb
   text_json: SuSuInterActs/SuSuInterActs/text_data/motion2text.json
-  train_split: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  train_split: motion_generation/data_splits/step1_balanced_seed42/train_step1_smoke_512.txt
   eval_split: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
 
 data:
@@ -14,22 +14,16 @@ data:
   num_workers: 4
   require_causal_motion: true
   max_duration_mismatch_seconds: 0.12
-
-  # Both tags use a known current-state anchor during initial training. At
-  # conversation start, switch to mixed_all after exporting a neutral anchor.
   seed_mode: mixed_known
   neutral_seed_json: null
   neutral_seed_probability: 0.5
   previous_seed_probability: 0.5
-
-  # First run: pure teacher forcing. Later, point generated_anchor_dir at a
-  # rollout cache and raise this probability without changing the model format.
   generated_anchor_dir: null
   generated_prefix_probability: 0.0
 
 training:
   seed: 42
-  num_train_epochs: 10
+  num_train_epochs: 1
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 8
@@ -41,9 +35,9 @@ training:
   max_grad_norm: 1.0
   bf16: true
   gradient_checkpointing: true
-  logging_steps: 20
-  eval_steps: 500
-  save_steps: 500
+  logging_steps: 1
+  eval_steps: 0
+  save_steps: 0
   save_best: true
   early_stopping_patience: 0
   early_stopping_min_delta: 0.0
@@ -51,7 +45,7 @@ training:
 monitoring:
   report_to: wandb
   wandb_project: sentiavatar-step1-planner
-  wandb_run_name: step1_multipart_fixed_gap3_mimi_q0
-  wandb_tags: [phase1, step1, qwen, mimi-q0, multipart, fixed-gap3, causal]
+  wandb_run_name: step1_gap3_smoke512_mimi_q0
+  wandb_tags: [phase1, smoke, qwen, mimi-q0, multipart, fixed-gap3, causal]
   wandb_mode: online
   wandb_entity: null

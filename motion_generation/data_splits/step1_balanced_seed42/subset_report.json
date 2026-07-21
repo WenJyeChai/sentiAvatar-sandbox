@@ -1,0 +1,870 @@
+{
+  "schema_version": 1,
+  "seed": 42,
+  "official_splits": {
+    "train": 19019,
+    "val": 635,
+    "test": 1479,
+    "train_sha256": "b12b70b37355d8c2b9fb350cff1257d1957a50a95722243ada094d5cd70a0cc2",
+    "leakage": {
+      "train_val": 0,
+      "train_test": 0,
+      "val_test": 0
+    }
+  },
+  "uses_msd": false,
+  "complexity_definition": "Mean percentile rank of body and hand 6D-rotation mean/p90 change; joint positions are recorded for audit but do not affect selection.",
+  "raw_motion_quality": {
+    "clips_with_positions": 7882,
+    "clips_without_positions": 11137
+  },
+  "balance_specs": {
+    "source": {
+      "importance": 1.0,
+      "frequency_temperature": 0.75
+    },
+    "session": {
+      "importance": 0.75,
+      "frequency_temperature": 0.8
+    },
+    "duration_bin": {
+      "importance": 1.0,
+      "frequency_temperature": 0.0
+    },
+    "complexity_bin": {
+      "importance": 1.5,
+      "frequency_temperature": 0.0
+    },
+    "text_length_bin": {
+      "importance": 0.5,
+      "frequency_temperature": 0.0
+    },
+    "annotation_pattern": {
+      "importance": 1.0,
+      "frequency_temperature": 0.85
+    },
+    "expression": {
+      "importance": 0.05,
+      "frequency_temperature": 0.75
+    },
+    "action": {
+      "importance": 0.05,
+      "frequency_temperature": 0.75
+    }
+  },
+  "full_train": {
+    "clips": 19019,
+    "duration_hours": 33.21120833333333,
+    "duration_seconds": {
+      "count": 19019,
+      "min": 3.0,
+      "p10": 3.95,
+      "median": 6.1,
+      "p90": 8.7,
+      "max": 41.05,
+      "mean": 6.286363636363637
+    },
+    "complexity_score": {
+      "count": 19019,
+      "min": 0.0002103270585760858,
+      "p10": 0.14559627721106322,
+      "median": 0.51255389630876,
+      "p90": 0.8227652750026291,
+      "max": 0.9996450730886528,
+      "mean": 0.5
+    },
+    "source": {
+      "unique": 2,
+      "counts": {
+        "fbx_to_json_data_susu_retarget_maya": 17888,
+        "fbx_to_json_data_susu_chonglu": 1131
+      }
+    },
+    "session": {
+      "unique": 72,
+      "counts": {
+        "fbx_to_json_data_susu_retarget_maya/20250916": 546,
+        "fbx_to_json_data_susu_retarget_maya/20250912": 522,
+        "fbx_to_json_data_susu_retarget_maya/20250901": 509,
+        "fbx_to_json_data_susu_retarget_maya/20250911": 508,
+        "fbx_to_json_data_susu_retarget_maya/20250910": 506,
+        "fbx_to_json_data_susu_retarget_maya/20250904": 504,
+        "fbx_to_json_data_susu_retarget_maya/20250909": 500,
+        "fbx_to_json_data_susu_retarget_maya/20250915": 478,
+        "fbx_to_json_data_susu_retarget_maya/20250829": 477,
+        "fbx_to_json_data_susu_retarget_maya/20250820": 474,
+        "fbx_to_json_data_susu_retarget_maya/20250902": 473,
+        "fbx_to_json_data_susu_retarget_maya/20250805": 469,
+        "fbx_to_json_data_susu_retarget_maya/20250903": 465,
+        "fbx_to_json_data_susu_chonglu/20260115": 448,
+        "fbx_to_json_data_susu_retarget_maya/20250806": 422,
+        "fbx_to_json_data_susu_retarget_maya/20250821": 411,
+        "fbx_to_json_data_susu_retarget_maya/20250828": 397,
+        "fbx_to_json_data_susu_retarget_maya/20250826": 387,
+        "fbx_to_json_data_susu_retarget_maya/20250905": 367,
+        "fbx_to_json_data_susu_chonglu/20260119": 352,
+        "fbx_to_json_data_susu_chonglu/20260116": 331,
+        "fbx_to_json_data_susu_retarget_maya/20250825": 330,
+        "fbx_to_json_data_susu_retarget_maya/20250815": 311,
+        "fbx_to_json_data_susu_retarget_maya/20250804": 304,
+        "fbx_to_json_data_susu_retarget_maya/20250801": 299,
+        "fbx_to_json_data_susu_retarget_maya/20250929": 295,
+        "fbx_to_json_data_susu_retarget_maya/20250822": 281,
+        "fbx_to_json_data_susu_retarget_maya/20251015": 261,
+        "fbx_to_json_data_susu_retarget_maya/20251107": 252,
+        "fbx_to_json_data_susu_retarget_maya/20251029": 250,
+        "fbx_to_json_data_susu_retarget_maya/20251031": 249,
+        "fbx_to_json_data_susu_retarget_maya/20251104": 246,
+        "fbx_to_json_data_susu_retarget_maya/20251022": 244,
+        "fbx_to_json_data_susu_retarget_maya/20250813": 242,
+        "fbx_to_json_data_susu_retarget_maya/20251110": 228,
+        "fbx_to_json_data_susu_retarget_maya/20251113": 224,
+        "fbx_to_json_data_susu_retarget_maya/20250819": 222,
+        "fbx_to_json_data_susu_retarget_maya/20251111": 220,
+        "fbx_to_json_data_susu_retarget_maya/20251011": 215,
+        "fbx_to_json_data_susu_retarget_maya/20251009": 206,
+        "fbx_to_json_data_susu_retarget_maya/20251119": 203,
+        "fbx_to_json_data_susu_retarget_maya/20251112": 199,
+        "fbx_to_json_data_susu_retarget_maya/20251013": 197,
+        "fbx_to_json_data_susu_retarget_maya/20251103": 196,
+        "fbx_to_json_data_susu_retarget_maya/20251020": 190,
+        "fbx_to_json_data_susu_retarget_maya/20251106": 186,
+        "fbx_to_json_data_susu_retarget_maya/20251010": 185,
+        "fbx_to_json_data_susu_retarget_maya/20250923": 183,
+        "fbx_to_json_data_susu_retarget_maya/20250926": 183,
+        "fbx_to_json_data_susu_retarget_maya/20251014": 182,
+        "fbx_to_json_data_susu_retarget_maya/20250925": 181,
+        "fbx_to_json_data_susu_retarget_maya/20250818": 180,
+        "fbx_to_json_data_susu_retarget_maya/20251121": 173,
+        "fbx_to_json_data_susu_retarget_maya/20250812": 172,
+        "fbx_to_json_data_susu_retarget_maya/20251028": 159,
+        "fbx_to_json_data_susu_retarget_maya/20250919": 151,
+        "fbx_to_json_data_susu_retarget_maya/20250917": 150,
+        "fbx_to_json_data_susu_retarget_maya/20250928": 149,
+        "fbx_to_json_data_susu_retarget_maya/20250930": 141,
+        "fbx_to_json_data_susu_retarget_maya/20251105": 140,
+        "fbx_to_json_data_susu_retarget_maya/20250918": 130,
+        "fbx_to_json_data_susu_retarget_maya/20250922": 130,
+        "fbx_to_json_data_susu_retarget_maya/20251024": 119,
+        "fbx_to_json_data_susu_retarget_maya/20251125": 118,
+        "fbx_to_json_data_susu_retarget_maya/20251016": 108,
+        "fbx_to_json_data_susu_retarget_maya/20250924": 101,
+        "fbx_to_json_data_susu_retarget_maya/20250814": 97,
+        "fbx_to_json_data_susu_retarget_maya/20251030": 83,
+        "fbx_to_json_data_susu_retarget_maya/20251027": 82,
+        "fbx_to_json_data_susu_retarget_maya/20251021": 58,
+        "fbx_to_json_data_susu_retarget_maya/20251126": 42,
+        "fbx_to_json_data_susu_retarget_maya/20251120": 26
+      }
+    },
+    "duration_bin": {
+      "unique": 5,
+      "counts": {
+        "q2of5": 3909,
+        "q4of5": 3887,
+        "q5of5": 3819,
+        "q3of5": 3737,
+        "q1of5": 3667
+      }
+    },
+    "complexity_bin": {
+      "unique": 5,
+      "counts": {
+        "q1of5": 3804,
+        "q3of5": 3804,
+        "q4of5": 3804,
+        "q5of5": 3804,
+        "q2of5": 3803
+      }
+    },
+    "text_length_bin": {
+      "unique": 5,
+      "counts": {
+        "q5of5": 4178,
+        "q4of5": 4053,
+        "q3of5": 3815,
+        "q1of5": 3588,
+        "q2of5": 3385
+      }
+    },
+    "annotation_pattern": {
+      "unique": 4,
+      "counts": {
+        "action-only": 8322,
+        "expression+action": 4338,
+        "expression-only": 3924,
+        "no-tags": 2435
+      }
+    },
+    "expression": {
+      "annotated_clips": 8262,
+      "unique_selected": 1714,
+      "unique_available": 1714,
+      "clips_with_dataset_frequency_1_to_4": 2236,
+      "top_selected": {
+        "<unannotated>": 10757,
+        "狡黠": 68,
+        "若无其事": 65,
+        "调皮": 63,
+        "轻笑": 63,
+        "若有所思": 61,
+        "单眼眨": 60,
+        "小得意": 58,
+        "傲娇": 57,
+        "欲拒还迎": 57,
+        "偷笑": 56,
+        "微笑": 55,
+        "玩味": 55,
+        "挑眉": 54,
+        "坏笑": 53,
+        "调侃": 53,
+        "眨眼": 53,
+        "嗔怪": 52,
+        "眼神闪烁": 52,
+        "莞尔": 50
+      }
+    },
+    "action": {
+      "annotated_clips": 12660,
+      "unique_selected": 6145,
+      "unique_available": 6145,
+      "clips_with_dataset_frequency_1_to_4": 6950,
+      "top_selected": {
+        "<unannotated>": 6359,
+        "无动作": 176,
+        "手背托下巴": 68,
+        "身体前倾": 60,
+        "低头": 55,
+        "身体微前倾": 54,
+        "单手托下巴": 49,
+        "抬头仰望": 49,
+        "身体前倾缓慢后撤": 49,
+        "侧头歪脖": 48,
+        "身体后靠": 47,
+        "手指点太阳穴": 45,
+        "指尖轻弹": 45,
+        "指尖轻敲": 44,
+        "低头浅笑": 44,
+        "轻咬下唇": 44,
+        "单手握拳托腮": 42,
+        "双手背后": 41,
+        "缓慢后仰": 41,
+        "眼神闪烁": 41
+      }
+    }
+  },
+  "subsets": {
+    "smoke": {
+      "size": 512,
+      "path": "train_step1_smoke_512.txt",
+      "nested_superset_of_previous": true,
+      "clips": 512,
+      "duration_hours": 0.8880138888888889,
+      "duration_seconds": {
+        "count": 512,
+        "min": 3.0,
+        "p10": 3.85,
+        "median": 6.074999999999999,
+        "p90": 8.645000000000001,
+        "max": 13.2,
+        "mean": 6.24384765625
+      },
+      "complexity_score": {
+        "count": 512,
+        "min": 0.00034178147018613947,
+        "p10": 0.13738694920601538,
+        "median": 0.5117717425596803,
+        "p90": 0.8194920601535388,
+        "max": 0.9862235776632664,
+        "mean": 0.49975295813505627
+      },
+      "source": {
+        "unique": 2,
+        "counts": {
+          "fbx_to_json_data_susu_retarget_maya": 472,
+          "fbx_to_json_data_susu_chonglu": 40
+        }
+      },
+      "session": {
+        "unique": 72,
+        "counts": {
+          "fbx_to_json_data_susu_chonglu/20260115": 15,
+          "fbx_to_json_data_susu_chonglu/20260119": 13,
+          "fbx_to_json_data_susu_chonglu/20260116": 12,
+          "fbx_to_json_data_susu_retarget_maya/20250901": 12,
+          "fbx_to_json_data_susu_retarget_maya/20250904": 12,
+          "fbx_to_json_data_susu_retarget_maya/20250909": 12,
+          "fbx_to_json_data_susu_retarget_maya/20250910": 12,
+          "fbx_to_json_data_susu_retarget_maya/20250911": 12,
+          "fbx_to_json_data_susu_retarget_maya/20250912": 12,
+          "fbx_to_json_data_susu_retarget_maya/20250916": 12,
+          "fbx_to_json_data_susu_retarget_maya/20250805": 11,
+          "fbx_to_json_data_susu_retarget_maya/20250820": 11,
+          "fbx_to_json_data_susu_retarget_maya/20250829": 11,
+          "fbx_to_json_data_susu_retarget_maya/20250902": 11,
+          "fbx_to_json_data_susu_retarget_maya/20250903": 11,
+          "fbx_to_json_data_susu_retarget_maya/20250915": 11,
+          "fbx_to_json_data_susu_retarget_maya/20250806": 10,
+          "fbx_to_json_data_susu_retarget_maya/20250821": 10,
+          "fbx_to_json_data_susu_retarget_maya/20250826": 10,
+          "fbx_to_json_data_susu_retarget_maya/20250828": 10,
+          "fbx_to_json_data_susu_retarget_maya/20250905": 9,
+          "fbx_to_json_data_susu_retarget_maya/20250801": 8,
+          "fbx_to_json_data_susu_retarget_maya/20250804": 8,
+          "fbx_to_json_data_susu_retarget_maya/20250815": 8,
+          "fbx_to_json_data_susu_retarget_maya/20250825": 8,
+          "fbx_to_json_data_susu_retarget_maya/20250929": 8,
+          "fbx_to_json_data_susu_retarget_maya/20250813": 7,
+          "fbx_to_json_data_susu_retarget_maya/20250822": 7,
+          "fbx_to_json_data_susu_retarget_maya/20251015": 7,
+          "fbx_to_json_data_susu_retarget_maya/20251022": 7,
+          "fbx_to_json_data_susu_retarget_maya/20251029": 7,
+          "fbx_to_json_data_susu_retarget_maya/20251031": 7,
+          "fbx_to_json_data_susu_retarget_maya/20251104": 7,
+          "fbx_to_json_data_susu_retarget_maya/20251107": 7,
+          "fbx_to_json_data_susu_retarget_maya/20250819": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251009": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251011": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251013": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251103": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251110": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251111": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251112": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251113": 6,
+          "fbx_to_json_data_susu_retarget_maya/20251119": 6,
+          "fbx_to_json_data_susu_retarget_maya/20250812": 5,
+          "fbx_to_json_data_susu_retarget_maya/20250818": 5,
+          "fbx_to_json_data_susu_retarget_maya/20250917": 5,
+          "fbx_to_json_data_susu_retarget_maya/20250919": 5,
+          "fbx_to_json_data_susu_retarget_maya/20250923": 5,
+          "fbx_to_json_data_susu_retarget_maya/20250925": 5,
+          "fbx_to_json_data_susu_retarget_maya/20250926": 5,
+          "fbx_to_json_data_susu_retarget_maya/20250928": 5,
+          "fbx_to_json_data_susu_retarget_maya/20251010": 5,
+          "fbx_to_json_data_susu_retarget_maya/20251014": 5,
+          "fbx_to_json_data_susu_retarget_maya/20251020": 5,
+          "fbx_to_json_data_susu_retarget_maya/20251028": 5,
+          "fbx_to_json_data_susu_retarget_maya/20251106": 5,
+          "fbx_to_json_data_susu_retarget_maya/20251121": 5,
+          "fbx_to_json_data_susu_retarget_maya/20250918": 4,
+          "fbx_to_json_data_susu_retarget_maya/20250922": 4,
+          "fbx_to_json_data_susu_retarget_maya/20250924": 4,
+          "fbx_to_json_data_susu_retarget_maya/20250930": 4,
+          "fbx_to_json_data_susu_retarget_maya/20251016": 4,
+          "fbx_to_json_data_susu_retarget_maya/20251024": 4,
+          "fbx_to_json_data_susu_retarget_maya/20251105": 4,
+          "fbx_to_json_data_susu_retarget_maya/20251125": 4,
+          "fbx_to_json_data_susu_retarget_maya/20250814": 3,
+          "fbx_to_json_data_susu_retarget_maya/20251027": 3,
+          "fbx_to_json_data_susu_retarget_maya/20251030": 3,
+          "fbx_to_json_data_susu_retarget_maya/20251021": 2,
+          "fbx_to_json_data_susu_retarget_maya/20251120": 2,
+          "fbx_to_json_data_susu_retarget_maya/20251126": 2
+        }
+      },
+      "duration_bin": {
+        "unique": 5,
+        "counts": {
+          "q1of5": 103,
+          "q3of5": 103,
+          "q2of5": 102,
+          "q4of5": 102,
+          "q5of5": 102
+        }
+      },
+      "complexity_bin": {
+        "unique": 5,
+        "counts": {
+          "q2of5": 103,
+          "q3of5": 103,
+          "q1of5": 102,
+          "q4of5": 102,
+          "q5of5": 102
+        }
+      },
+      "text_length_bin": {
+        "unique": 5,
+        "counts": {
+          "q3of5": 103,
+          "q5of5": 103,
+          "q1of5": 102,
+          "q2of5": 102,
+          "q4of5": 102
+        }
+      },
+      "annotation_pattern": {
+        "unique": 4,
+        "counts": {
+          "action-only": 212,
+          "expression+action": 135,
+          "expression-only": 104,
+          "no-tags": 61
+        }
+      },
+      "expression": {
+        "annotated_clips": 239,
+        "unique_selected": 217,
+        "unique_available": 1714,
+        "clips_with_dataset_frequency_1_to_4": 16,
+        "top_selected": {
+          "<unannotated>": 273,
+          "偷笑": 2,
+          "狡黠": 2,
+          "调皮": 2,
+          "若有所思": 2,
+          "若无其事": 2,
+          "单眼眨": 2,
+          "轻笑": 2,
+          "嗔怪": 2,
+          "小得意": 2,
+          "甜美微笑": 2,
+          "傲娇": 2,
+          "眯眼笑": 2,
+          "欲拒还迎": 2,
+          "微笑": 2,
+          "撇嘴": 2,
+          "挑眉": 2,
+          "抿嘴": 2,
+          "坏笑": 2,
+          "闪躲": 2
+        }
+      },
+      "action": {
+        "annotated_clips": 347,
+        "unique_selected": 346,
+        "unique_available": 6145,
+        "clips_with_dataset_frequency_1_to_4": 163,
+        "top_selected": {
+          "<unannotated>": 165,
+          "无动作": 2,
+          "托着下巴，做出倾听的姿态": 1,
+          "轻轻摆了摆手": 1,
+          "双手叉腰": 1,
+          "托着下巴做思考状": 1,
+          "双手托着下巴": 1,
+          "垂下眼睫": 1,
+          "手背托下巴": 1,
+          "双手交叠悬空": 1,
+          "身体前倾缓慢后撤": 1,
+          "身体前倾": 1,
+          "双腿交叉站立": 1,
+          "轻拨发丝": 1,
+          "微微摇头": 1,
+          "微微歪头看着他": 1,
+          "眼神游离": 1,
+          "一只脚轻轻踩另一只脚": 1,
+          "手指点太阳穴": 1,
+          "毫无征兆地以脚尖为支点，快速地转了一圈回到正面，然后站定，歪着头看你，好像什么都没发生。": 1
+        }
+      }
+    },
+    "pilot": {
+      "size": 2000,
+      "path": "train_step1_pilot_2000.txt",
+      "nested_superset_of_previous": true,
+      "clips": 2000,
+      "duration_hours": 3.4699861111111114,
+      "duration_seconds": {
+        "count": 2000,
+        "min": 3.0,
+        "p10": 3.9,
+        "median": 6.05,
+        "p90": 8.7,
+        "max": 15.95,
+        "mean": 6.2459750000000005
+      },
+      "complexity_score": {
+        "count": 2000,
+        "min": 0.00034178147018613947,
+        "p10": 0.13852534441055842,
+        "median": 0.5132045956462299,
+        "p90": 0.8234777579135556,
+        "max": 0.995083605005784,
+        "mean": 0.5013106267746346
+      },
+      "source": {
+        "unique": 2,
+        "counts": {
+          "fbx_to_json_data_susu_retarget_maya": 1841,
+          "fbx_to_json_data_susu_chonglu": 159
+        }
+      },
+      "session": {
+        "unique": 72,
+        "counts": {
+          "fbx_to_json_data_susu_chonglu/20260115": 61,
+          "fbx_to_json_data_susu_retarget_maya/20250916": 51,
+          "fbx_to_json_data_susu_chonglu/20260119": 50,
+          "fbx_to_json_data_susu_retarget_maya/20250912": 49,
+          "fbx_to_json_data_susu_chonglu/20260116": 48,
+          "fbx_to_json_data_susu_retarget_maya/20250904": 48,
+          "fbx_to_json_data_susu_retarget_maya/20250911": 48,
+          "fbx_to_json_data_susu_retarget_maya/20250909": 47,
+          "fbx_to_json_data_susu_retarget_maya/20250910": 47,
+          "fbx_to_json_data_susu_retarget_maya/20250901": 46,
+          "fbx_to_json_data_susu_retarget_maya/20250915": 46,
+          "fbx_to_json_data_susu_retarget_maya/20250902": 45,
+          "fbx_to_json_data_susu_retarget_maya/20250829": 44,
+          "fbx_to_json_data_susu_retarget_maya/20250903": 44,
+          "fbx_to_json_data_susu_retarget_maya/20250805": 43,
+          "fbx_to_json_data_susu_retarget_maya/20250820": 43,
+          "fbx_to_json_data_susu_retarget_maya/20250806": 40,
+          "fbx_to_json_data_susu_retarget_maya/20250821": 39,
+          "fbx_to_json_data_susu_retarget_maya/20250828": 38,
+          "fbx_to_json_data_susu_retarget_maya/20250826": 37,
+          "fbx_to_json_data_susu_retarget_maya/20250905": 37,
+          "fbx_to_json_data_susu_retarget_maya/20250825": 33,
+          "fbx_to_json_data_susu_retarget_maya/20250804": 31,
+          "fbx_to_json_data_susu_retarget_maya/20250815": 31,
+          "fbx_to_json_data_susu_retarget_maya/20250801": 30,
+          "fbx_to_json_data_susu_retarget_maya/20250929": 30,
+          "fbx_to_json_data_susu_retarget_maya/20250822": 29,
+          "fbx_to_json_data_susu_retarget_maya/20251015": 27,
+          "fbx_to_json_data_susu_retarget_maya/20250813": 26,
+          "fbx_to_json_data_susu_retarget_maya/20251022": 26,
+          "fbx_to_json_data_susu_retarget_maya/20251029": 26,
+          "fbx_to_json_data_susu_retarget_maya/20251031": 26,
+          "fbx_to_json_data_susu_retarget_maya/20251104": 26,
+          "fbx_to_json_data_susu_retarget_maya/20251107": 26,
+          "fbx_to_json_data_susu_retarget_maya/20251110": 25,
+          "fbx_to_json_data_susu_retarget_maya/20250819": 24,
+          "fbx_to_json_data_susu_retarget_maya/20251111": 24,
+          "fbx_to_json_data_susu_retarget_maya/20251113": 24,
+          "fbx_to_json_data_susu_retarget_maya/20251011": 23,
+          "fbx_to_json_data_susu_retarget_maya/20251009": 22,
+          "fbx_to_json_data_susu_retarget_maya/20251013": 22,
+          "fbx_to_json_data_susu_retarget_maya/20251103": 22,
+          "fbx_to_json_data_susu_retarget_maya/20251112": 22,
+          "fbx_to_json_data_susu_retarget_maya/20251119": 22,
+          "fbx_to_json_data_susu_retarget_maya/20251010": 21,
+          "fbx_to_json_data_susu_retarget_maya/20251020": 21,
+          "fbx_to_json_data_susu_retarget_maya/20251106": 21,
+          "fbx_to_json_data_susu_retarget_maya/20250812": 20,
+          "fbx_to_json_data_susu_retarget_maya/20250818": 20,
+          "fbx_to_json_data_susu_retarget_maya/20250923": 20,
+          "fbx_to_json_data_susu_retarget_maya/20250925": 20,
+          "fbx_to_json_data_susu_retarget_maya/20250926": 20,
+          "fbx_to_json_data_susu_retarget_maya/20251014": 20,
+          "fbx_to_json_data_susu_retarget_maya/20251121": 20,
+          "fbx_to_json_data_susu_retarget_maya/20250917": 18,
+          "fbx_to_json_data_susu_retarget_maya/20250919": 18,
+          "fbx_to_json_data_susu_retarget_maya/20251028": 18,
+          "fbx_to_json_data_susu_retarget_maya/20250928": 17,
+          "fbx_to_json_data_susu_retarget_maya/20250930": 17,
+          "fbx_to_json_data_susu_retarget_maya/20251105": 17,
+          "fbx_to_json_data_susu_retarget_maya/20250918": 16,
+          "fbx_to_json_data_susu_retarget_maya/20250922": 16,
+          "fbx_to_json_data_susu_retarget_maya/20251024": 15,
+          "fbx_to_json_data_susu_retarget_maya/20251125": 15,
+          "fbx_to_json_data_susu_retarget_maya/20251016": 14,
+          "fbx_to_json_data_susu_retarget_maya/20250814": 13,
+          "fbx_to_json_data_susu_retarget_maya/20250924": 13,
+          "fbx_to_json_data_susu_retarget_maya/20251027": 11,
+          "fbx_to_json_data_susu_retarget_maya/20251030": 11,
+          "fbx_to_json_data_susu_retarget_maya/20251021": 8,
+          "fbx_to_json_data_susu_retarget_maya/20251126": 7,
+          "fbx_to_json_data_susu_retarget_maya/20251120": 5
+        }
+      },
+      "duration_bin": {
+        "unique": 5,
+        "counts": {
+          "q4of5": 401,
+          "q2of5": 400,
+          "q3of5": 400,
+          "q5of5": 400,
+          "q1of5": 399
+        }
+      },
+      "complexity_bin": {
+        "unique": 5,
+        "counts": {
+          "q1of5": 400,
+          "q2of5": 400,
+          "q3of5": 400,
+          "q4of5": 400,
+          "q5of5": 400
+        }
+      },
+      "text_length_bin": {
+        "unique": 5,
+        "counts": {
+          "q2of5": 401,
+          "q4of5": 401,
+          "q1of5": 400,
+          "q3of5": 399,
+          "q5of5": 399
+        }
+      },
+      "annotation_pattern": {
+        "unique": 4,
+        "counts": {
+          "action-only": 826,
+          "expression+action": 531,
+          "expression-only": 406,
+          "no-tags": 237
+        }
+      },
+      "expression": {
+        "annotated_clips": 937,
+        "unique_selected": 690,
+        "unique_available": 1714,
+        "clips_with_dataset_frequency_1_to_4": 217,
+        "top_selected": {
+          "<unannotated>": 1063,
+          "偷笑": 5,
+          "狡黠": 5,
+          "调皮": 5,
+          "若有所思": 5,
+          "若无其事": 5,
+          "单眼眨": 5,
+          "轻笑": 5,
+          "小得意": 5,
+          "傲娇": 5,
+          "欲拒还迎": 5,
+          "调侃": 5,
+          "嗔怪": 4,
+          "莞尔": 4,
+          "眨眼": 4,
+          "玩味": 4,
+          "甜美微笑": 4,
+          "眯眼笑": 4,
+          "微笑": 4,
+          "撇嘴": 4
+        }
+      },
+      "action": {
+        "annotated_clips": 1357,
+        "unique_selected": 1198,
+        "unique_available": 6145,
+        "clips_with_dataset_frequency_1_to_4": 767,
+        "top_selected": {
+          "<unannotated>": 643,
+          "无动作": 8,
+          "手背托下巴": 4,
+          "身体前倾": 4,
+          "低头": 4,
+          "身体微前倾": 4,
+          "双手叉腰": 3,
+          "身体前倾缓慢后撤": 3,
+          "轻拨发丝": 3,
+          "手指点太阳穴": 3,
+          "双手背后": 3,
+          "脸颊比心": 3,
+          "眼神追随": 3,
+          "身体微微后倾": 3,
+          "缓慢后仰": 3,
+          "侧头歪脖": 3,
+          "抬头仰望": 3,
+          "嘴角轻扬": 3,
+          "身体后靠": 3,
+          "指尖轻敲": 3
+        }
+      }
+    },
+    "main": {
+      "size": 6000,
+      "path": "train_step1_main_6000.txt",
+      "nested_superset_of_previous": true,
+      "clips": 6000,
+      "duration_hours": 10.439819444444444,
+      "duration_seconds": {
+        "count": 6000,
+        "min": 3.0,
+        "p10": 3.95,
+        "median": 6.05,
+        "p90": 8.7,
+        "max": 35.45,
+        "mean": 6.263891666666667
+      },
+      "complexity_score": {
+        "count": 6000,
+        "min": 0.00034178147018613947,
+        "p10": 0.14081790934903776,
+        "median": 0.5144336943947838,
+        "p90": 0.8237722157955623,
+        "max": 0.9996450730886528,
+        "mean": 0.5007698539979668
+      },
+      "source": {
+        "unique": 2,
+        "counts": {
+          "fbx_to_json_data_susu_retarget_maya": 5517,
+          "fbx_to_json_data_susu_chonglu": 483
+        }
+      },
+      "session": {
+        "unique": 72,
+        "counts": {
+          "fbx_to_json_data_susu_chonglu/20260115": 185,
+          "fbx_to_json_data_susu_chonglu/20260119": 153,
+          "fbx_to_json_data_susu_retarget_maya/20250916": 150,
+          "fbx_to_json_data_susu_chonglu/20260116": 145,
+          "fbx_to_json_data_susu_retarget_maya/20250912": 145,
+          "fbx_to_json_data_susu_retarget_maya/20250911": 142,
+          "fbx_to_json_data_susu_retarget_maya/20250904": 141,
+          "fbx_to_json_data_susu_retarget_maya/20250910": 141,
+          "fbx_to_json_data_susu_retarget_maya/20250909": 140,
+          "fbx_to_json_data_susu_retarget_maya/20250901": 139,
+          "fbx_to_json_data_susu_retarget_maya/20250915": 135,
+          "fbx_to_json_data_susu_retarget_maya/20250902": 134,
+          "fbx_to_json_data_susu_retarget_maya/20250829": 132,
+          "fbx_to_json_data_susu_retarget_maya/20250903": 132,
+          "fbx_to_json_data_susu_retarget_maya/20250820": 131,
+          "fbx_to_json_data_susu_retarget_maya/20250805": 130,
+          "fbx_to_json_data_susu_retarget_maya/20250806": 120,
+          "fbx_to_json_data_susu_retarget_maya/20250821": 117,
+          "fbx_to_json_data_susu_retarget_maya/20250828": 114,
+          "fbx_to_json_data_susu_retarget_maya/20250826": 112,
+          "fbx_to_json_data_susu_retarget_maya/20250905": 110,
+          "fbx_to_json_data_susu_retarget_maya/20250825": 98,
+          "fbx_to_json_data_susu_retarget_maya/20250815": 94,
+          "fbx_to_json_data_susu_retarget_maya/20250804": 92,
+          "fbx_to_json_data_susu_retarget_maya/20250801": 91,
+          "fbx_to_json_data_susu_retarget_maya/20250929": 91,
+          "fbx_to_json_data_susu_retarget_maya/20250822": 87,
+          "fbx_to_json_data_susu_retarget_maya/20251015": 82,
+          "fbx_to_json_data_susu_retarget_maya/20251107": 80,
+          "fbx_to_json_data_susu_retarget_maya/20251029": 79,
+          "fbx_to_json_data_susu_retarget_maya/20251031": 79,
+          "fbx_to_json_data_susu_retarget_maya/20251022": 78,
+          "fbx_to_json_data_susu_retarget_maya/20251104": 78,
+          "fbx_to_json_data_susu_retarget_maya/20250813": 77,
+          "fbx_to_json_data_susu_retarget_maya/20251110": 74,
+          "fbx_to_json_data_susu_retarget_maya/20251113": 73,
+          "fbx_to_json_data_susu_retarget_maya/20250819": 72,
+          "fbx_to_json_data_susu_retarget_maya/20251111": 72,
+          "fbx_to_json_data_susu_retarget_maya/20251011": 70,
+          "fbx_to_json_data_susu_retarget_maya/20251009": 68,
+          "fbx_to_json_data_susu_retarget_maya/20251119": 67,
+          "fbx_to_json_data_susu_retarget_maya/20251013": 66,
+          "fbx_to_json_data_susu_retarget_maya/20251103": 66,
+          "fbx_to_json_data_susu_retarget_maya/20251112": 66,
+          "fbx_to_json_data_susu_retarget_maya/20251020": 64,
+          "fbx_to_json_data_susu_retarget_maya/20251010": 63,
+          "fbx_to_json_data_susu_retarget_maya/20251106": 63,
+          "fbx_to_json_data_susu_retarget_maya/20250923": 62,
+          "fbx_to_json_data_susu_retarget_maya/20250926": 62,
+          "fbx_to_json_data_susu_retarget_maya/20251014": 62,
+          "fbx_to_json_data_susu_retarget_maya/20250818": 61,
+          "fbx_to_json_data_susu_retarget_maya/20250925": 61,
+          "fbx_to_json_data_susu_retarget_maya/20250812": 59,
+          "fbx_to_json_data_susu_retarget_maya/20251121": 59,
+          "fbx_to_json_data_susu_retarget_maya/20251028": 55,
+          "fbx_to_json_data_susu_retarget_maya/20250917": 53,
+          "fbx_to_json_data_susu_retarget_maya/20250919": 53,
+          "fbx_to_json_data_susu_retarget_maya/20250928": 53,
+          "fbx_to_json_data_susu_retarget_maya/20250930": 50,
+          "fbx_to_json_data_susu_retarget_maya/20251105": 50,
+          "fbx_to_json_data_susu_retarget_maya/20250918": 47,
+          "fbx_to_json_data_susu_retarget_maya/20250922": 47,
+          "fbx_to_json_data_susu_retarget_maya/20251024": 44,
+          "fbx_to_json_data_susu_retarget_maya/20251125": 44,
+          "fbx_to_json_data_susu_retarget_maya/20251016": 41,
+          "fbx_to_json_data_susu_retarget_maya/20250924": 39,
+          "fbx_to_json_data_susu_retarget_maya/20250814": 37,
+          "fbx_to_json_data_susu_retarget_maya/20251027": 33,
+          "fbx_to_json_data_susu_retarget_maya/20251030": 33,
+          "fbx_to_json_data_susu_retarget_maya/20251021": 25,
+          "fbx_to_json_data_susu_retarget_maya/20251126": 19,
+          "fbx_to_json_data_susu_retarget_maya/20251120": 13
+        }
+      },
+      "duration_bin": {
+        "unique": 5,
+        "counts": {
+          "q1of5": 1200,
+          "q2of5": 1200,
+          "q3of5": 1200,
+          "q4of5": 1200,
+          "q5of5": 1200
+        }
+      },
+      "complexity_bin": {
+        "unique": 5,
+        "counts": {
+          "q1of5": 1200,
+          "q2of5": 1200,
+          "q3of5": 1200,
+          "q4of5": 1200,
+          "q5of5": 1200
+        }
+      },
+      "text_length_bin": {
+        "unique": 5,
+        "counts": {
+          "q2of5": 1201,
+          "q1of5": 1200,
+          "q3of5": 1200,
+          "q4of5": 1200,
+          "q5of5": 1199
+        }
+      },
+      "annotation_pattern": {
+        "unique": 4,
+        "counts": {
+          "action-only": 2492,
+          "expression+action": 1595,
+          "expression-only": 1209,
+          "no-tags": 704
+        }
+      },
+      "expression": {
+        "annotated_clips": 2804,
+        "unique_selected": 1520,
+        "unique_available": 1714,
+        "clips_with_dataset_frequency_1_to_4": 1102,
+        "top_selected": {
+          "<unannotated>": 3196,
+          "狡黠": 16,
+          "调皮": 15,
+          "若无其事": 15,
+          "轻笑": 15,
+          "若有所思": 14,
+          "单眼眨": 14,
+          "小得意": 14,
+          "欲拒还迎": 14,
+          "偷笑": 13,
+          "嗔怪": 13,
+          "眨眼": 13,
+          "玩味": 13,
+          "傲娇": 13,
+          "微笑": 13,
+          "调侃": 13,
+          "挑眉": 13,
+          "坏笑": 13,
+          "眼神闪烁": 13,
+          "莞尔": 12
+        }
+      },
+      "action": {
+        "annotated_clips": 4087,
+        "unique_selected": 3319,
+        "unique_available": 6145,
+        "clips_with_dataset_frequency_1_to_4": 2894,
+        "top_selected": {
+          "<unannotated>": 1913,
+          "无动作": 21,
+          "身体前倾": 10,
+          "身体微前倾": 9,
+          "手背托下巴": 8,
+          "低头": 8,
+          "双手背后": 7,
+          "侧头歪脖": 7,
+          "单手托下巴": 7,
+          "双手叉腰": 6,
+          "身体前倾缓慢后撤": 6,
+          "轻拨发丝": 6,
+          "手指点太阳穴": 6,
+          "脸颊比心": 6,
+          "眼神追随": 6,
+          "缓慢后仰": 6,
+          "抬头仰望": 6,
+          "嘴角轻扬": 6,
+          "身体后靠": 6,
+          "指尖轻敲": 6
+        }
+      }
+    }
+  }
+}

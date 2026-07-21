@@ -84,10 +84,15 @@ Training reports aggregate accuracy and all 16 part/quantizer accuracies. Latent
 motion_generation/utils/adaptive_anchor_tokens.py
 motion_generation/models/step1_mimi_planner.py
 motion_generation/scripts/precompute_mimi_audio_tokens.py
+motion_generation/scripts/build_step1_training_subsets.py
 motion_generation/scripts/export_step1_seed_anchor.py
 motion_generation/scripts/validate_step1_fixed_gap_data.py
 motion_generation/scripts/train_step1_multipart_fixed_gap3.py
 motion_generation/configs/step1_multipart_fixed_gap3.yaml
+motion_generation/configs/step1_multipart_fixed_gap3_smoke512.yaml
+motion_generation/configs/step1_multipart_fixed_gap3_pilot2000.yaml
+motion_generation/configs/step1_multipart_fixed_gap3_main6000.yaml
+motion_generation/data_splits/step1_balanced_seed42/
 motion_generation/models/test_step1_mimi_planner.py
 motion_generation/notebooks/phase1_mimi_preflight.ipynb
 ```
@@ -182,19 +187,62 @@ neutral_seed_json: motion_generation/configs/step1_neutral_seed.json
 
 Do not call an arbitrary first frame neutral without visual verification.
 
-## 9. Four-GPU training
+## 9. Build the nested training subsets
+
+Precompute Mimi and causal body tokens for the full dataset, but do not use the
+full 19,019-clip train split for the first Phase 1 experiment. Build the
+reproducible nested subsets once:
+
+```bash
+python motion_generation/scripts/build_step1_training_subsets.py
+```
+
+The output contract is:
+
+```text
+motion_generation/data_splits/step1_balanced_seed42/
+  train_step1_smoke_512.txt
+  train_step1_pilot_2000.txt
+  train_step1_main_6000.txt
+  selected_main_metadata.csv
+  subset_report.json
+```
+
+The subsets are nested (`512 in 2,000 in 6,000`) and use only the official
+training split. The builder fails on any duplicate or train/val/test overlap.
+It balances:
+
+- both capture sources and all 72 training sessions;
+- five duration quantiles;
+- five text-length quantiles;
+- tag-availability modes and tempered exact-tag diversity; and
+- five codec-independent raw-motion complexity quantiles.
+
+Motion complexity is the mean percentile rank of body and hand 6D-rotation
+mean/p90 change. These arrays exist for every clip and avoid confounding the
+selection with the dataset's inconsistent `positions` availability. Position
+availability is still reported as a data-quality audit but does not influence
+membership. The builder does not read MSD or codec outputs.
+
+For seed 42, every pilot and main duration/complexity bin is exactly balanced;
+the smoke bins differ by at most one clip. The generated local report records
+the exact distributions, signal fallbacks, and leakage checks. A metadata cache
+under `SuSuInterActs/SuSuInterActs/.cache/` makes reruns take seconds.
+
+## 10. Four-GPU training
 
 Validate every training and validation record before allocating four GPUs:
 
 ```bash
 python motion_generation/scripts/validate_step1_fixed_gap_data.py \
-  --config motion_generation/configs/step1_multipart_fixed_gap3.yaml \
-  --output_json checkpoints/step1_multipart_fixed_gap3/data_preflight.json
+  --config motion_generation/configs/step1_multipart_fixed_gap3_smoke512.yaml \
+  --output_json checkpoints/step1_multipart_fixed_gap3_smoke512/data_preflight.json
 ```
 
 This catches missing shards, noncausal motion exports, duration mismatches, token-range errors, and sequences over `max_length`.
 
-First run a small integration job:
+Run the 512-clip, one-epoch integration stage first. It still evaluates on all
+635 validation clips:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -202,12 +250,11 @@ NCCL_P2P_DISABLE=1 \
 NCCL_IB_DISABLE=1 \
 torchrun --nproc_per_node=4 --master_port=29515 \
   motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
-  --config motion_generation/configs/step1_multipart_fixed_gap3.yaml \
-  --max_train_clips 64 \
-  --max_eval_clips 32
+  --config motion_generation/configs/step1_multipart_fixed_gap3_smoke512.yaml
 ```
 
-Then run the complete training by removing the two `--max_*_clips` arguments:
+If serialization, memory, loss, and all 16 slot metrics are sound, run the
+2,000-clip pilot for three epochs:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -215,10 +262,11 @@ NCCL_P2P_DISABLE=1 \
 NCCL_IB_DISABLE=1 \
 torchrun --nproc_per_node=4 --master_port=29515 \
   motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
-  --config motion_generation/configs/step1_multipart_fixed_gap3.yaml
+  --config motion_generation/configs/step1_multipart_fixed_gap3_pilot2000.yaml
 ```
 
-Resume all ranks from the same planner checkpoint:
+Then launch the clean 6,000-clip main run from the original Qwen planning
+checkpoint:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -226,13 +274,31 @@ NCCL_P2P_DISABLE=1 \
 NCCL_IB_DISABLE=1 \
 torchrun --nproc_per_node=4 --master_port=29515 \
   motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
-  --config motion_generation/configs/step1_multipart_fixed_gap3.yaml \
-  --resume_from_checkpoint checkpoints/step1_multipart_fixed_gap3/checkpoint-500
+  --config motion_generation/configs/step1_multipart_fixed_gap3_main6000.yaml
+```
+
+The main config permits at most 12 epochs and stops after three completed
+epochs without at least `0.001` validation-CE improvement. `best/` is updated
+on every improvement. The final test split remains untouched.
+
+Resume all ranks from the same checkpoint and the same stage config:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NCCL_P2P_DISABLE=1 \
+NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=4 --master_port=29515 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_multipart_fixed_gap3_main6000.yaml \
+  --resume_from_checkpoint checkpoints/step1_multipart_fixed_gap3_main6000/checkpoint-500
 ```
 
 The default global anchor-token batch is `2 clips/GPU x 4 GPUs x 8 accumulation = 64 clips/update`. Adjust only after measuring actual sequence lengths and GPU memory.
 
-## 10. Checkpoint format
+Do not use `--max_train_clips N` for a scientific subset; it takes the first N
+split entries and is retained only for debugging. Use the generated manifests.
+
+## 11. Checkpoint format
 
 Every saved directory is a standalone `MimiQwenPlanner` checkpoint containing:
 
@@ -243,9 +309,11 @@ Every saved directory is a standalone `MimiQwenPlanner` checkpoint containing:
 - optimizer/scheduler/global-step state; and
 - the source training YAML serialized as JSON.
 
-`latest_checkpoint.txt` points to the most recent save. `final/` is written after all epochs.
+`latest_checkpoint.txt` points to the most recent save. `best/` contains the
+lowest validation-CE checkpoint and `final/` contains the last state, including
+when training stops early.
 
-## 11. Generated-prefix curriculum
+## 12. Generated-prefix curriculum
 
 The first run uses GT previous anchors. The dataset already supports scheduled sampling from a rollout cache. A cache file has either form:
 
@@ -263,7 +331,7 @@ Set `generated_anchor_dir` and gradually raise `generated_prefix_probability` on
 
 The rollout-cache producer is intentionally deferred until the first checkpoint exists.
 
-## 12. Validation gates before Phase 2
+## 13. Validation gates before Phase 2
 
 1. Anchor CE must improve materially below the random `6.2383` reference.
 2. Report all 16 slot accuracies; do not accept a result driven only by easy lower-body slots.

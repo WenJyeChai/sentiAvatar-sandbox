@@ -1092,6 +1092,10 @@ Body-first results use 635 validation clips; face-enabled evaluation uses only t
 - keep Step 2 reference checkpoint permanently frozen for controls;
 - permit a trainable Step 2 copy only after predicted-anchor mismatch is measured;
 - train content before adaptive scheduling;
+- preprocess Mimi/body tokens for all clips but train the first fixed-gap
+  baseline on deterministic nested 512/2,000/6,000 train-only subsets;
+- balance the subsets with raw body/hand rotation dynamics and metadata, not
+  MSD outputs, while retaining the complete validation split;
 - use GT and predicted-content oracle gates before expensive end-to-end optimization;
 - do not optimize or interpret raw attention magnitude as grounding.
 
@@ -1137,6 +1141,7 @@ Before editing code, a new developer should:
 | Multipart codecs | `motion_generation/models/multipart_rvqvae.py` |
 | Multipart codec training | `motion_generation/scripts/train_multipart_rvqvae.py` |
 | Multipart token export | `motion_generation/scripts/export_multipart_motion_tokens.py` |
+| Step 1 balanced subset builder | `motion_generation/scripts/build_step1_training_subsets.py` |
 | Root and part preprocessing | `motion_generation/utils/multipart_motion.py` |
 | Step 2 detailed handoff | `motion_generation/STEP2_MULTIPART_C2F_HANDOFF.md` |
 | Multipart MSD atlas | `motion_generation/utils/msd/outputs/multipart_atlas_val/README.md` |
