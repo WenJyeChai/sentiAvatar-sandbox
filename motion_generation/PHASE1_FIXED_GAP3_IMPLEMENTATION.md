@@ -96,6 +96,7 @@ motion_generation/configs/step1_multipart_fixed_gap3_main6000.yaml
 motion_generation/data_splits/step1_balanced_seed42/
 motion_generation/models/test_step1_mimi_planner.py
 motion_generation/notebooks/phase1_mimi_preflight.ipynb
+motion_generation/notebooks/validate_causal_multipart_rvqvae.ipynb
 ```
 
 ## 5. Remote prerequisite
@@ -251,6 +252,14 @@ math and `body_causal=true`, and writes the consolidated `export_manifest.json`.
 The Step 1 loader additionally rejects any payload whose `body_causal` is not
 exactly `true`, whose part order differs, or whose slot/rate/codebook metadata
 is wrong.
+
+Before accepting Phase 0 quality, run
+`motion_generation/notebooks/validate_causal_multipart_rvqvae.ipynb` in a
+Jupyter process launched with `NVIDIA_TF32_OVERRIDE=0`. It performs the strict
+causal gate, full validation reconstruction metrics, q0-to-q3 ablation,
+codebook utilization/entropy analysis, runtime measurement, and qualitative
+error timelines. Its final report is written under
+`motion_generation/outputs/causal_codec_validation/`.
 
 ## 8. Optional neutral conversation-start seed
 
