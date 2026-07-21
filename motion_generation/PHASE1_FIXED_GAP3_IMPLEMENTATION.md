@@ -97,6 +97,8 @@ motion_generation/data_splits/step1_balanced_seed42/
 motion_generation/models/test_step1_mimi_planner.py
 motion_generation/notebooks/phase1_mimi_preflight.ipynb
 motion_generation/notebooks/validate_causal_multipart_rvqvae.ipynb
+motion_generation/notebooks/evaluate_step1_fixed_gap3_planner.ipynb
+motion_generation/utils/step1_planner_evaluation.py
 ```
 
 ## 5. Remote prerequisite
@@ -371,9 +373,10 @@ torchrun --nproc_per_node=4 --master_port=29515 \
   --config motion_generation/configs/step1_multipart_fixed_gap3_main6000.yaml
 ```
 
-The main config permits at most 12 epochs and stops after three completed
-epochs without at least `0.001` validation-CE improvement. `best/` is updated
-on every improvement. The final test split remains untouched.
+The main config runs through its configured 50 epochs with early stopping
+disabled so that the initial fixed-gap learning curve is observed in full.
+`best/` is still updated on every validation-CE improvement. The final test
+split remains untouched.
 
 Resume all ranks from the same checkpoint and the same stage config:
 
@@ -387,7 +390,10 @@ torchrun --nproc_per_node=4 --master_port=29515 \
   --resume_from_checkpoint checkpoints/step1_multipart_fixed_gap3_main6000/checkpoint-500
 ```
 
-The default global anchor-token batch is `2 clips/GPU x 4 GPUs x 8 accumulation = 64 clips/update`. Adjust only after measuring actual sequence lengths and GPU memory.
+The main run uses `32 clips/GPU x 4 GPUs x 1 accumulation = 128 clips/update`,
+matching the completed 6,000-clip experiment. The smoke and pilot configs keep
+their smaller integration settings. Adjust only after measuring actual
+sequence lengths and GPU memory.
 
 Do not use `--max_train_clips N` for a scientific subset; it takes the first N
 split entries and is retained only for debugging. Use the generated manifests.
@@ -423,7 +429,9 @@ or:
 
 Set `generated_anchor_dir` and gradually raise `generated_prefix_probability` only after the GT-prefix baseline converges. Input anchor ids are replaced by generated ids while CE targets remain GT, producing genuine generated-prefix exposure without changing the sequence grammar.
 
-The rollout-cache producer is intentionally deferred until the first checkpoint exists.
+The validation notebook now produces greedy generated-prefix rollout caches in
+the schema above. A separate training-split cache export should be run only
+after the validation rollout establishes that exposure bias is manageable.
 
 ## 13. Validation gates before Phase 2
 
@@ -433,5 +441,12 @@ The rollout-cache producer is intentionally deferred until the first checkpoint 
 4. Measure GT-prefix versus generated-prefix degradation.
 5. Decode predicted anchors through the new causal body codecs and inspect kinematics.
 6. Run predicted anchors through the frozen Step 2 reference before implementing adaptive gaps.
+
+The first five gates are implemented in
+`motion_generation/notebooks/evaluate_step1_fixed_gap3_planner.ipynb`. It
+compares `best` and `final`, fits train-unigram and previous-anchor baselines,
+runs KV-cached generated-prefix decoding, measures text/Mimi shuffle
+sensitivity, and reports codec-space oracle-gap anchor substitutions. It does
+not use the test split or claim Step 2 quality.
 
 Passing the causal Mimi preflight proves representation correctness, not downstream motion predictability.

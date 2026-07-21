@@ -23,10 +23,10 @@ data:
 
 training:
   seed: 42
-  num_train_epochs: 12
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 2
-  gradient_accumulation_steps: 8
+  num_train_epochs: 50
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 1
   learning_rate: 2.0e-5
   weight_decay: 0.01
   adam_betas: [0.9, 0.95]
@@ -39,8 +39,11 @@ training:
   eval_steps: 0
   save_steps: 100
   save_best: true
-  early_stopping_patience: 3
-  early_stopping_min_delta: 0.001
+  # Early stopping is disabled for the initial main learning curve. With these
+  # keys omitted, the trainer defaults early_stopping_patience to 0 (disabled)
+  # and runs through num_train_epochs while still saving the best checkpoint.
+  # early_stopping_patience: 3
+  # early_stopping_min_delta: 0.001
 
 monitoring:
   report_to: wandb
