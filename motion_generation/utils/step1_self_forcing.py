@@ -226,7 +226,6 @@ def generate_history_batch(
     )
 
 
-@torch.inference_mode()
 def apply_generated_history(
     model: MimiQwenPlanner,
     batch: Mapping[str, torch.Tensor],
@@ -235,7 +234,12 @@ def apply_generated_history(
     microbatch_size: int,
     use_bf16: bool,
 ) -> tuple[torch.Tensor, GeneratedHistoryBatchStats]:
-    """Return a cloned input tensor with selected rows fully self-forced."""
+    """Return a normal cloned input tensor with selected rows fully self-forced.
+
+    ``generate_history_batch`` owns the inference-mode boundary for the model
+    rollout.  This wrapper must stay outside that boundary because its returned
+    token IDs are consumed by the subsequent gradient-enabled training forward.
+    """
 
     generated_input_ids = batch["input_ids"].clone()
     stats = GeneratedHistoryBatchStats()

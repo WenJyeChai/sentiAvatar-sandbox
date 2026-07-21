@@ -176,3 +176,30 @@ def test_apply_generated_history_leaves_unselected_rows_teacher_forced() -> None
     assert stats.anchors == 1
     assert stats.tokens == BODY_SLOT_COUNT
     assert not torch.equal(generated[1, target_mask], batch["input_ids"][1, target_mask]) or stats.correct > 0
+
+
+def test_generated_history_can_feed_gradient_enabled_training_forward() -> None:
+    planner = tiny_q0q3_planner()
+    batch = synthetic_batch(planner)
+    generated, _ = apply_generated_history(
+        planner,
+        batch,
+        [0, 1],
+        microbatch_size=2,
+        use_bf16=False,
+    )
+
+    # Regression guard: inference tensors cannot be saved by embedding
+    # backward, even though input IDs themselves never require gradients.
+    assert not torch.is_inference(generated)
+    planner.train()
+    output = planner(
+        input_ids=generated,
+        attention_mask=batch["attention_mask"],
+        audio_codes=batch["audio_codes"],
+        target_slots=batch["target_slots"],
+        motion_local_labels=batch["motion_local_labels"],
+    )
+    assert output.loss is not None
+    output.loss.backward()
+    assert any(parameter.grad is not None for parameter in planner.parameters())

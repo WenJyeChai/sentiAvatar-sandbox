@@ -14,6 +14,11 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+# The tokenizer is constructed in the parent process and then inherited by
+# DataLoader workers. Explicitly disabling its internal thread pool avoids the
+# Hugging Face post-fork warning; DataLoader workers still provide parallelism.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import numpy as np
 import torch
 import torch.distributed as dist
