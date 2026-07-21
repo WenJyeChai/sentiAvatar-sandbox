@@ -10,7 +10,7 @@ paths:
 
 data:
   fixed_gap: 3
-  max_length: 2048
+  max_length: 2560
   num_workers: 4
   require_causal_motion: true
   max_duration_mismatch_seconds: 0.12
