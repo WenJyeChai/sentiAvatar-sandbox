@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -17,6 +18,7 @@ import torch
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 MODULE_DIR = PROJECT_DIR / "motion_generation"
 sys.path.insert(0, str(MODULE_DIR))
+FORMAT_VERSION = 2
 
 from models.multipart_rvqvae import MultiPartRVQVAE  # noqa: E402
 from utils.multipart_motion import (  # noqa: E402
@@ -54,6 +56,7 @@ class LoadedPartCodec:
     part: str
     model: MultiPartRVQVAE
     normalizer: PartNormalizer
+    normalizer_path: Path
     checkpoint_path: Path
     codebook_size: int
     num_quantizers: int
@@ -126,6 +129,7 @@ def load_part_codec(path: Path, device: torch.device) -> LoadedPartCodec:
         part=part,
         model=model,
         normalizer=normalizer,
+        normalizer_path=normalizer_path.resolve(),
         checkpoint_path=path,
         codebook_size=codebook_size,
         num_quantizers=num_quantizers,
@@ -142,6 +146,84 @@ def load_part_codec(path: Path, device: torch.device) -> LoadedPartCodec:
 def output_json_path(output_dir: Path, name: str) -> Path:
     parts = PurePosixPath(name.replace("\\", "/")).parts
     return output_dir / Path(*parts).with_suffix(".json")
+
+
+def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def names_sha256(names) -> str:
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(str(name).replace("\\", "/").encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def assigned_shard_names(names, num_shards: int, shard_id: int):
+    if num_shards < 1 or not 0 <= shard_id < num_shards:
+        raise ValueError("Require num_shards >= 1 and 0 <= shard_id < num_shards")
+    if len(names) != len(set(names)):
+        raise ValueError("Split file contains duplicate clip names")
+    return [name for index, name in enumerate(names) if index % num_shards == shard_id]
+
+
+def shard_manifest_name(num_shards: int, shard_id: int) -> str:
+    return f"export_manifest_shard_{shard_id:05d}_of_{num_shards:05d}.json"
+
+
+def atomic_write_json(path: Path, payload, *, indent: Optional[int] = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=indent)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def export_signature(payload: Mapping[str, object]) -> str:
+    serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def existing_output_matches(path: Path, name: str, signature: str) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return (
+            isinstance(payload, dict)
+            and payload.get("format_version") == FORMAT_VERSION
+            and payload.get("name") == name
+            and payload.get("export_signature") == signature
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def configure_strict_inference_math(device: torch.device) -> Dict[str, object]:
+    """Disable TF32 so full-prefix and streaming RVQ decisions stay stable."""
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.set_float32_matmul_precision("highest")
+    return {
+        "device_type": device.type,
+        "nvidia_tf32_override": os.environ.get("NVIDIA_TF32_OVERRIDE"),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+    }
 
 
 def build_token_layout(part_order, num_quantizers: int):
@@ -218,14 +300,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--motion_fps", type=float, default=20.0)
     parser.add_argument("--root_abs_threshold", type=float, default=10.0)
-    parser.add_argument("--max_clips", type=int, default=None)
+    parser.add_argument(
+        "--max_clips",
+        type=int,
+        default=None,
+        help="Optional number of assigned clips to export in this shard (debug only).",
+    )
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Number of disjoint modulo shards sharing the output directory.",
+    )
+    parser.add_argument(
+        "--shard_id",
+        type=int,
+        default=0,
+        help="Zero-based shard index in [0, num_shards).",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.max_clips is not None and args.max_clips < 1:
+        raise ValueError("max_clips must be positive")
+    if args.num_shards < 1 or not 0 <= args.shard_id < args.num_shards:
+        raise ValueError("Require num_shards >= 1 and 0 <= shard_id < num_shards")
     device = torch.device(args.device if torch.cuda.is_available() or "cuda" not in args.device else "cpu")
+    math_mode = configure_strict_inference_math(device)
     data_dir = args.data_dir.resolve()
     motion_dir = (args.motion_dir or data_dir / "motion_data").resolve()
     face_dir = (args.face_dir or data_dir / "arkit_data").resolve()
@@ -265,19 +369,57 @@ def main() -> None:
     token_layout = build_token_layout(part_order, num_quantizers)
     token_fps = float(args.motion_fps) / float(unit_length)
 
-    names = load_name_list(split_file)
+    all_names = load_name_list(split_file)
+    names = assigned_shard_names(all_names, args.num_shards, args.shard_id)
     if args.max_clips is not None:
         names = names[: args.max_clips]
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    counts = {"exported": 0, "skipped_existing": 0, "missing": 0, "failed": 0}
+    checkpoint_fingerprints = {
+        part: {
+            "path": str(loaded.checkpoint_path),
+            "sha256": sha256_file(loaded.checkpoint_path),
+            "normalizer_path": str(loaded.normalizer_path),
+            "normalizer_sha256": sha256_file(loaded.normalizer_path),
+        }
+        for part, loaded in codecs.items()
+    }
+    signature_payload = {
+        "format_version": FORMAT_VERSION,
+        "motion_fps": float(args.motion_fps),
+        "motion_token_fps": token_fps,
+        "motion_token_unit_length": unit_length,
+        "codebook_size": codebook_size,
+        "num_quantizers": num_quantizers,
+        "part_order": list(part_order),
+        "token_layout": token_layout,
+        "causal_by_part": {part: loaded.causal for part, loaded in codecs.items()},
+        "checkpoint_fingerprints": checkpoint_fingerprints,
+        "math_mode": math_mode,
+    }
+    signature = export_signature(signature_payload)
+    print(
+        f"Shard {args.shard_id}/{args.num_shards}: {len(names)} assigned "
+        f"from {len(all_names)} split clips"
+    )
+    print("Strict inference math:", math_mode)
+
+    counts = {
+        "exported": 0,
+        "skipped_existing": 0,
+        "invalid_existing_rewritten": 0,
+        "missing": 0,
+        "failed": 0,
+    }
     for index, name in enumerate(names, start=1):
         motion_path = motion_path_for_name(motion_dir, name)
         face_path = motion_path_for_name(face_dir, name)
         out_path = output_json_path(output_dir, name)
         if out_path.exists() and not args.overwrite:
-            counts["skipped_existing"] += 1
-            continue
+            if existing_output_matches(out_path, name, signature):
+                counts["skipped_existing"] += 1
+                continue
+            counts["invalid_existing_rewritten"] += 1
         if not motion_path.exists() or (FACE_PART in part_order and not face_path.exists()):
             counts["missing"] += 1
             continue
@@ -306,14 +448,17 @@ def main() -> None:
                 "token_layout": token_layout,
                 "root_schema": meta.get("root_schema"),
                 "root_mean_norm": meta.get("root_mean_norm"),
+                "source_part_frames": meta.get("source_part_frames"),
+                "aligned_source_frames": meta.get("aligned_source_frames"),
                 "source_motion_path": str(motion_path),
                 "source_face_path": str(face_path) if FACE_PART in part_order else None,
                 "part_checkpoints": {part: str(loaded.checkpoint_path) for part, loaded in codecs.items()},
                 "causal_by_part": {part: loaded.causal for part, loaded in codecs.items()},
                 "body_causal": all(codecs[part].causal for part in PART_ORDER),
             }
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False)
+            payload["format_version"] = FORMAT_VERSION
+            payload["export_signature"] = signature
+            atomic_write_json(out_path, payload)
             counts["exported"] += 1
         except Exception as exc:
             counts["failed"] += 1
@@ -322,29 +467,42 @@ def main() -> None:
         if index % 100 == 0:
             print(f"{index}/{len(names)} {counts}")
 
-    with open(output_dir / "export_manifest.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "split_file": str(split_file),
-                "motion_dir": str(motion_dir),
-                "output_dir": str(output_dir),
-                "counts": counts,
-                "motion_fps": float(args.motion_fps),
-                "motion_token_fps": token_fps,
-                "motion_token_unit_length": unit_length,
-                "codebook_size": codebook_size,
-                "num_quantizers": num_quantizers,
-                "part_order": list(part_order),
-                "tokens_per_frame": len(part_order) * num_quantizers,
-                "token_layout": token_layout,
-                "causal_by_part": {part: loaded.causal for part, loaded in codecs.items()},
-                "body_causal": all(codecs[part].causal for part in PART_ORDER),
-            },
-            f,
-            indent=2,
-        )
+    manifest = {
+        "format_version": FORMAT_VERSION,
+        "split_file": str(split_file),
+        "motion_dir": str(motion_dir),
+        "output_dir": str(output_dir),
+        "shard_id": int(args.shard_id),
+        "num_shards": int(args.num_shards),
+        "total_split_clips": len(all_names),
+        "assigned_clips": len(names),
+        "split_names_sha256": names_sha256(all_names),
+        "assigned_names_sha256": names_sha256(names),
+        "max_clips": args.max_clips,
+        "counts": counts,
+        "motion_fps": float(args.motion_fps),
+        "motion_token_fps": token_fps,
+        "motion_token_unit_length": unit_length,
+        "codebook_size": codebook_size,
+        "num_quantizers": num_quantizers,
+        "part_order": list(part_order),
+        "tokens_per_frame": len(part_order) * num_quantizers,
+        "token_layout": token_layout,
+        "causal_by_part": {part: loaded.causal for part, loaded in codecs.items()},
+        "body_causal": all(codecs[part].causal for part in PART_ORDER),
+        "checkpoint_fingerprints": checkpoint_fingerprints,
+        "math_mode": math_mode,
+        "export_signature": signature,
+    }
+    manifest_path = output_dir / shard_manifest_name(args.num_shards, args.shard_id)
+    atomic_write_json(manifest_path, manifest, indent=2)
+    if args.num_shards == 1:
+        # Preserve the historical one-process output until the verifier replaces
+        # it with the consolidated manifest.
+        atomic_write_json(output_dir / "export_manifest.json", manifest, indent=2)
     print("Done:", counts)
     print("Output:", output_dir)
+    print("Manifest:", manifest_path)
 
 
 if __name__ == "__main__":

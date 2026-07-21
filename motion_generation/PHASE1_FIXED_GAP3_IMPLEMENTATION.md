@@ -85,6 +85,7 @@ motion_generation/utils/adaptive_anchor_tokens.py
 motion_generation/models/step1_mimi_planner.py
 motion_generation/scripts/precompute_mimi_audio_tokens.py
 motion_generation/scripts/build_step1_training_subsets.py
+motion_generation/scripts/verify_multipart_motion_token_export.py
 motion_generation/scripts/export_step1_seed_anchor.py
 motion_generation/scripts/validate_step1_fixed_gap_data.py
 motion_generation/scripts/train_step1_multipart_fixed_gap3.py
@@ -141,20 +142,30 @@ The script is resumable by default and writes one manifest per shard.
 After all four Phase 0 codecs finish, audit representative clips first:
 
 ```bash
-python motion_generation/scripts/audit_causal_body_codecs.py \
+NVIDIA_TF32_OVERRIDE=0 CUDA_VISIBLE_DEVICES=0 python \
+  motion_generation/scripts/audit_causal_body_codecs.py \
   --upper_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_upper_512x4_scratch/model/best.pth \
   --lower_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_lower_512x4_scratch/model/best.pth \
   --feet_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_feet_512x4_scratch/model/best.pth \
   --hands_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_hands_512x4_scratch/model/best.pth \
   --device cuda:0 \
   --max_clips 32 \
+  --atol 0.005 \
   --output_json checkpoints/causal_multipart_rvqvae/phase0_audit.json
 ```
 
-Then export all dense 10 Hz body tokens:
+The audit and exporter also disable PyTorch TF32 internally. Keep the
+environment override as a process-level guard against GPU shape-dependent RVQ
+token flips.
+
+Export all dense 10 Hz body tokens using four separate terminals. Every worker
+loads all four codecs on its visible GPU but owns a disjoint modulo shard.
+
+GPU 0 / shard 0:
 
 ```bash
-python motion_generation/scripts/export_multipart_motion_tokens.py \
+NVIDIA_TF32_OVERRIDE=0 CUDA_VISIBLE_DEVICES=0 python \
+  motion_generation/scripts/export_multipart_motion_tokens.py \
   --data_dir SuSuInterActs/SuSuInterActs \
   --split_file SuSuInterActs/SuSuInterActs/split/all_file_list.txt \
   --output_dir SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4 \
@@ -162,10 +173,84 @@ python motion_generation/scripts/export_multipart_motion_tokens.py \
   --lower_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_lower_512x4_scratch/model/best.pth \
   --feet_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_feet_512x4_scratch/model/best.pth \
   --hands_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_hands_512x4_scratch/model/best.pth \
-  --device cuda:0
+  --device cuda:0 \
+  --num_shards 4 \
+  --shard_id 0
 ```
 
-The Step 1 loader rejects any payload whose `body_causal` is not exactly `true`, whose part order differs, or whose slot/rate/codebook metadata is wrong.
+GPU 1 / shard 1:
+
+```bash
+NVIDIA_TF32_OVERRIDE=0 CUDA_VISIBLE_DEVICES=1 python \
+  motion_generation/scripts/export_multipart_motion_tokens.py \
+  --data_dir SuSuInterActs/SuSuInterActs \
+  --split_file SuSuInterActs/SuSuInterActs/split/all_file_list.txt \
+  --output_dir SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4 \
+  --upper_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_upper_512x4_scratch/model/best.pth \
+  --lower_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_lower_512x4_scratch/model/best.pth \
+  --feet_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_feet_512x4_scratch/model/best.pth \
+  --hands_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_hands_512x4_scratch/model/best.pth \
+  --device cuda:0 \
+  --num_shards 4 \
+  --shard_id 1
+```
+
+GPU 2 / shard 2:
+
+```bash
+NVIDIA_TF32_OVERRIDE=0 CUDA_VISIBLE_DEVICES=2 python \
+  motion_generation/scripts/export_multipart_motion_tokens.py \
+  --data_dir SuSuInterActs/SuSuInterActs \
+  --split_file SuSuInterActs/SuSuInterActs/split/all_file_list.txt \
+  --output_dir SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4 \
+  --upper_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_upper_512x4_scratch/model/best.pth \
+  --lower_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_lower_512x4_scratch/model/best.pth \
+  --feet_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_feet_512x4_scratch/model/best.pth \
+  --hands_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_hands_512x4_scratch/model/best.pth \
+  --device cuda:0 \
+  --num_shards 4 \
+  --shard_id 2
+```
+
+GPU 3 / shard 3:
+
+```bash
+NVIDIA_TF32_OVERRIDE=0 CUDA_VISIBLE_DEVICES=3 python \
+  motion_generation/scripts/export_multipart_motion_tokens.py \
+  --data_dir SuSuInterActs/SuSuInterActs \
+  --split_file SuSuInterActs/SuSuInterActs/split/all_file_list.txt \
+  --output_dir SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4 \
+  --upper_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_upper_512x4_scratch/model/best.pth \
+  --lower_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_lower_512x4_scratch/model/best.pth \
+  --feet_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_feet_512x4_scratch/model/best.pth \
+  --hands_ckpt checkpoints/causal_multipart_rvqvae/causal_rvq_hands_512x4_scratch/model/best.pth \
+  --device cuda:0 \
+  --num_shards 4 \
+  --shard_id 3
+```
+
+The exporter is resumable. A clip is skipped only when its format and export
+signature match the current checkpoints, normalizers, token contract, and math
+mode. Incompatible existing outputs are atomically rewritten.
+
+After all four processes finish, consolidate and verify the export:
+
+```bash
+python motion_generation/scripts/verify_multipart_motion_token_export.py \
+  --data_dir SuSuInterActs/SuSuInterActs \
+  --split_file SuSuInterActs/SuSuInterActs/split/all_file_list.txt \
+  --output_dir SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4 \
+  --num_shards 4
+```
+
+This reads every output, checks all 21,133 assignments exactly once, rejects
+missing/unexpected/corrupt files, verifies every 16-slot ID and length, compares
+checkpoint and normalizer fingerprints across workers, requires strict TF32-off
+math and `body_causal=true`, and writes the consolidated `export_manifest.json`.
+
+The Step 1 loader additionally rejects any payload whose `body_causal` is not
+exactly `true`, whose part order differs, or whose slot/rate/codebook metadata
+is wrong.
 
 ## 8. Optional neutral conversation-start seed
 

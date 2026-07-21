@@ -15,7 +15,11 @@ PROJECT_DIR = Path(__file__).resolve().parents[2]
 MODULE_DIR = PROJECT_DIR / "motion_generation"
 sys.path.insert(0, str(MODULE_DIR))
 
-from scripts.export_multipart_motion_tokens import LoadedPartCodec, load_part_codec  # noqa: E402
+from scripts.export_multipart_motion_tokens import (  # noqa: E402
+    LoadedPartCodec,
+    configure_strict_inference_math,
+    load_part_codec,
+)
 from utils.multipart_motion import (  # noqa: E402
     PART_ORDER,
     load_motion_dict,
@@ -182,6 +186,8 @@ def audit_part_clip(
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() or "cuda" not in args.device else "cpu")
+    math_mode = configure_strict_inference_math(device)
+    print("Strict inference math:", math_mode)
     data_root = args.data_root.resolve()
     split_file = (args.split_file or data_root / "split" / "val_file_list.txt").resolve()
     motion_dir = data_root / "motion_data"
@@ -204,6 +210,7 @@ def main() -> None:
         "status": "passed",
         "split_file": str(split_file),
         "device": str(device),
+        "math_mode": math_mode,
         "parts": {},
     }
     audited = 0
@@ -250,4 +257,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
