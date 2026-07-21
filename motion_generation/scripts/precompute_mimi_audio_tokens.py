@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Precompute causal Mimi audio tokens for the Phase 1 planner.
 
-All eight Moshi codebooks are stored, while the fixed Phase 1 model initially
-reads q0 only.  Offline Mimi encoding is safe here because the checkpoint is
-causal and the repository preflight verifies exact offline/streaming equality.
+All eight Moshi codebooks are stored. The current generated-history planner
+reads q0-q3 while older fixed-gap checkpoints may read q0 only. Offline Mimi
+encoding is safe here because the checkpoint is causal and the repository
+preflight verifies exact offline/streaming equality across all levels.
 """
 
 from __future__ import annotations
@@ -346,7 +347,8 @@ def main() -> None:
         "frame_size": MIMI_FRAME_SIZE,
         "num_codebooks": MIMI_CODEBOOKS,
         "cardinality": MIMI_CARDINALITY,
-        "planner_initial_codebooks": [0],
+        "planner_default_codebooks": [0, 1, 2, 3],
+        "planner_legacy_codebooks": [0],
         "shard_id": args.shard_id,
         "num_shards": args.num_shards,
         "assigned_clips": len(names),

@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 import yaml
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 
 
@@ -42,6 +42,14 @@ from utils.adaptive_anchor_tokens import (  # noqa: E402
     ensure_step1_special_tokens,
     motion_token_id_table,
     validate_anchor,
+)
+from utils.step1_self_forcing import (  # noqa: E402
+    GeneratedHistoryBatchStats,
+    apply_generated_history,
+    deterministic_generated_indices,
+    generated_history_probability,
+    rollout_quality_metrics,
+    validate_generated_labels,
 )
 
 
@@ -70,6 +78,29 @@ def section(config: Mapping[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Config section {name!r} must be a mapping")
     return dict(value)
+
+
+def mimi_codebooks_from_config(config: Mapping[str, Any]) -> list[int]:
+    audio = section(config, "audio")
+    data = section(config, "data")
+    values = audio.get("mimi_codebooks_used", data.get("mimi_codebooks_used", [0]))
+    if not isinstance(values, list) or not values:
+        raise ValueError("audio.mimi_codebooks_used must be a non-empty list")
+    codebooks = [int(value) for value in values]
+    if codebooks[0] != 0:
+        raise ValueError("audio.mimi_codebooks_used must begin with q0")
+    if len(set(codebooks)) != len(codebooks) or any(not 0 <= value < 8 for value in codebooks):
+        raise ValueError("audio.mimi_codebooks_used must contain unique indices in [0, 7]")
+    if "mimi_codebooks_used" in audio and "mimi_codebooks_used" in data:
+        data_codebooks = [int(value) for value in data["mimi_codebooks_used"]]
+        if data_codebooks != codebooks:
+            raise ValueError("audio and data Mimi codebook configurations disagree")
+    if len(codebooks) > 1:
+        if str(audio.get("fusion", "concat_linear")) != "concat_linear":
+            raise ValueError("q0-q3 currently supports only concat_linear audio fusion")
+        if not bool(audio.get("sparse_audio_embedding", True)):
+            raise ValueError("q0-q3 requires sparse_audio_embedding on 24 GB GPUs")
+    return codebooks
 
 
 def project_path(value: str | Path) -> Path:
@@ -164,6 +195,7 @@ def build_model_and_tokenizer(
     base_model: Path,
     resume: Optional[Path],
     dtype: torch.dtype,
+    mimi_codebooks_used: list[int],
 ) -> tuple[MimiQwenPlanner, Any, list[str]]:
     if resume is not None:
         resume = resume.resolve()
@@ -179,6 +211,11 @@ def build_model_and_tokenizer(
         expected_table = torch.tensor(motion_token_id_table(tokenizer), dtype=torch.long)
         if not torch.equal(model.motion_token_ids.cpu(), expected_table):
             raise RuntimeError("Resume checkpoint motion-token classifier table does not match tokenizer")
+        if list(model.config.mimi_codebooks_used) != list(mimi_codebooks_used):
+            raise RuntimeError(
+                "Resume checkpoint Mimi codebooks do not match the requested configuration: "
+                f"checkpoint={model.config.mimi_codebooks_used}, requested={mimi_codebooks_used}"
+            )
         return model, tokenizer, []
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, local_files_only=True, trust_remote_code=True)
@@ -198,7 +235,7 @@ def build_model_and_tokenizer(
         motion_token_ids=table,
         mimi_cardinality=2_048,
         mimi_codebooks_stored=8,
-        mimi_codebooks_used=[0],
+        mimi_codebooks_used=mimi_codebooks_used,
     )
     model = MimiQwenPlanner(planner_config, language_model=language_model)
     model.tie_weights()
@@ -236,6 +273,7 @@ def build_dataset(
         random_seed=int(data_config.get("random_seed", 42)),
         require_causal_motion=bool(data_config.get("require_causal_motion", True)),
         max_duration_mismatch_seconds=float(data_config.get("max_duration_mismatch_seconds", 0.12)),
+        mimi_codebooks_used=data_config.get("mimi_codebooks_used", [0]),
     )
 
 
@@ -322,6 +360,8 @@ def save_checkpoint(
     checkpoint_name: Optional[str] = None,
     best_eval_loss: float = math.inf,
     epochs_without_improvement: int = 0,
+    curriculum_activation_epoch: Optional[int] = None,
+    best_rollout_accuracy: float = -math.inf,
 ) -> Path:
     if final and checkpoint_name is not None:
         raise ValueError("final and checkpoint_name cannot both be set")
@@ -342,6 +382,8 @@ def save_checkpoint(
                 "batch_in_epoch": batch_in_epoch,
                 "best_eval_loss": float(best_eval_loss),
                 "epochs_without_improvement": int(epochs_without_improvement),
+                "curriculum_activation_epoch": curriculum_activation_epoch,
+                "best_rollout_accuracy": float(best_rollout_accuracy),
             },
             checkpoint_dir / "training_state.pt",
         )
@@ -359,9 +401,9 @@ def load_training_state(
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     device: torch.device,
-) -> tuple[int, int, int, float, int]:
+) -> tuple[int, int, int, float, int, Optional[int], float]:
     if checkpoint is None:
-        return 0, 0, 0, math.inf, 0
+        return 0, 0, 0, math.inf, 0, None, -math.inf
     state_path = checkpoint.resolve() / "training_state.pt"
     if not state_path.is_file():
         raise FileNotFoundError(f"Resume training state not found: {state_path}")
@@ -378,6 +420,12 @@ def load_training_state(
         int(state["batch_in_epoch"]),
         float(state.get("best_eval_loss", math.inf)),
         int(state.get("epochs_without_improvement", 0)),
+        (
+            int(state["curriculum_activation_epoch"])
+            if state.get("curriculum_activation_epoch") is not None
+            else None
+        ),
+        float(state.get("best_rollout_accuracy", -math.inf)),
     )
 
 
@@ -401,6 +449,92 @@ def initialize_wandb(
     )
 
 
+def validate_generated_history_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    generated = section(config, "generated_history")
+    generated.setdefault("enabled", False)
+    generated.setdefault("decoding", "greedy")
+    generated.setdefault("minimum_teacher_epochs", 5)
+    generated.setdefault("ramp_epochs", 10)
+    generated.setdefault("max_probability", 0.5)
+    generated.setdefault("rollout_microbatch_size", 8)
+    generated.setdefault("rollout_eval_clips", 64)
+    generated.setdefault("teacher_forced_ce_max", 5.4)
+    generated.setdefault("rollout_accuracy_min", 0.01)
+    generated.setdefault("rollout_q0_accuracy_min", 0.03)
+    generated.setdefault("milestone_epochs", [5, 15, 25, 35, 50])
+    generated.setdefault("rollout_eval_epochs", [5, 15, 25, 35, 50])
+    if generated["decoding"] != "greedy":
+        raise ValueError("Only greedy generated-history decoding is currently supported")
+    for key in ("minimum_teacher_epochs", "ramp_epochs", "rollout_microbatch_size", "rollout_eval_clips"):
+        generated[key] = int(generated[key])
+        if generated[key] <= 0:
+            raise ValueError(f"generated_history.{key} must be positive")
+    generated["max_probability"] = float(generated["max_probability"])
+    if not 0 <= generated["max_probability"] <= 1:
+        raise ValueError("generated_history.max_probability must be in [0, 1]")
+    for key in ("teacher_forced_ce_max", "rollout_accuracy_min", "rollout_q0_accuracy_min"):
+        generated[key] = float(generated[key])
+    for key in ("milestone_epochs", "rollout_eval_epochs"):
+        values = [int(value) for value in generated[key]]
+        if any(value <= 0 for value in values):
+            raise ValueError(f"generated_history.{key} must contain positive epochs")
+        generated[key] = sorted(set(values))
+    return generated
+
+
+def run_rank0_rollout_evaluation(
+    model: torch.nn.Module,
+    loader: Optional[DataLoader],
+    *,
+    device: torch.device,
+    rank: int,
+    distributed: bool,
+    use_bf16: bool,
+) -> GeneratedHistoryBatchStats:
+    """Run rollout on rank zero, then broadcast its scalar metrics."""
+
+    values = torch.zeros(8, dtype=torch.float64, device=device)
+    if is_main(rank):
+        if loader is None:
+            raise ValueError("Rank zero rollout evaluation requires a loader")
+        unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
+        was_training = unwrapped.training
+        unwrapped.eval()
+        stats = rollout_quality_metrics(
+            unwrapped,
+            loader,
+            device=device,
+            use_bf16=use_bf16,
+        )
+        unwrapped.train(was_training)
+        values = torch.tensor(
+            [
+                stats.clips,
+                stats.anchors,
+                stats.tokens,
+                stats.correct,
+                stats.q0_correct,
+                stats.q0_tokens,
+                stats.confidence_sum,
+                stats.entropy_sum,
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+    if distributed:
+        dist.broadcast(values, src=0)
+    return GeneratedHistoryBatchStats(
+        clips=int(values[0].item()),
+        anchors=int(values[1].item()),
+        tokens=int(values[2].item()),
+        correct=int(values[3].item()),
+        q0_correct=int(values[4].item()),
+        q0_tokens=int(values[5].item()),
+        confidence_sum=float(values[6].item()),
+        entropy_sum=float(values[7].item()),
+    )
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config.resolve())
@@ -408,6 +542,16 @@ def main() -> None:
     distributed, rank, local_rank, world_size, device = setup_distributed()
     training = section(config, "training")
     data_config = section(config, "data")
+    mimi_codebooks_used = mimi_codebooks_from_config(config)
+    data_config["mimi_codebooks_used"] = mimi_codebooks_used
+    generated_history = validate_generated_history_config(config)
+    if bool(generated_history["enabled"]) and (
+        data_config.get("generated_anchor_dir")
+        or float(data_config.get("generated_prefix_probability", 0.0)) > 0
+    ):
+        raise ValueError(
+            "On-policy generated_history cannot be mixed with the legacy disk-cache curriculum"
+        )
     seed = int(training.get("seed", 42))
     seed_everything(seed, rank)
     resume = args.resume_from_checkpoint.resolve() if args.resume_from_checkpoint else None
@@ -423,6 +567,7 @@ def main() -> None:
         base_model=paths["base_model"],
         resume=resume,
         dtype=dtype,
+        mimi_codebooks_used=mimi_codebooks_used,
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -490,7 +635,7 @@ def main() -> None:
         sampler=train_sampler,
         num_workers=workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=workers > 0,
+        persistent_workers=bool(data_config.get("persistent_workers", workers > 0)),
         collate_fn=collator,
     )
     eval_loader = DataLoader(
@@ -500,9 +645,21 @@ def main() -> None:
         sampler=eval_sampler,
         num_workers=workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=workers > 0,
+        persistent_workers=bool(data_config.get("persistent_workers", workers > 0)),
         collate_fn=collator,
     )
+
+    rollout_eval_loader = None
+    if is_main(rank) and bool(generated_history["enabled"]):
+        rollout_count = min(int(generated_history["rollout_eval_clips"]), len(eval_dataset))
+        rollout_eval_loader = DataLoader(
+            Subset(eval_dataset, range(rollout_count)),
+            batch_size=int(generated_history["rollout_microbatch_size"]),
+            shuffle=False,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+            collate_fn=collator,
+        )
 
     if distributed:
         model = DistributedDataParallel(
@@ -529,6 +686,8 @@ def main() -> None:
         resume_batch,
         best_eval_loss,
         epochs_without_improvement,
+        curriculum_activation_epoch,
+        best_rollout_accuracy,
     ) = load_training_state(resume, optimizer, scheduler, device)
 
     if is_main(rank):
@@ -540,11 +699,19 @@ def main() -> None:
         print(f"Output:            {paths['output_dir']}")
         print(f"Motion tokens:     {paths['motion_token_dir']}")
         print(f"Mimi tokens:       {paths['mimi_token_dir']}")
+        print(f"Mimi codebooks:    {mimi_codebooks_used}")
         print(f"Train/eval clips:  {len(train_dataset)}/{len(eval_dataset)}")
         print(f"World size:        {world_size}")
         print(f"Added controls:    {added_tokens}")
         print(f"Parameters:        {trainable:,} trainable / {total:,} total")
         print(f"Updates:           {total_steps} ({updates_per_epoch}/epoch)")
+        print(
+            "Generated history: "
+            f"enabled={bool(generated_history['enabled'])}, "
+            f"activation_epoch={curriculum_activation_epoch}, "
+            f"ramp={generated_history['ramp_epochs']} epochs, "
+            f"p_max={generated_history['max_probability']}"
+        )
         print("=" * 76)
 
     paths["output_dir"].mkdir(parents=True, exist_ok=True)
@@ -563,7 +730,10 @@ def main() -> None:
     autocast_enabled = use_bf16 and device.type == "cuda"
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    running = torch.zeros(3 + 2 * len(BODY_SLOTS), dtype=torch.float64, device=device)
+    base_metric_count = 3 + 2 * len(BODY_SLOTS)
+    # clean loss/correct/count, generated loss/correct/count, then eight
+    # detached rollout statistics.
+    running = torch.zeros(base_metric_count + 14, dtype=torch.float64, device=device)
     run_start = time.perf_counter()
 
     completed_epochs = start_epoch
@@ -586,6 +756,43 @@ def main() -> None:
                 else contextlib.nullcontext()
             )
             inputs = move_batch(batch, device)
+            validate_generated_labels(inputs)
+            epoch_progress = epoch + batch_index / max(1, len(train_loader))
+            generated_probability = (
+                generated_history_probability(
+                    epoch_progress,
+                    activation_epoch=curriculum_activation_epoch,
+                    ramp_epochs=int(generated_history["ramp_epochs"]),
+                    max_probability=float(generated_history["max_probability"]),
+                )
+                if bool(generated_history["enabled"])
+                else 0.0
+            )
+            generated_indices = deterministic_generated_indices(
+                batch["names"],
+                generated_probability,
+                seed=seed,
+                epoch=epoch,
+                batch_index=batch_index,
+            )
+            generated_mask = torch.zeros(
+                inputs["input_ids"].shape[0], dtype=torch.bool, device=device
+            )
+            rollout_stats = GeneratedHistoryBatchStats()
+            if generated_indices:
+                generated_mask[generated_indices] = True
+                unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
+                was_training = unwrapped.training
+                unwrapped.eval()
+                generated_input_ids, rollout_stats = apply_generated_history(
+                    unwrapped,
+                    inputs,
+                    generated_indices,
+                    microbatch_size=int(generated_history["rollout_microbatch_size"]),
+                    use_bf16=use_bf16,
+                )
+                unwrapped.train(was_training)
+                inputs["input_ids"] = generated_input_ids
             with sync_context:
                 with torch.autocast(
                     device_type=device.type,
@@ -600,7 +807,32 @@ def main() -> None:
             running[1] += output.correct.detach().to(torch.float64)
             running[2] += count
             running[3 : 3 + len(BODY_SLOTS)] += output.per_slot_correct.detach().to(torch.float64)
-            running[3 + len(BODY_SLOTS) :] += output.per_slot_count.detach().to(torch.float64)
+            running[
+                3 + len(BODY_SLOTS) : 3 + 2 * len(BODY_SLOTS)
+            ] += output.per_slot_count.detach().to(torch.float64)
+            clean_mask = ~generated_mask
+            split_offset = base_metric_count
+            if bool(clean_mask.any()):
+                running[split_offset] += output.per_example_loss_sum[clean_mask].detach().sum().to(torch.float64)
+                running[split_offset + 1] += output.per_example_correct[clean_mask].detach().sum().to(torch.float64)
+                running[split_offset + 2] += output.per_example_count[clean_mask].detach().sum().to(torch.float64)
+            if bool(generated_mask.any()):
+                running[split_offset + 3] += output.per_example_loss_sum[generated_mask].detach().sum().to(torch.float64)
+                running[split_offset + 4] += output.per_example_correct[generated_mask].detach().sum().to(torch.float64)
+                running[split_offset + 5] += output.per_example_count[generated_mask].detach().sum().to(torch.float64)
+            rollout_values = (
+                rollout_stats.clips,
+                rollout_stats.anchors,
+                rollout_stats.tokens,
+                rollout_stats.correct,
+                rollout_stats.q0_correct,
+                rollout_stats.q0_tokens,
+                rollout_stats.confidence_sum,
+                rollout_stats.entropy_sum,
+            )
+            running[split_offset + 6 :] += torch.tensor(
+                rollout_values, dtype=torch.float64, device=device
+            )
 
             if not should_step:
                 continue
@@ -614,16 +846,43 @@ def main() -> None:
                 totals = reduce_sums(running.clone(), distributed)
                 denominator = max(1.0, float(totals[2]))
                 if is_main(rank):
+                    split_offset = base_metric_count
+                    clean_count = max(1.0, float(totals[split_offset + 2]))
+                    generated_count = max(1.0, float(totals[split_offset + 5]))
+                    rollout_tokens = max(1.0, float(totals[split_offset + 8]))
+                    rollout_q0_tokens = max(1.0, float(totals[split_offset + 11]))
                     train_metrics = {
                         "train/loss": float(totals[0]) / denominator,
                         "train/slot_accuracy": float(totals[1]) / denominator,
                         "train/learning_rate": scheduler.get_last_lr()[0],
                         "train/epoch": epoch + (batch_index + 1) / max(1, len(train_loader)),
+                        "curriculum/generated_history_probability": generated_probability,
+                        "curriculum/generated_clips": float(totals[split_offset + 6]),
+                        "curriculum/generated_anchors": float(totals[split_offset + 7]),
                     }
+                    if float(totals[split_offset + 2]) > 0:
+                        train_metrics.update(
+                            {
+                                "train_clean/loss": float(totals[split_offset]) / clean_count,
+                                "train_clean/slot_accuracy": float(totals[split_offset + 1]) / clean_count,
+                            }
+                        )
+                    if float(totals[split_offset + 5]) > 0:
+                        train_metrics.update(
+                            {
+                                "train_generated/loss": float(totals[split_offset + 3]) / generated_count,
+                                "train_generated/slot_accuracy": float(totals[split_offset + 4]) / generated_count,
+                                "rollout/accuracy": float(totals[split_offset + 9]) / rollout_tokens,
+                                "rollout/q0_accuracy": float(totals[split_offset + 10]) / rollout_q0_tokens,
+                                "rollout/mean_confidence": float(totals[split_offset + 12]) / rollout_tokens,
+                                "rollout/mean_entropy": float(totals[split_offset + 13]) / rollout_tokens,
+                            }
+                        )
                     print(
                         f"step={global_step}/{total_steps} epoch={epoch + 1}/{epochs} "
                         f"loss={train_metrics['train/loss']:.5f} "
                         f"slot_acc={train_metrics['train/slot_accuracy']:.4%} "
+                        f"p_gen={generated_probability:.3f} "
                         f"lr={scheduler.get_last_lr()[0]:.3e} "
                         f"elapsed={time.perf_counter() - run_start:.1f}s"
                     )
@@ -673,6 +932,8 @@ def main() -> None:
                     rank=rank,
                     best_eval_loss=best_eval_loss,
                     epochs_without_improvement=epochs_without_improvement,
+                    curriculum_activation_epoch=curriculum_activation_epoch,
+                    best_rollout_accuracy=best_rollout_accuracy,
                 )
         resume_batch = 0
 
@@ -708,7 +969,63 @@ def main() -> None:
         if improved:
             best_eval_loss = float(eval_metrics["loss"])
             epochs_without_improvement = 0
-            if save_best:
+        else:
+            epochs_without_improvement += 1
+        rollout_metrics = None
+        activation_check = (
+            bool(generated_history["enabled"])
+            and curriculum_activation_epoch is None
+            and completed_epochs >= int(generated_history["minimum_teacher_epochs"])
+        )
+        scheduled_rollout_eval = (
+            bool(generated_history["enabled"])
+            and completed_epochs in generated_history["rollout_eval_epochs"]
+        )
+        if activation_check or scheduled_rollout_eval:
+            rollout_metrics = run_rank0_rollout_evaluation(
+                model,
+                rollout_eval_loader,
+                device=device,
+                rank=rank,
+                distributed=distributed,
+                use_bf16=use_bf16,
+            )
+            if is_main(rank):
+                print(
+                    f"[generated rollout] epoch={completed_epochs} "
+                    f"clips={rollout_metrics.clips} "
+                    f"accuracy={rollout_metrics.accuracy:.4%} "
+                    f"q0_accuracy={rollout_metrics.q0_accuracy:.4%} "
+                    f"confidence={rollout_metrics.mean_confidence:.4f} "
+                    f"entropy={rollout_metrics.mean_entropy:.4f}"
+                )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "eval_rollout/accuracy": rollout_metrics.accuracy,
+                            "eval_rollout/q0_accuracy": rollout_metrics.q0_accuracy,
+                            "eval_rollout/mean_confidence": rollout_metrics.mean_confidence,
+                            "eval_rollout/mean_entropy": rollout_metrics.mean_entropy,
+                            "eval_rollout/clips": rollout_metrics.clips,
+                        },
+                        step=global_step,
+                    )
+
+        if activation_check:
+            gate_passed = bool(
+                eval_metrics["loss"] <= float(generated_history["teacher_forced_ce_max"])
+                and rollout_metrics is not None
+                and rollout_metrics.accuracy >= float(generated_history["rollout_accuracy_min"])
+                and rollout_metrics.q0_accuracy
+                >= float(generated_history["rollout_q0_accuracy_min"])
+            )
+            if gate_passed:
+                curriculum_activation_epoch = completed_epochs
+                if is_main(rank):
+                    print(
+                        "[generated-history gate] PASS: curriculum activates at the next epoch; "
+                        f"activation_epoch={curriculum_activation_epoch}"
+                    )
                 save_checkpoint(
                     model,
                     tokenizer,
@@ -721,12 +1038,63 @@ def main() -> None:
                     source_config=config,
                     distributed=distributed,
                     rank=rank,
-                    checkpoint_name="best",
+                    checkpoint_name="teacher_warmup",
                     best_eval_loss=best_eval_loss,
                     epochs_without_improvement=epochs_without_improvement,
+                    curriculum_activation_epoch=curriculum_activation_epoch,
+                    best_rollout_accuracy=best_rollout_accuracy,
                 )
-        else:
-            epochs_without_improvement += 1
+            elif is_main(rank):
+                print(
+                    "[generated-history gate] HOLD: "
+                    f"ce={eval_metrics['loss']:.5f}/"
+                    f"{generated_history['teacher_forced_ce_max']:.5f}, "
+                    f"rollout={rollout_metrics.accuracy:.4%}/"
+                    f"{generated_history['rollout_accuracy_min']:.4%}, "
+                    f"q0={rollout_metrics.q0_accuracy:.4%}/"
+                    f"{generated_history['rollout_q0_accuracy_min']:.4%}"
+                )
+
+        if rollout_metrics is not None and rollout_metrics.accuracy > best_rollout_accuracy:
+            best_rollout_accuracy = rollout_metrics.accuracy
+            save_checkpoint(
+                model,
+                tokenizer,
+                optimizer,
+                scheduler,
+                output_dir=paths["output_dir"],
+                global_step=global_step,
+                epoch=completed_epochs,
+                batch_in_epoch=0,
+                source_config=config,
+                distributed=distributed,
+                rank=rank,
+                checkpoint_name="best_rollout",
+                best_eval_loss=best_eval_loss,
+                epochs_without_improvement=epochs_without_improvement,
+                curriculum_activation_epoch=curriculum_activation_epoch,
+                best_rollout_accuracy=best_rollout_accuracy,
+            )
+
+        if improved and save_best:
+            save_checkpoint(
+                model,
+                tokenizer,
+                optimizer,
+                scheduler,
+                output_dir=paths["output_dir"],
+                global_step=global_step,
+                epoch=completed_epochs,
+                batch_in_epoch=0,
+                source_config=config,
+                distributed=distributed,
+                rank=rank,
+                checkpoint_name="best",
+                best_eval_loss=best_eval_loss,
+                epochs_without_improvement=epochs_without_improvement,
+                curriculum_activation_epoch=curriculum_activation_epoch,
+                best_rollout_accuracy=best_rollout_accuracy,
+            )
         if is_main(rank):
             print(
                 f"[early stopping] best_loss={best_eval_loss:.5f} "
@@ -741,6 +1109,28 @@ def main() -> None:
                     },
                     step=global_step,
                 )
+        if (
+            bool(generated_history["enabled"])
+            and completed_epochs in generated_history["milestone_epochs"]
+        ):
+            save_checkpoint(
+                model,
+                tokenizer,
+                optimizer,
+                scheduler,
+                output_dir=paths["output_dir"],
+                global_step=global_step,
+                epoch=completed_epochs,
+                batch_in_epoch=0,
+                source_config=config,
+                distributed=distributed,
+                rank=rank,
+                checkpoint_name=f"epoch-{completed_epochs:04d}",
+                best_eval_loss=best_eval_loss,
+                epochs_without_improvement=epochs_without_improvement,
+                curriculum_activation_epoch=curriculum_activation_epoch,
+                best_rollout_accuracy=best_rollout_accuracy,
+            )
         if (
             early_stopping_patience > 0
             and epochs_without_improvement >= early_stopping_patience
@@ -765,6 +1155,8 @@ def main() -> None:
         final=True,
         best_eval_loss=best_eval_loss,
         epochs_without_improvement=epochs_without_improvement,
+        curriculum_activation_epoch=curriculum_activation_epoch,
+        best_rollout_accuracy=best_rollout_accuracy,
     )
     if is_main(rank):
         suffix = " (early stopped)" if stopped_early else ""

@@ -121,8 +121,10 @@ def test_dataset_serializes_causal_audio_before_each_anchor(tmp_path: Path, step
     item = dataset[0]
     assert item["anchor_times"] == (0, 4, 8, 12, 16, 20, 24, 28, 32, 35)
     assert item["audio_boundaries"] == (0, 5, 10, 15, 20, 25, 30, 35, 40, 45)
-    assert sum(code >= 0 for code in item["audio_codes"]) == 45
-    assert [code for code in item["audio_codes"] if code >= 0] == codes[0].astype(int).tolist()
+    assert sum(frame_codes[0] >= 0 for frame_codes in item["audio_codes"]) == 45
+    assert [
+        frame_codes[0] for frame_codes in item["audio_codes"] if frame_codes[0] >= 0
+    ] == codes[0].astype(int).tolist()
     assert sum(slot >= 0 for slot in item["target_slots"]) == 9 * BODY_SLOT_COUNT
     assert [slot for slot in item["target_slots"] if slot >= 0] == list(range(16)) * 9
 
@@ -140,6 +142,26 @@ def test_dataset_serializes_causal_audio_before_each_anchor(tmp_path: Path, step
     ]
     assert len(first_audio_positions) == 5
     assert item["motion_local_labels"][first_target_position : first_target_position + 16] == tokens[4]
+
+
+def test_dataset_serializes_synchronous_q0_q3_frames(tmp_path: Path, step1_tokenizer):
+    name = "session/q0q3"
+    motion_dir, audio_dir, _, codes = _write_synthetic_clip(tmp_path, name)
+    dataset = Step1FixedGapDataset(
+        [name],
+        tokenizer=step1_tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "q0 q3"},
+        mimi_codebooks_used=[0, 1, 2, 3],
+    )
+    item = dataset[0]
+    observed = np.asarray(
+        [frame for frame in item["audio_codes"] if all(code >= 0 for code in frame)],
+        dtype=np.int64,
+    )
+    assert observed.shape == (45, 4)
+    assert np.array_equal(observed, codes[:4].T)
 
 
 def test_generated_prefix_changes_inputs_but_keeps_gt_labels(tmp_path: Path, step1_tokenizer):
@@ -186,7 +208,7 @@ def test_collator_masks_padding_and_preserves_modal_fields(tmp_path: Path, step1
     batch = collator([item, item])
     assert batch["input_ids"].shape[0] == 2
     assert batch["input_ids"].shape[1] % 8 == 0
-    assert torch.equal(batch["audio_codes"].ge(0), batch["input_ids"].eq(
+    assert torch.equal(batch["audio_codes"].ge(0).all(dim=-1), batch["input_ids"].eq(
         step1_tokenizer.convert_tokens_to_ids(MIMI_FRAME_TOKEN)
     ))
     assert torch.equal(batch["target_slots"].ge(0), batch["motion_local_labels"].ne(IGNORE_INDEX))
@@ -300,3 +322,89 @@ def test_audio_code_must_match_placeholder_positions():
     audio_codes[0, 1] = 12
     with pytest.raises(ValueError, match="exactly"):
         planner.prepare_input_embeddings(input_ids, audio_codes)
+
+
+def test_q0_q3_sparse_audio_fusion_backpropagates_all_codebooks(tmp_path: Path):
+    planner = _tiny_planner()
+    qwen = planner.language_model
+    planner = MimiQwenPlanner(
+        MimiQwenPlannerConfig(
+            language_model_config=qwen.config.to_dict(),
+            audio_placeholder_id=planner.config.audio_placeholder_id,
+            motion_token_ids=planner.motion_token_ids.tolist(),
+            mimi_codebooks_used=[0, 1, 2, 3],
+        ),
+        language_model=qwen,
+    )
+    labels = torch.tensor([(slot * 11 + 3) % 512 for slot in range(16)], dtype=torch.long)
+    input_ids = torch.zeros((1, 20), dtype=torch.long)
+    input_ids[0, 2] = planner.config.audio_placeholder_id
+    for slot in range(16):
+        input_ids[0, 4 + slot] = planner.motion_token_ids[slot, labels[slot]]
+    audio_codes = torch.full((1, 20, 4), -1, dtype=torch.long)
+    audio_codes[0, 2] = torch.tensor([101, 202, 303, 404])
+    target_slots = torch.full_like(input_ids, -1)
+    target_slots[0, 4:] = torch.arange(16)
+    motion_labels = torch.full_like(input_ids, IGNORE_INDEX)
+    motion_labels[0, 4:] = labels
+    output = planner(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        audio_codes=audio_codes,
+        target_slots=target_slots,
+        motion_local_labels=motion_labels,
+    )
+    output.loss.backward()
+    assert float(planner.audio_embedding.weight.grad[101].abs().sum()) > 0
+    for embedding, code in zip(planner.additional_audio_embeddings, [202, 303, 404]):
+        assert float(embedding.weight.grad[code].abs().sum()) > 0
+    assert planner.audio_fusion.weight.grad is not None
+
+    save_dir = tmp_path / "q0q3-planner"
+    planner.save_pretrained(save_dir, safe_serialization=True)
+    reloaded = MimiQwenPlanner.from_pretrained(save_dir, local_files_only=True)
+    assert reloaded.config.mimi_codebooks_used == [0, 1, 2, 3]
+    assert len(reloaded.additional_audio_embeddings) == 3
+    assert torch.equal(reloaded.audio_fusion.weight, planner.audio_fusion.weight)
+
+
+def test_q0_q3_rejects_partial_audio_frames():
+    planner = _tiny_planner()
+    qwen = planner.language_model
+    planner = MimiQwenPlanner(
+        MimiQwenPlannerConfig(
+            language_model_config=qwen.config.to_dict(),
+            audio_placeholder_id=planner.config.audio_placeholder_id,
+            motion_token_ids=planner.motion_token_ids.tolist(),
+            mimi_codebooks_used=[0, 1, 2, 3],
+        ),
+        language_model=qwen,
+    )
+    input_ids = torch.zeros((1, 4), dtype=torch.long)
+    input_ids[0, 1] = planner.config.audio_placeholder_id
+    audio_codes = torch.full((1, 4, 4), -1, dtype=torch.long)
+    audio_codes[0, 1, :2] = torch.tensor([1, 2])
+    with pytest.raises(ValueError, match="all configured"):
+        planner.prepare_input_embeddings(input_ids, audio_codes)
+
+
+def test_q0_q3_fusion_matches_bf16_language_embedding_dtype():
+    base = _tiny_planner()
+    qwen = base.language_model.to(dtype=torch.bfloat16)
+    planner = MimiQwenPlanner(
+        MimiQwenPlannerConfig(
+            language_model_config=qwen.config.to_dict(),
+            audio_placeholder_id=base.config.audio_placeholder_id,
+            motion_token_ids=base.motion_token_ids.tolist(),
+            mimi_codebooks_used=[0, 1, 2, 3],
+        ),
+        language_model=qwen,
+    )
+    input_ids = torch.zeros((1, 3), dtype=torch.long)
+    input_ids[0, 1] = planner.config.audio_placeholder_id
+    audio_codes = torch.full((1, 3, 4), -1, dtype=torch.long)
+    audio_codes[0, 1] = torch.tensor([1, 2, 3, 4])
+    embeddings = planner.prepare_input_embeddings(input_ids, audio_codes)
+    assert embeddings.dtype == torch.bfloat16
+    assert planner.audio_embedding.weight.dtype == torch.bfloat16
+    assert planner.audio_fusion.weight.dtype == torch.bfloat16

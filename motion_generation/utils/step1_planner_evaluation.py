@@ -36,6 +36,7 @@ from utils.adaptive_anchor_tokens import (
     fixed_anchor_times,
 )
 from utils.causal_codec_evaluation import reconstruction_metrics
+from utils.step1_self_forcing import generate_history_batch
 
 
 def slot_name(slot: int) -> str:
@@ -318,35 +319,6 @@ def _target_groups(item: Mapping[str, Any]) -> list[np.ndarray]:
 
 
 @torch.inference_mode()
-def _cached_chunk(
-    model: MimiQwenPlanner,
-    *,
-    input_ids: Sequence[int],
-    audio_codes: Sequence[int],
-    device: torch.device,
-    past_key_values: Any,
-    use_bf16: bool,
-) -> tuple[torch.Tensor, Any]:
-    if len(input_ids) != len(audio_codes) or not input_ids:
-        raise ValueError("A cached chunk must contain matching non-empty ids and audio codes")
-    ids = torch.as_tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
-    audio = torch.as_tensor(audio_codes, dtype=torch.long, device=device).unsqueeze(0)
-    embeddings = model.prepare_input_embeddings(ids, audio)
-    with torch.autocast(
-        device_type=device.type,
-        dtype=torch.bfloat16,
-        enabled=bool(use_bf16 and device.type == "cuda"),
-    ):
-        outputs = model._base_model_forward(  # pylint: disable=protected-access
-            inputs_embeds=embeddings,
-            past_key_values=past_key_values,
-            use_cache=True,
-            return_dict=True,
-        )
-    return outputs.last_hidden_state[:, -1], outputs.past_key_values
-
-
-@torch.inference_mode()
 def greedy_rollout_item(
     model: MimiQwenPlanner,
     item: Mapping[str, Any],
@@ -357,58 +329,30 @@ def greedy_rollout_item(
     """Generate all target anchors while retaining only the known seed anchor."""
 
     model.eval()
-    input_ids = [int(value) for value in item["input_ids"]]
-    audio_codes = [int(value) for value in item["audio_codes"]]
+    input_ids = torch.as_tensor(item["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
+    audio_codes = torch.as_tensor(item["audio_codes"], dtype=torch.long, device=device)
+    if audio_codes.ndim == 1:
+        audio_codes = audio_codes.unsqueeze(-1)
+    audio_codes = audio_codes.unsqueeze(0)
+    target_slots = torch.as_tensor(item["target_slots"], dtype=torch.long, device=device).unsqueeze(0)
     labels = np.asarray(item["motion_local_labels"], dtype=np.int64)
     groups = _target_groups(item)
-    predictions: list[list[int]] = []
-    targets: list[list[int]] = []
-    confidences: list[list[float]] = []
-    entropies: list[list[float]] = []
-    output_weight = model.language_model.get_output_embeddings().weight
-    cursor = 0
-    past = None
     started = time.perf_counter()
-
-    for group in groups:
-        first = int(group[0])
-        hidden, past = _cached_chunk(
-            model,
-            input_ids=input_ids[cursor:first],
-            audio_codes=audio_codes[cursor:first],
-            device=device,
-            past_key_values=past,
-            use_bf16=use_bf16,
-        )
-        predicted_anchor: list[int] = []
-        anchor_confidence: list[float] = []
-        anchor_entropy: list[float] = []
-        for slot in range(BODY_SLOT_COUNT):
-            logits = F.linear(
-                hidden,
-                output_weight.index_select(0, model.motion_token_ids[slot]),
-            ).float().squeeze(0)
-            probabilities = logits.softmax(dim=-1)
-            local_id = int(logits.argmax().item())
-            predicted_anchor.append(local_id)
-            anchor_confidence.append(float(probabilities[local_id].item()))
-            anchor_entropy.append(
-                float((-(probabilities * probabilities.clamp_min(1e-12).log()).sum()).item())
-            )
-            token_id = int(model.motion_token_ids[slot, local_id].item())
-            hidden, past = _cached_chunk(
-                model,
-                input_ids=[token_id],
-                audio_codes=[-1],
-                device=device,
-                past_key_values=past,
-                use_bf16=use_bf16,
-            )
-        predictions.append(predicted_anchor)
-        targets.append([int(labels[position]) for position in group])
-        confidences.append(anchor_confidence)
-        entropies.append(anchor_entropy)
-        cursor = int(group[-1]) + 1
+    rollout = generate_history_batch(
+        model,
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        audio_codes=audio_codes,
+        target_slots=target_slots,
+        use_bf16=use_bf16,
+    )
+    predicted_array = rollout.predicted_local_ids[0].cpu().numpy()
+    confidence_array = rollout.confidence[0].cpu().numpy()
+    entropy_array = rollout.entropy[0].cpu().numpy()
+    predictions = [[int(predicted_array[position]) for position in group] for group in groups]
+    targets = [[int(labels[position]) for position in group] for group in groups]
+    confidences = [[float(confidence_array[position]) for position in group] for group in groups]
+    entropies = [[float(entropy_array[position]) for position in group] for group in groups]
 
     return RolloutResult(
         name=str(item["name"]),
@@ -435,6 +379,19 @@ def evaluate_rollouts(results: Sequence[RolloutResult]) -> dict[str, Any]:
         mean_entropy=float(entropy.mean()),
         elapsed_seconds=float(sum(result.elapsed_seconds for result in results)),
     )
+    flat_correct = (predictions == labels).reshape(-1).astype(np.float64)
+    flat_confidence = confidence.reshape(-1)
+    calibration_error = 0.0
+    for lower, upper in zip(np.linspace(0.0, 1.0, 11)[:-1], np.linspace(0.0, 1.0, 11)[1:]):
+        in_bin = (flat_confidence >= lower) & (
+            flat_confidence <= upper if upper == 1.0 else flat_confidence < upper
+        )
+        if np.any(in_bin):
+            calibration_error += float(in_bin.mean()) * abs(
+                float(flat_confidence[in_bin].mean()) - float(flat_correct[in_bin].mean())
+            )
+    summary["expected_calibration_error_10bin"] = calibration_error
+    summary["top1_brier"] = float(np.mean((flat_confidence - flat_correct) ** 2))
 
     horizon_rows = []
     for result in results:
@@ -477,7 +434,7 @@ def write_rollout_cache(results: Sequence[RolloutResult], output_dir: Path) -> N
 
 
 class ShuffledAudioDataset(Dataset):
-    """Keep the target/template fixed while replacing q0 with another clip's q0."""
+    """Keep targets fixed while replacing configured Mimi streams with a donor clip."""
 
     def __init__(
         self,
@@ -501,15 +458,18 @@ class ShuffledAudioDataset(Dataset):
         donor_path = canonical_data_path(
             self.mimi_token_dir, self.donor_names[index], ".npz"
         )
-        donor = np.asarray(load_mimi_tokens(donor_path)["codes"])[0]
-        positions = np.flatnonzero(np.asarray(item["audio_codes"]) >= 0)
-        if not len(positions) or not len(donor):
+        codebooks = tuple(getattr(self.base_dataset, "mimi_codebooks_used", (0,)))
+        donor = np.asarray(load_mimi_tokens(donor_path)["codes"])[list(codebooks)]
+        audio_codes = np.asarray(item["audio_codes"], dtype=np.int64)
+        if audio_codes.ndim == 1:
+            audio_codes = audio_codes[:, None]
+        positions = np.flatnonzero(np.all(audio_codes >= 0, axis=-1))
+        if not len(positions) or donor.shape[1] == 0:
             return item
         donor_indices = np.rint(
-            np.linspace(0, len(donor) - 1, num=len(positions))
+            np.linspace(0, donor.shape[1] - 1, num=len(positions))
         ).astype(np.int64)
-        audio_codes = np.asarray(item["audio_codes"], dtype=np.int64)
-        audio_codes[positions] = donor[donor_indices]
+        audio_codes[positions] = donor[:, donor_indices].T
         item["audio_codes"] = audio_codes.tolist()
         return item
 
@@ -556,9 +516,18 @@ def codec_anchor_diagnostics(
         quantizer = loaded.model.quantizers[part]
         gt_anchor_codes = _part_codes(dense[times], part_index).to(device)
         predicted_anchor_codes = _part_codes(predicted_anchors, part_index).to(device)
+        copied_anchor_codes = _part_codes(dense[previous_times], part_index).to(device)
         gt_latent = quantizer.get_codebook_entry(gt_anchor_codes)
         predicted_latent = quantizer.get_codebook_entry(predicted_anchor_codes)
-        latent_rmse = float(torch.sqrt(torch.mean((predicted_latent - gt_latent) ** 2)).item())
+        copied_latent = quantizer.get_codebook_entry(copied_anchor_codes)
+        latent_rmse = {
+            "oracle_gap_anchor_substitution": float(
+                torch.sqrt(torch.mean((predicted_latent - gt_latent) ** 2)).item()
+            ),
+            "oracle_gap_previous_anchor_copy": float(
+                torch.sqrt(torch.mean((copied_latent - gt_latent) ** 2)).item()
+            ),
+        }
 
         decoded = {}
         decoded_normalized = {}
@@ -593,7 +562,7 @@ def codec_anchor_diagnostics(
                     "variant": variant,
                     "token_frames": int(len(dense)),
                     "anchor_count": int(len(times)),
-                    "predicted_anchor_latent_rmse": latent_rmse,
+                    "anchor_latent_rmse": latent_rmse[variant],
                     **metrics,
                 }
             )

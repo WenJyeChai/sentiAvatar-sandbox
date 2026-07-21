@@ -132,7 +132,7 @@ def deterministic_choice(probability: float, *, seed: int, epoch: int, name: str
 class Step1Sequence:
     name: str
     input_ids: list[int]
-    audio_codes: list[int]
+    audio_codes: list[list[int]]
     target_slots: list[int]
     motion_local_labels: list[int]
     anchor_times: tuple[int, ...]
@@ -167,6 +167,7 @@ class Step1FixedGapDataset(Dataset):
         random_seed: int = 42,
         require_causal_motion: bool = True,
         max_duration_mismatch_seconds: float = 0.12,
+        mimi_codebooks_used: Optional[Sequence[int]] = None,
     ) -> None:
         if seed_mode not in {"observed", "previous", "neutral", "mixed_known", "mixed_all"}:
             raise ValueError(
@@ -198,6 +199,15 @@ class Step1FixedGapDataset(Dataset):
         self.random_seed = int(random_seed)
         self.require_causal_motion = bool(require_causal_motion)
         self.max_duration_mismatch_seconds = float(max_duration_mismatch_seconds)
+        self.mimi_codebooks_used = tuple(int(value) for value in (mimi_codebooks_used or [0]))
+        if not self.mimi_codebooks_used:
+            raise ValueError("At least one Mimi codebook must be used")
+        if len(set(self.mimi_codebooks_used)) != len(self.mimi_codebooks_used):
+            raise ValueError("Mimi codebook indices must be unique")
+        if any(not 0 <= value < MIMI_STORED_CODEBOOKS for value in self.mimi_codebooks_used):
+            raise ValueError(
+                f"Mimi codebook indices must be in [0, {MIMI_STORED_CODEBOOKS - 1}]"
+            )
         self.epoch = 0
         self._single_token_ids = self._build_single_token_ids()
 
@@ -283,7 +293,7 @@ class Step1FixedGapDataset(Dataset):
         audio_path = canonical_data_path(self.mimi_token_dir, name, ".npz")
         motion_tokens, _ = load_motion_tokens(motion_path, require_causal=self.require_causal_motion)
         mimi_payload = load_mimi_tokens(audio_path)
-        q0 = np.asarray(mimi_payload["codes"])[0]
+        mimi_codes = np.asarray(mimi_payload["codes"])[list(self.mimi_codebooks_used)]
         if name not in self.text_map:
             raise KeyError(f"Missing text annotation for {name}")
 
@@ -299,7 +309,7 @@ class Step1FixedGapDataset(Dataset):
         anchor_times = fixed_anchor_times(len(motion_tokens), gap=self.fixed_gap)
         audio_boundaries = causal_audio_boundaries(
             anchor_times,
-            audio_frames=len(q0),
+            audio_frames=mimi_codes.shape[1],
             audio_fps=MIMI_FRAME_RATE,
             motion_fps=MOTION_TOKEN_FPS,
         )
@@ -309,13 +319,14 @@ class Step1FixedGapDataset(Dataset):
 
         prompt = f"Human: {STEP1_ROLE_TOKEN}{self.text_map[name]}<|im_end|>\nAssistant:"
         input_ids = [int(value) for value in self.tokenizer.encode(prompt, add_special_tokens=False)]
-        audio_codes = [-1] * len(input_ids)
+        empty_audio = [-1] * len(self.mimi_codebooks_used)
+        audio_codes = [empty_audio.copy() for _ in input_ids]
         target_slots = [-1] * len(input_ids)
         motion_local_labels = [IGNORE_INDEX] * len(input_ids)
 
         def append_control(token: str) -> None:
             input_ids.append(self._single_token_ids[token])
-            audio_codes.append(-1)
+            audio_codes.append(empty_audio.copy())
             target_slots.append(-1)
             motion_local_labels.append(IGNORE_INDEX)
 
@@ -329,7 +340,7 @@ class Step1FixedGapDataset(Dataset):
                 if token_id is None:
                     raise ValueError(f"Tokenizer is missing body token for slot {slot}, id {input_local_id}")
                 input_ids.append(int(token_id))
-                audio_codes.append(-1)
+                audio_codes.append(empty_audio.copy())
                 if target_anchor is None:
                     target_slots.append(-1)
                     motion_local_labels.append(IGNORE_INDEX)
@@ -350,9 +361,9 @@ class Step1FixedGapDataset(Dataset):
             gap = gap_from_anchor_times(left_time, target_time)
             append_control(GAP_TOKENS[gap])
             next_audio_boundary = audio_boundaries[anchor_index]
-            for code in q0[audio_cursor:next_audio_boundary]:
+            for frame_codes in mimi_codes[:, audio_cursor:next_audio_boundary].T:
                 append_control(MIMI_FRAME_TOKEN)
-                audio_codes[-1] = int(code)
+                audio_codes[-1] = [int(code) for code in frame_codes]
             audio_cursor = next_audio_boundary
 
             gt_anchor = tuple(int(v) for v in motion_tokens[target_time])
@@ -368,15 +379,18 @@ class Step1FixedGapDataset(Dataset):
                 generated_prefix_anchors += 1
             append_anchor(input_anchor, target_anchor=gt_anchor)
 
-        if audio_cursor != len(q0):
-            raise AssertionError(f"Did not consume all Mimi frames for {name}: {audio_cursor}/{len(q0)}")
+        if audio_cursor != mimi_codes.shape[1]:
+            raise AssertionError(
+                f"Did not consume all Mimi frames for {name}: "
+                f"{audio_cursor}/{mimi_codes.shape[1]}"
+            )
         append_control(AUDIO_END_TOKEN)
         append_control(MOTION_END_TOKEN)
         im_end_ids = self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
         if len(im_end_ids) != 1:
             raise ValueError("<|im_end|> must be a single token")
         input_ids.append(int(im_end_ids[0]))
-        audio_codes.append(-1)
+        audio_codes.append(empty_audio.copy())
         target_slots.append(-1)
         motion_local_labels.append(IGNORE_INDEX)
 
@@ -424,10 +438,23 @@ class Step1PlannerCollator:
             return torch.tensor(rows, dtype=torch.long)
 
         input_ids = padded("input_ids", self.pad_token_id)
+        codebook_counts = {
+            len(frame_codes)
+            for example in examples
+            for frame_codes in example["audio_codes"]
+        }
+        if len(codebook_counts) != 1:
+            raise ValueError(f"Examples use inconsistent Mimi codebook counts: {codebook_counts}")
+        codebook_count = codebook_counts.pop()
+        padded_audio = []
+        for example in examples:
+            values = [list(map(int, frame_codes)) for frame_codes in example["audio_codes"]]
+            values.extend([[-1] * codebook_count for _ in range(longest - len(values))])
+            padded_audio.append(values)
         return {
             "input_ids": input_ids,
             "attention_mask": input_ids.ne(self.pad_token_id).long(),
-            "audio_codes": padded("audio_codes", -1),
+            "audio_codes": torch.tensor(padded_audio, dtype=torch.long),
             "target_slots": padded("target_slots", -1),
             "motion_local_labels": padded("motion_local_labels", IGNORE_INDEX),
             "names": [str(example["name"]) for example in examples],
@@ -468,10 +495,13 @@ class MimiQwenPlannerOutput(ModelOutput):
     count: Optional[torch.Tensor] = None
     per_slot_correct: Optional[torch.Tensor] = None
     per_slot_count: Optional[torch.Tensor] = None
+    per_example_loss_sum: Optional[torch.Tensor] = None
+    per_example_correct: Optional[torch.Tensor] = None
+    per_example_count: Optional[torch.Tensor] = None
 
 
 class MimiQwenPlanner(PreTrainedModel):
-    """Qwen with a separate 2,048-entry Mimi q0 embedding and slot CE."""
+    """Qwen with codebook-specific causal Mimi embeddings and slot CE."""
 
     config_class = MimiQwenPlannerConfig
     base_model_prefix = "language_model"
@@ -489,9 +519,48 @@ class MimiQwenPlanner(PreTrainedModel):
             language_model = AutoModelForCausalLM.from_config(language_config)
         self.language_model = language_model
         hidden_size = int(language_model.config.hidden_size)
-        self.audio_embedding = nn.Embedding(config.mimi_cardinality, hidden_size)
+        embedding_dtype = language_model.get_input_embeddings().weight.dtype
+        if not config.mimi_codebooks_used:
+            raise ValueError("At least one Mimi codebook must be configured")
+        if config.mimi_codebooks_used[0] != 0:
+            raise ValueError("The first configured Mimi codebook must be q0")
+        if len(set(config.mimi_codebooks_used)) != len(config.mimi_codebooks_used):
+            raise ValueError("Configured Mimi codebooks must be unique")
+        if any(not 0 <= value < config.mimi_codebooks_stored for value in config.mimi_codebooks_used):
+            raise ValueError("Configured Mimi codebook index is outside the stored Mimi streams")
+
+        # Preserve the historical q0 parameter name so q0-only checkpoints remain loadable.
+        self.audio_embedding = nn.Embedding(
+            config.mimi_cardinality, hidden_size, dtype=embedding_dtype
+        )
+        self.additional_audio_embeddings = nn.ModuleList(
+            nn.Embedding(config.mimi_cardinality, hidden_size, dtype=embedding_dtype)
+            for _ in config.mimi_codebooks_used[1:]
+        )
+        codebook_count = len(config.mimi_codebooks_used)
+        self.audio_fusion = (
+            nn.Linear(
+                codebook_count * hidden_size,
+                hidden_size,
+                bias=False,
+                dtype=embedding_dtype,
+            )
+            if codebook_count > 1
+            else nn.Identity()
+        )
         initializer_range = float(getattr(language_model.config, "initializer_range", 0.02))
         nn.init.normal_(self.audio_embedding.weight, mean=0.0, std=initializer_range)
+        for embedding in self.additional_audio_embeddings:
+            nn.init.normal_(embedding.weight, mean=0.0, std=initializer_range)
+        if isinstance(self.audio_fusion, nn.Linear):
+            # Start as a variance-preserving average while leaving the fusion learnable.
+            with torch.no_grad():
+                self.audio_fusion.weight.zero_()
+                scale = codebook_count ** -0.5
+                identity = torch.eye(hidden_size, dtype=self.audio_fusion.weight.dtype)
+                for index in range(codebook_count):
+                    left = index * hidden_size
+                    self.audio_fusion.weight[:, left : left + hidden_size].copy_(identity * scale)
 
         motion_token_ids = torch.tensor(config.motion_token_ids, dtype=torch.long)
         if tuple(motion_token_ids.shape) != (BODY_SLOT_COUNT, BODY_CODEBOOK_SIZE):
@@ -513,6 +582,7 @@ class MimiQwenPlanner(PreTrainedModel):
         motion_token_ids: Sequence[Sequence[int]],
         torch_dtype: Optional[torch.dtype] = None,
         local_files_only: bool = True,
+        mimi_codebooks_used: Optional[Sequence[int]] = None,
     ) -> "MimiQwenPlanner":
         language_model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -526,7 +596,7 @@ class MimiQwenPlanner(PreTrainedModel):
             motion_token_ids=motion_token_ids,
             mimi_cardinality=MIMI_CARDINALITY,
             mimi_codebooks_stored=MIMI_STORED_CODEBOOKS,
-            mimi_codebooks_used=[0],
+            mimi_codebooks_used=mimi_codebooks_used or [0],
         )
         return cls(config, language_model=language_model)
 
@@ -551,20 +621,40 @@ class MimiQwenPlanner(PreTrainedModel):
         self.language_model.gradient_checkpointing_disable()
 
     def prepare_input_embeddings(self, input_ids: torch.Tensor, audio_codes: torch.Tensor) -> torch.Tensor:
-        if input_ids.shape != audio_codes.shape:
-            raise ValueError("input_ids and audio_codes must have the same shape")
+        if audio_codes.ndim == input_ids.ndim:
+            audio_codes = audio_codes.unsqueeze(-1)
+        expected_audio_shape = (*input_ids.shape, len(self.config.mimi_codebooks_used))
+        if tuple(audio_codes.shape) != expected_audio_shape:
+            raise ValueError(
+                f"audio_codes must have shape {expected_audio_shape}, got {tuple(audio_codes.shape)}"
+            )
         placeholder_mask = input_ids.eq(self.config.audio_placeholder_id)
         code_mask = audio_codes.ge(0)
-        if not torch.equal(placeholder_mask, code_mask):
+        complete_code_mask = code_mask.all(dim=-1)
+        if not torch.equal(code_mask.any(dim=-1), complete_code_mask):
+            raise ValueError("Every Mimi frame must provide all configured codebooks")
+        if not torch.equal(placeholder_mask, complete_code_mask):
             raise ValueError("audio_codes must be set exactly at [mimi_frame] placeholder positions")
-        if code_mask.any():
-            selected = audio_codes[code_mask]
+        if complete_code_mask.any():
+            selected = audio_codes[complete_code_mask]
             if int(selected.min()) < 0 or int(selected.max()) >= self.config.mimi_cardinality:
                 raise ValueError("Mimi input code is outside the configured cardinality")
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
-        safe_codes = audio_codes.clamp(min=0)
-        audio_embeddings = self.audio_embedding(safe_codes)
-        return torch.where(placeholder_mask.unsqueeze(-1), audio_embeddings, text_embeddings)
+        if not bool(complete_code_mask.any()):
+            return text_embeddings
+
+        # Embed only real audio positions; materializing four [B,L,H] tensors is
+        # unnecessarily expensive for 2,560-token sequences on 24 GB GPUs.
+        selected_codes = audio_codes[complete_code_mask]
+        codebook_embeddings = [self.audio_embedding(selected_codes[:, 0])]
+        codebook_embeddings.extend(
+            embedding(selected_codes[:, index + 1])
+            for index, embedding in enumerate(self.additional_audio_embeddings)
+        )
+        fused_audio = self.audio_fusion(torch.cat(codebook_embeddings, dim=-1))
+        flat_embeddings = text_embeddings.reshape(-1, text_embeddings.shape[-1])
+        flat_positions = complete_code_mask.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        return flat_embeddings.index_copy(0, flat_positions, fused_audio).view_as(text_embeddings)
 
     def _base_model_forward(self, **kwargs: Any):
         base_prefix = getattr(self.language_model, "base_model_prefix", "model")
@@ -584,11 +674,12 @@ class MimiQwenPlanner(PreTrainedModel):
         if not (
             input_ids.shape
             == attention_mask.shape
-            == audio_codes.shape
             == target_slots.shape
             == motion_local_labels.shape
         ):
-            raise ValueError("All planner input tensors must have the same [B, L] shape")
+            raise ValueError("All non-audio planner input tensors must have the same [B, L] shape")
+        if tuple(audio_codes.shape[:2]) != tuple(input_ids.shape):
+            raise ValueError("audio_codes must begin with the same [B, L] shape as input_ids")
         target_mask = target_slots.ge(0)
         label_mask = motion_local_labels.ne(IGNORE_INDEX)
         if not torch.equal(target_mask, label_mask):
@@ -613,6 +704,9 @@ class MimiQwenPlanner(PreTrainedModel):
         count = torch.zeros((), device=hidden.device, dtype=torch.long)
         per_slot_correct = torch.zeros(BODY_SLOT_COUNT, device=hidden.device, dtype=torch.long)
         per_slot_count = torch.zeros(BODY_SLOT_COUNT, device=hidden.device, dtype=torch.long)
+        per_example_loss_sum = torch.zeros(input_ids.shape[0], device=hidden.device, dtype=torch.float32)
+        per_example_correct = torch.zeros(input_ids.shape[0], device=hidden.device, dtype=torch.long)
+        per_example_count = torch.zeros(input_ids.shape[0], device=hidden.device, dtype=torch.long)
         for slot in range(BODY_SLOT_COUNT):
             mask = shifted_slots.eq(slot)
             slot_count = mask.sum()
@@ -623,12 +717,20 @@ class MimiQwenPlanner(PreTrainedModel):
             classifier_weight = output_weight.index_select(0, allowed_ids)
             logits = F.linear(slot_hidden, classifier_weight).float()
             labels = shifted_labels[mask]
-            loss_sum = loss_sum + F.cross_entropy(logits, labels, reduction="sum")
-            slot_correct = logits.argmax(dim=-1).eq(labels).sum()
+            token_losses = F.cross_entropy(logits, labels, reduction="none")
+            token_correct = logits.argmax(dim=-1).eq(labels)
+            loss_sum = loss_sum + token_losses.sum()
+            slot_correct = token_correct.sum()
             correct = correct + slot_correct
             count = count + slot_count
             per_slot_correct[slot] = slot_correct
             per_slot_count[slot] = slot_count
+            example_indices = mask.nonzero(as_tuple=False)[:, 0]
+            per_example_loss_sum.scatter_add_(0, example_indices, token_losses)
+            per_example_correct.scatter_add_(0, example_indices, token_correct.to(torch.long))
+            per_example_count.scatter_add_(
+                0, example_indices, torch.ones_like(example_indices, dtype=torch.long)
+            )
         if not bool(count):
             raise ValueError("Batch contains no supervised anchor tokens")
         loss = loss_sum / count
@@ -638,6 +740,9 @@ class MimiQwenPlanner(PreTrainedModel):
             count=count,
             per_slot_correct=per_slot_correct,
             per_slot_count=per_slot_count,
+            per_example_loss_sum=per_example_loss_sum,
+            per_example_correct=per_example_correct,
+            per_example_count=per_example_count,
         )
 
     @torch.inference_mode()

@@ -1,0 +1,68 @@
+paths:
+  base_model: checkpoints/llm
+  output_dir: checkpoints/step1_multipart_fixed_gap3_self_forcing_q0q3_smoke
+  data_dir: SuSuInterActs/SuSuInterActs
+  motion_token_dir: SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4
+  mimi_token_dir: SuSuInterActs/SuSuInterActs/audio_tokens_mimi_12p5hz_8cb
+  text_json: SuSuInterActs/SuSuInterActs/text_data/motion2text.json
+  train_split: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  eval_split: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+
+data:
+  fixed_gap: 3
+  max_length: 2560
+  mimi_codebooks_used: [0, 1, 2, 3]
+  num_workers: 2
+  persistent_workers: false
+  require_causal_motion: true
+  max_duration_mismatch_seconds: 0.12
+  seed_mode: mixed_known
+  neutral_seed_json: null
+  neutral_seed_probability: 0.5
+  previous_seed_probability: 0.5
+  generated_anchor_dir: null
+  generated_prefix_probability: 0.0
+
+audio:
+  mimi_codebooks_used: [0, 1, 2, 3]
+  fusion: concat_linear
+  sparse_audio_embedding: true
+
+generated_history:
+  enabled: true
+  decoding: greedy
+  minimum_teacher_epochs: 1
+  ramp_epochs: 1
+  max_probability: 0.5
+  rollout_microbatch_size: 2
+  rollout_eval_clips: 8
+  # Smoke-only permissive gates ensure epoch 2 exercises generated histories.
+  teacher_forced_ce_max: 10.0
+  rollout_accuracy_min: 0.0
+  rollout_q0_accuracy_min: 0.0
+  rollout_eval_epochs: [1, 3]
+  milestone_epochs: [1, 3]
+
+training:
+  seed: 42
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  adam_betas: [0.9, 0.95]
+  adam_epsilon: 1.0e-8
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 1
+  eval_steps: 0
+  save_steps: 0
+  save_best: true
+  early_stopping_patience: 0
+  early_stopping_min_delta: 0.0
+
+monitoring:
+  report_to: none

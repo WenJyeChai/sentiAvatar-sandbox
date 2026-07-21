@@ -22,6 +22,7 @@ from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     build_dataset,
     load_config,
     load_neutral_seed,
+    mimi_codebooks_from_config,
     resolve_data_paths,
     section,
     validate_paths,
@@ -99,6 +100,7 @@ def main() -> None:
     paths = resolve_data_paths(config)
     validate_paths(paths, resume=None)
     data_config = section(config, "data")
+    data_config["mimi_codebooks_used"] = mimi_codebooks_from_config(config)
     tokenizer = AutoTokenizer.from_pretrained(paths["base_model"], local_files_only=True)
     added = ensure_step1_special_tokens(tokenizer)
     print(f"Tokenizer controls added in-memory: {len(added)}")

@@ -99,6 +99,7 @@ motion_generation/notebooks/phase1_mimi_preflight.ipynb
 motion_generation/notebooks/validate_causal_multipart_rvqvae.ipynb
 motion_generation/notebooks/evaluate_step1_fixed_gap3_planner.ipynb
 motion_generation/utils/step1_planner_evaluation.py
+motion_generation/STEP1_FIXED_GAP3_EVALUATION_REPORT.md
 ```
 
 ## 5. Remote prerequisite
@@ -450,3 +451,72 @@ sensitivity, and reports codec-space oracle-gap anchor substitutions. It does
 not use the test split or claim Step 2 quality.
 
 Passing the causal Mimi preflight proves representation correctness, not downstream motion predictability.
+
+## 14. Full-data q0-q3 generated-history run
+
+The on-policy Self-Forcing-style experiment is configured in:
+
+```text
+motion_generation/configs/step1_multipart_fixed_gap3_self_forcing_q0q3_full.yaml
+```
+
+It starts from `checkpoints/llm`, consumes synchronous causal Mimi q0-q3 at
+one 12.5 Hz placeholder per frame, and trains on the complete official SuSu
+training split. Four independent embedding tables are concatenated and
+projected into the Qwen hidden size. Only real audio positions are embedded,
+avoiding four dense audio tensors over the full 2,560-token sequence.
+
+The first five epochs are teacher forced. At and after epoch 5, a deterministic
+64-clip generated rollout opens the curriculum only when all three gates pass:
+
+- teacher-forced validation CE is at most 5.4;
+- generated-history accuracy is at least 1%; and
+- generated-history q0 motion-slot accuracy is at least 3%.
+
+After activation, the fraction of fully self-forced clips follows a ten-epoch
+cosine ramp from 0 to 0.5 and remains at 0.5 through epoch 50. Selection is at
+clip level: every supervised anchor after the known seed is generated for a
+selected clip. GT labels never change. The generated discrete IDs are produced
+under inference mode with Qwen `past_key_values`; the cache is released before
+the separate gradient-bearing CE pass. No rollout files are written.
+
+Validate the full records on the remote machine:
+
+```bash
+python motion_generation/scripts/validate_step1_fixed_gap_data.py \
+  --config motion_generation/configs/step1_multipart_fixed_gap3_self_forcing_q0q3_full.yaml \
+  --output_json checkpoints/step1_multipart_fixed_gap3_self_forcing_q0q3_full/data_preflight.json
+```
+
+Before the full job, exercise both the teacher and generated-history paths on
+64 clips. The smoke gates are deliberately permissive and are not scientific
+thresholds:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NCCL_P2P_DISABLE=1 \
+NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=4 --master_port=29515 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_multipart_fixed_gap3_self_forcing_q0q3_smoke.yaml \
+  --max_train_clips 64 --max_eval_clips 32
+```
+
+Launch on four 4090 GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+NCCL_P2P_DISABLE=1 \
+NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=4 --master_port=29515 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_multipart_fixed_gap3_self_forcing_q0q3_full.yaml
+```
+
+The effective batch is `32 x 4 x 1 = 128`. With 19,019 training clips this is
+149 optimizer updates per epoch and approximately 7,450 updates over 50 epochs.
+Early stopping is disabled. The trainer retains `best/`, `best_rollout/`,
+`teacher_warmup/`, `final/`, and milestones at epochs 5, 15, 25, 35, and 50.
+Curriculum activation and best-rollout state are included in resumable training
+state. `persistent_workers` is disabled so epoch-dependent mixed-known seed
+selection reaches DataLoader workers correctly.
