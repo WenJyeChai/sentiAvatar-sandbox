@@ -4,6 +4,7 @@
 **Scope:** Step 1 planner design, Step 2 integration, losses, training curriculum, inference contract, implementation plan, and evaluation gates.  
 **Detailed Step 2 reference:** [`STEP2_MULTIPART_C2F_HANDOFF.md`](STEP2_MULTIPART_C2F_HANDOFF.md)  
 **Literature review:** [`../learned_sparse_anchor_planning_literature_review.md`](../learned_sparse_anchor_planning_literature_review.md)
+**Phase 1 implementation:** [`PHASE1_FIXED_GAP3_IMPLEMENTATION.md`](PHASE1_FIXED_GAP3_IMPLEMENTATION.md)
 
 ---
 
