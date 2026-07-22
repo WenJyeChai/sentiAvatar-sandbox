@@ -23,6 +23,7 @@ from utils.adaptive_anchor_tokens import (  # noqa: E402
     body_global_id,
 )
 from utils.step1_planner_evaluation import (  # noqa: E402
+    build_anchor_substitution_token_variants,
     evaluate_reference_baselines,
     evaluate_rollouts,
     fit_unigram_prior,
@@ -82,6 +83,40 @@ def test_summary_and_unigram_reference() -> None:
     assert uniform["accuracy"] == 1.0 / BODY_CODEBOOK_SIZE
     copied = next(row for row in baseline_rows if row["baseline"] == "previous_gt_anchor_copy")
     assert copied["accuracy"] == 1.0
+
+
+def test_anchor_substitution_variants_retain_oracle_gaps() -> None:
+    dense = np.asarray(
+        [
+            [(11 * time + slot) % BODY_CODEBOOK_SIZE for slot in range(BODY_SLOT_COUNT)]
+            for time in range(10)
+        ],
+        dtype=np.int64,
+    )
+    times = (0, 4, 8, 9)
+    predictions = (dense[list(times[1:])] + 37) % BODY_CODEBOOK_SIZE
+    variants = build_anchor_substitution_token_variants(
+        dense_tokens=dense,
+        anchor_times=times,
+        predicted_anchors=predictions,
+        target_anchors=dense[list(times[1:])],
+    )
+
+    target_times = np.asarray(times[1:])
+    non_anchor = np.ones(len(dense), dtype=bool)
+    non_anchor[target_times] = False
+    for value in variants.values():
+        assert np.array_equal(value[non_anchor], dense[non_anchor])
+    assert np.array_equal(
+        variants["rollout_anchor_substitution"][target_times], predictions
+    )
+    assert np.array_equal(
+        variants["previous_gt_anchor_copy"][target_times], dense[list(times[:-1])]
+    )
+    assert np.array_equal(
+        variants["seed_hold"][target_times],
+        np.repeat(dense[[times[0]]], len(target_times), axis=0),
+    )
 
 
 def test_cached_greedy_rollout_generates_all_slots() -> None:

@@ -590,6 +590,72 @@ def _part_codes(dense_tokens: np.ndarray, part_index: int) -> torch.Tensor:
     ).unsqueeze(0)
 
 
+def build_anchor_substitution_token_variants(
+    *,
+    dense_tokens: Sequence[Sequence[int]] | np.ndarray,
+    anchor_times: Sequence[int],
+    predicted_anchors: Sequence[Sequence[int]] | np.ndarray,
+    target_anchors: Optional[Sequence[Sequence[int]] | np.ndarray] = None,
+) -> dict[str, np.ndarray]:
+    """Build dense oracle-gap sequences for sparse-anchor evaluation.
+
+    Every returned sequence retains GT tokens outside the selected anchor
+    positions.  Consequently these variants isolate the damage introduced by
+    the anchors; they are not Step 2 infilling outputs.
+
+    ``previous_gt_anchor_copy`` is an oracle one-step persistence reference:
+    each target receives the preceding *GT* anchor. ``seed_hold`` is the
+    deployable persistence reference and repeats only the initial known seed.
+    """
+
+    dense = np.asarray(dense_tokens, dtype=np.int64)
+    times = np.asarray(anchor_times, dtype=np.int64)
+    predictions = np.asarray(predicted_anchors, dtype=np.int64)
+    if dense.ndim != 2 or dense.shape[1] != BODY_SLOT_COUNT:
+        raise ValueError(
+            f"dense_tokens must have shape [T, {BODY_SLOT_COUNT}], got {dense.shape}"
+        )
+    if times.ndim != 1 or len(times) < 2:
+        raise ValueError("anchor_times must contain a seed and at least one target")
+    if np.any(np.diff(times) <= 0):
+        raise ValueError("anchor_times must be strictly increasing")
+    if times[0] < 0 or times[-1] >= len(dense):
+        raise ValueError(
+            f"anchor_times [{times[0]}, {times[-1]}] exceed dense length {len(dense)}"
+        )
+    expected_shape = (len(times) - 1, BODY_SLOT_COUNT)
+    if predictions.shape != expected_shape:
+        raise ValueError(
+            f"predicted_anchors must have shape {expected_shape}, got {predictions.shape}"
+        )
+    for label, values in (("dense_tokens", dense), ("predicted_anchors", predictions)):
+        if np.any((values < 0) | (values >= BODY_CODEBOOK_SIZE)):
+            raise ValueError(f"{label} contains IDs outside [0, {BODY_CODEBOOK_SIZE - 1}]")
+
+    target_times = times[1:]
+    if target_anchors is not None:
+        targets = np.asarray(target_anchors, dtype=np.int64)
+        if targets.shape != expected_shape:
+            raise ValueError(
+                f"target_anchors must have shape {expected_shape}, got {targets.shape}"
+            )
+        if not np.array_equal(targets, dense[target_times]):
+            raise ValueError("Rollout target anchors do not match the dense causal tokens")
+
+    predicted_dense = dense.copy()
+    predicted_dense[target_times] = predictions
+    previous_gt_dense = dense.copy()
+    previous_gt_dense[target_times] = dense[times[:-1]]
+    seed_hold_dense = dense.copy()
+    seed_hold_dense[target_times] = dense[times[0]]
+    return {
+        "causal_codec_reconstruction": dense.copy(),
+        "rollout_anchor_substitution": predicted_dense,
+        "previous_gt_anchor_copy": previous_gt_dense,
+        "seed_hold": seed_hold_dense,
+    }
+
+
 @torch.inference_mode()
 def codec_anchor_diagnostics(
     *,
@@ -610,11 +676,14 @@ def codec_anchor_diagnostics(
     times = np.asarray(anchor_times[1:], dtype=np.int64)
     if predicted_anchors.shape != (len(times), BODY_SLOT_COUNT):
         raise ValueError("Predicted anchors do not match non-seed anchor times")
-    predicted_dense = dense.copy()
-    copy_dense = dense.copy()
-    predicted_dense[times] = predicted_anchors
+    variants = build_anchor_substitution_token_variants(
+        dense_tokens=dense,
+        anchor_times=anchor_times,
+        predicted_anchors=predicted_anchors,
+    )
+    predicted_dense = variants["rollout_anchor_substitution"]
+    copy_dense = variants["previous_gt_anchor_copy"]
     previous_times = np.asarray(anchor_times[:-1], dtype=np.int64)
-    copy_dense[times] = dense[previous_times]
 
     rows: list[dict[str, float | int | str]] = []
     for part_index, part in enumerate(BODY_PART_ORDER):
