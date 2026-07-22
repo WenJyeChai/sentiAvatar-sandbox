@@ -116,6 +116,12 @@ For P1/P2/P3, replace only the config and use a different free master port.
 
 ## Evaluation
 
+For an interactive end-to-end evaluation, open
+`motion_generation/notebooks/evaluate_step1_condition_alignment.ipynb`. It
+runs the condition-likelihood evaluator, summarizes teacher-forced versus
+fixed-generated-prefix gaps, and exposes optional standard rollout and
+anchor-substitution FID stages behind separate switches.
+
 Training reports the teacher-forced quantities:
 
 ```text
@@ -179,4 +185,3 @@ loss so generated motion history does not erase conditioning reliance.
 - P3 tests coexistence only after isolated evidence.
 - The stopped expected-distortion/self-forcing run remains an exploratory
   ablation and is not a canonical pretraining checkpoint.
-
