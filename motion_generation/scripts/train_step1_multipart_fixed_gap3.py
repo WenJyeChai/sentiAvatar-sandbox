@@ -56,9 +56,6 @@ from utils.step1_self_forcing import (  # noqa: E402
     rollout_quality_metrics,
     validate_generated_labels,
 )
-from utils.step1_expected_distortion import (  # noqa: E402
-    load_normalized_codebook_distance_table,
-)
 from utils.step1_condition_alignment import (  # noqa: E402
     ConditionCorruption,
     corrupt_audio_with_causal_past,
@@ -832,6 +829,14 @@ def main() -> None:
         )
     model.language_model.config.use_cache = False
     if auxiliary_loss["type"] == "expected_distortion":
+        # The archived expected-distortion experiment depends on the full
+        # causal-codec stack. Import it only when that archived loss is
+        # explicitly selected so active CE/condition-alignment training and
+        # evaluation do not require codec-only packages such as einops.
+        from utils.step1_expected_distortion import (
+            load_normalized_codebook_distance_table,
+        )
+
         if is_main(rank):
             print("Loading frozen causal-codec geometry for expected-distortion loss")
         distances = load_normalized_codebook_distance_table(
