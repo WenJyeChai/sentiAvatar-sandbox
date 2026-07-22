@@ -39,6 +39,21 @@ from utils.causal_codec_evaluation import reconstruction_metrics
 from utils.step1_self_forcing import generate_history_batch
 
 
+class Step1EvaluationCollator:
+    """Preserve per-clip timing metadata on top of the training collator."""
+
+    def __init__(self, base_collator) -> None:
+        self.base_collator = base_collator
+
+    def __call__(self, examples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        batch = self.base_collator(examples)
+        batch["anchor_times"] = [
+            tuple(int(value) for value in example["anchor_times"])
+            for example in examples
+        ]
+        return batch
+
+
 def slot_name(slot: int) -> str:
     spec = BODY_SLOTS[int(slot)]
     return f"{spec.part}_q{spec.quantizer}"
@@ -363,6 +378,100 @@ def greedy_rollout_item(
         entropy=np.asarray(entropies, dtype=np.float64),
         elapsed_seconds=time.perf_counter() - started,
     )
+
+
+@torch.inference_mode()
+def greedy_rollout_batch(
+    model: MimiQwenPlanner,
+    batch: Mapping[str, Any],
+    *,
+    device: torch.device,
+    use_bf16: bool = True,
+) -> list[RolloutResult]:
+    """Generate a padded batch and recover one :class:`RolloutResult` per clip.
+
+    The batch must come from :class:`Step1EvaluationCollator`, which retains
+    ``anchor_times`` alongside the tensors produced by the training collator.
+    Batched generation uses exactly the same append-only KV-cache path as
+    generated-history training.
+    """
+
+    required = {
+        "input_ids",
+        "attention_mask",
+        "audio_codes",
+        "target_slots",
+        "motion_local_labels",
+        "names",
+        "anchor_times",
+    }
+    missing = sorted(required.difference(batch))
+    if missing:
+        raise KeyError(f"Evaluation rollout batch is missing: {missing}")
+    names = [str(name) for name in batch["names"]]
+    anchor_times = list(batch["anchor_times"])
+    if len(names) != len(anchor_times):
+        raise ValueError("names and anchor_times must have the same batch length")
+
+    tensor_batch = {
+        key: batch[key].to(device=device, non_blocking=True)
+        for key in (
+            "input_ids",
+            "attention_mask",
+            "audio_codes",
+            "target_slots",
+            "motion_local_labels",
+        )
+    }
+    started = time.perf_counter()
+    rollout = generate_history_batch(
+        model,
+        input_ids=tensor_batch["input_ids"],
+        attention_mask=tensor_batch["attention_mask"],
+        audio_codes=tensor_batch["audio_codes"],
+        target_slots=tensor_batch["target_slots"],
+        use_bf16=use_bf16,
+    )
+    elapsed_per_clip = (time.perf_counter() - started) / max(1, len(names))
+
+    outputs: list[RolloutResult] = []
+    for row, name in enumerate(names):
+        slots = tensor_batch["target_slots"][row].cpu().numpy()
+        groups = _target_groups({"target_slots": slots})
+        labels = tensor_batch["motion_local_labels"][row].cpu().numpy()
+        predicted = rollout.predicted_local_ids[row].cpu().numpy()
+        confidence = rollout.confidence[row].cpu().numpy()
+        entropy = rollout.entropy[row].cpu().numpy()
+        times = tuple(int(value) for value in anchor_times[row])
+        if len(times) != len(groups) + 1:
+            raise ValueError(
+                f"{name}: {len(times)} anchor times do not match "
+                f"{len(groups)} generated anchors plus the seed"
+            )
+        outputs.append(
+            RolloutResult(
+                name=name,
+                anchor_times=times,
+                target_anchors=np.asarray(
+                    [[int(labels[position]) for position in group] for group in groups],
+                    dtype=np.int64,
+                ),
+                predicted_anchors=np.asarray(
+                    [[int(predicted[position]) for position in group] for group in groups],
+                    dtype=np.int64,
+                ),
+                confidence=np.asarray(
+                    [[float(confidence[position]) for position in group] for group in groups],
+                    dtype=np.float64,
+                ),
+                entropy=np.asarray(
+                    [[float(entropy[position]) for position in group] for group in groups],
+                    dtype=np.float64,
+                ),
+                elapsed_seconds=elapsed_per_clip,
+            )
+        )
+    return outputs
 
 
 def evaluate_rollouts(results: Sequence[RolloutResult]) -> dict[str, Any]:

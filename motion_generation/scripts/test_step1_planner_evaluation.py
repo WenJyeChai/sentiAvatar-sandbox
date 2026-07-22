@@ -12,7 +12,11 @@ MOTION_GENERATION_DIR = Path(__file__).resolve().parents[1]
 if str(MOTION_GENERATION_DIR) not in sys.path:
     sys.path.insert(0, str(MOTION_GENERATION_DIR))
 
-from models.step1_mimi_planner import MimiQwenPlanner, MimiQwenPlannerConfig  # noqa: E402
+from models.step1_mimi_planner import (  # noqa: E402
+    MimiQwenPlanner,
+    MimiQwenPlannerConfig,
+    Step1PlannerCollator,
+)
 from utils.adaptive_anchor_tokens import (  # noqa: E402
     BODY_CODEBOOK_SIZE,
     BODY_SLOT_COUNT,
@@ -22,7 +26,9 @@ from utils.step1_planner_evaluation import (  # noqa: E402
     evaluate_reference_baselines,
     evaluate_rollouts,
     fit_unigram_prior,
+    greedy_rollout_batch,
     greedy_rollout_item,
+    Step1EvaluationCollator,
     summarize_slot_metrics,
 )
 
@@ -146,3 +152,67 @@ def test_cached_greedy_rollout_generates_all_slots() -> None:
     assert summary["summary"]["anchors"] == 2
     assert len(summary["slot_rows"]) == BODY_SLOT_COUNT
     assert result.cache_payload()["anchors"][0]["time"] == 4
+
+
+def test_batched_rollout_matches_individual_rollout() -> None:
+    planner = tiny_planner()
+    audio_placeholder = planner.config.audio_placeholder_id
+
+    def make_item(name: str, offset: int, anchors: int) -> dict[str, object]:
+        input_ids = [1, audio_placeholder, 2]
+        audio_codes = [-1, 11 + offset, -1]
+        target_slots = [-1, -1, -1]
+        labels = [-100, -100, -100]
+        times = [0]
+        for anchor_index in range(anchors):
+            local_ids = [
+                (offset + 19 * anchor_index + 7 * slot) % BODY_CODEBOOK_SIZE
+                for slot in range(BODY_SLOT_COUNT)
+            ]
+            input_ids.extend(
+                int(planner.motion_token_ids[slot, local_id])
+                for slot, local_id in enumerate(local_ids)
+            )
+            audio_codes.extend([-1] * BODY_SLOT_COUNT)
+            target_slots.extend(range(BODY_SLOT_COUNT))
+            labels.extend(local_ids)
+            times.append((anchor_index + 1) * 4)
+            if anchor_index + 1 < anchors:
+                input_ids.extend([3, audio_placeholder, 2])
+                audio_codes.extend([-1, 21 + offset + anchor_index, -1])
+                target_slots.extend([-1, -1, -1])
+                labels.extend([-100, -100, -100])
+        return {
+            "name": name,
+            "input_ids": input_ids,
+            "audio_codes": [[value] for value in audio_codes],
+            "target_slots": target_slots,
+            "motion_local_labels": labels,
+            "anchor_times": tuple(times),
+            "generated_prefix_anchors": 0,
+        }
+
+    items = [make_item("clip/a", 3, 1), make_item("clip/b", 17, 2)]
+    collator = Step1EvaluationCollator(
+        Step1PlannerCollator(pad_token_id=0, pad_to_multiple_of=1)
+    )
+    batched = greedy_rollout_batch(
+        planner,
+        collator(items),
+        device=torch.device("cpu"),
+        use_bf16=False,
+    )
+    individual = [
+        greedy_rollout_item(
+            planner,
+            item,
+            device=torch.device("cpu"),
+            use_bf16=False,
+        )
+        for item in items
+    ]
+    assert [result.name for result in batched] == [result.name for result in individual]
+    for batch_result, item_result in zip(batched, individual):
+        assert np.array_equal(batch_result.predicted_anchors, item_result.predicted_anchors)
+        assert np.array_equal(batch_result.target_anchors, item_result.target_anchors)
+        assert np.allclose(batch_result.confidence, item_result.confidence, atol=1e-6)
