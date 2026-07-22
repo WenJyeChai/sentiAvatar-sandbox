@@ -40,6 +40,11 @@ from utils.adaptive_anchor_tokens import (  # noqa: E402
 from utils.step1_expected_distortion import (  # noqa: E402
     normalized_codebook_distance_table,
 )
+from utils.step1_condition_alignment import (  # noqa: E402
+    corrupt_audio_with_causal_past,
+    corrupt_text_condition,
+    counterfactual_likelihood_loss,
+)
 
 
 @pytest.fixture(scope="module")
@@ -145,6 +150,9 @@ def test_dataset_serializes_causal_audio_before_each_anchor(tmp_path: Path, step
     ]
     assert len(first_audio_positions) == 5
     assert item["motion_local_labels"][first_target_position : first_target_position + 16] == tokens[4]
+    assert sum(item["text_mask"]) > 0
+    assert set(value for value in item["audio_anchor_ids"] if value >= 0) == set(range(9))
+    assert item["target_anchor_ids"][first_target_position : first_target_position + 16] == [0] * 16
 
 
 def test_dataset_serializes_synchronous_q0_q3_frames(tmp_path: Path, step1_tokenizer):
@@ -215,6 +223,81 @@ def test_collator_masks_padding_and_preserves_modal_fields(tmp_path: Path, step1
         step1_tokenizer.convert_tokens_to_ids(MIMI_FRAME_TOKEN)
     ))
     assert torch.equal(batch["target_slots"].ge(0), batch["motion_local_labels"].ne(IGNORE_INDEX))
+    assert batch["text_mask"].dtype == torch.bool
+    assert torch.equal(batch["target_slots"].ge(0), batch["target_anchor_ids"].ge(0))
+
+
+def test_condition_corruptions_preserve_targets_history_and_sequence_length(
+    tmp_path: Path, step1_tokenizer
+):
+    examples = []
+    for name, text in (("a/clip", "first transcript"), ("b/clip", "different words here")):
+        motion_dir, audio_dir, _, _ = _write_synthetic_clip(tmp_path, name)
+        dataset = Step1FixedGapDataset(
+            [name],
+            tokenizer=step1_tokenizer,
+            motion_token_dir=motion_dir,
+            mimi_token_dir=audio_dir,
+            text_map={name: text},
+            fixed_gap=3,
+            seed_mode="observed",
+        )
+        examples.append(dataset[0])
+    batch = Step1PlannerCollator(step1_tokenizer.pad_token_id)(examples)
+    text_corruption = corrupt_text_condition(
+        input_ids=batch["input_ids"],
+        audio_codes=batch["audio_codes"],
+        text_mask=batch["text_mask"],
+        target_anchor_ids=batch["target_anchor_ids"],
+        names=batch["names"],
+        selected_indices=[0],
+        seed=42,
+        epoch=1,
+        batch_index=2,
+    )
+    assert text_corruption.selected_indices.tolist() == [0]
+    outside_text = ~batch["text_mask"][0]
+    assert torch.equal(
+        text_corruption.input_ids[0, outside_text], batch["input_ids"][0, outside_text]
+    )
+    assert not torch.equal(
+        text_corruption.input_ids[0, batch["text_mask"][0]],
+        batch["input_ids"][0, batch["text_mask"][0]],
+    )
+    assert torch.equal(text_corruption.audio_codes, batch["audio_codes"])
+    assert int(text_corruption.target_mask[0].sum()) == int(batch["target_slots"][0].ge(0).sum())
+
+    audio_corruption = corrupt_audio_with_causal_past(
+        input_ids=batch["input_ids"],
+        audio_codes=batch["audio_codes"],
+        audio_anchor_ids=batch["audio_anchor_ids"],
+        target_anchor_ids=batch["target_anchor_ids"],
+        selected_indices=[0],
+        shift_anchors=2,
+    )
+    assert audio_corruption.selected_indices.tolist() == [0]
+    assert torch.equal(audio_corruption.input_ids, batch["input_ids"])
+    assert int(audio_corruption.target_mask[0].sum()) == 7 * 16
+    destination = batch["audio_anchor_ids"][0].eq(2)
+    source = batch["audio_anchor_ids"][0].eq(0)
+    assert torch.equal(
+        audio_corruption.audio_codes[0, destination], batch["audio_codes"][0, source]
+    )
+
+
+def test_counterfactual_loss_rewards_higher_wrong_condition_nll():
+    positive = torch.tensor([[1.0, 0.0], [2.0, 0.0]])
+    negative = torch.tensor([[1.8, 0.0], [2.6, 0.0]], requires_grad=True)
+    mask = torch.tensor([[True, False], [True, False]])
+    loss, gap = counterfactual_likelihood_loss(
+        positive_token_loss=positive,
+        negative_token_loss=negative,
+        target_mask=mask,
+        margin_nats=0.05,
+    )
+    assert torch.allclose(gap, torch.tensor([0.8, 0.6]))
+    loss.backward()
+    assert bool((negative.grad[mask] < 0).all())
 
 
 def _tiny_planner() -> MimiQwenPlanner:
@@ -382,6 +465,28 @@ def test_expected_distortion_requires_loaded_codec_geometry():
             motion_local_labels=labels,
             expected_distortion_weight=0.1,
         )
+
+
+def test_returned_per_token_losses_preserve_gradient_and_match_ce():
+    planner = _tiny_planner()
+    input_ids = torch.zeros((1, 4), dtype=torch.long)
+    target_slots = torch.full_like(input_ids, -1)
+    target_slots[0, 2] = 0
+    target_slots[0, 3] = 1
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    labels[0, 2:] = torch.tensor([7, 11])
+    output = planner(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        audio_codes=torch.full_like(input_ids, -1),
+        target_slots=target_slots,
+        motion_local_labels=labels,
+        return_token_losses=True,
+    )
+    assert output.per_token_loss.shape == input_ids.shape
+    assert torch.allclose(output.per_token_loss.sum(), output.ce_loss * output.count)
+    output.per_token_loss[:, 2:].mean().backward()
+    assert planner.language_model.get_output_embeddings().weight.grad is not None
 
 
 def test_audio_code_must_match_placeholder_positions():

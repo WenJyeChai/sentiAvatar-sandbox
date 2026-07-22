@@ -12,7 +12,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 # The tokenizer is constructed in the parent process and then inherited by
 # DataLoader workers. Explicitly disabling its internal thread pool avoids the
@@ -59,6 +59,13 @@ from utils.step1_self_forcing import (  # noqa: E402
 from utils.step1_expected_distortion import (  # noqa: E402
     load_normalized_codebook_distance_table,
 )
+from utils.step1_condition_alignment import (  # noqa: E402
+    ConditionCorruption,
+    corrupt_audio_with_causal_past,
+    corrupt_text_condition,
+    counterfactual_likelihood_loss,
+    deterministic_condition_indices,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,8 +76,16 @@ def parse_args() -> argparse.Namespace:
         default=PROJECT_DIR / "motion_generation" / "configs" / "step1_multipart_fixed_gap3.yaml",
     )
     parser.add_argument("--resume_from_checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--init_from_checkpoint",
+        type=Path,
+        default=None,
+        help="Load planner/tokenizer weights but start a fresh optimizer, schedule, and epoch count.",
+    )
     parser.add_argument("--max_train_clips", type=int, default=None)
     parser.add_argument("--max_eval_clips", type=int, default=None)
+    parser.add_argument("--output_dir", type=Path, default=None)
+    parser.add_argument("--num_train_epochs", type=int, default=None)
     return parser.parse_args()
 
 
@@ -290,6 +305,26 @@ def move_batch(batch: Mapping[str, Any], device: torch.device) -> dict[str, torc
     return {key: batch[key].to(device=device, non_blocking=True) for key in keys}
 
 
+def move_condition_metadata(
+    batch: Mapping[str, Any], device: torch.device
+) -> dict[str, torch.Tensor]:
+    keys = ("text_mask", "audio_anchor_ids", "target_anchor_ids")
+    return {key: batch[key].to(device=device, non_blocking=True) for key in keys}
+
+
+def corrupted_model_inputs(
+    inputs: Mapping[str, torch.Tensor], corruption: ConditionCorruption
+) -> dict[str, torch.Tensor]:
+    indices = corruption.selected_indices
+    result = {
+        key: value.index_select(0, indices)
+        for key, value in inputs.items()
+    }
+    result["input_ids"] = corruption.input_ids.index_select(0, indices)
+    result["audio_codes"] = corruption.audio_codes.index_select(0, indices)
+    return result
+
+
 def reduce_sums(values: torch.Tensor, distributed: bool) -> torch.Tensor:
     values = values.detach()
     if distributed:
@@ -305,34 +340,94 @@ def evaluate(
     device: torch.device,
     distributed: bool,
     use_bf16: bool,
+    condition_alignment: Optional[Mapping[str, Any]] = None,
+    alignment_seed: int = 42,
 ) -> dict[str, Any]:
     model.eval()
-    totals = torch.zeros(3 + 2 * len(BODY_SLOTS), dtype=torch.float64, device=device)
+    base_count = 3 + 2 * len(BODY_SLOTS)
+    # Base metrics followed by audio gap/count and text gap/count.
+    totals = torch.zeros(base_count + 4, dtype=torch.float64, device=device)
     autocast_enabled = use_bf16 and device.type == "cuda"
-    for batch in loader:
+    alignment_enabled = bool(
+        condition_alignment is not None and condition_alignment.get("evaluate", False)
+    )
+    for batch_index, batch in enumerate(loader):
         inputs = move_batch(batch, device)
+        metadata = move_condition_metadata(batch, device) if alignment_enabled else None
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
-            output = model(**inputs)
+            output = model(**inputs, return_token_losses=alignment_enabled)
         count = output.count.to(torch.float64)
         totals[0] += output.loss.detach().to(torch.float64) * count
         totals[1] += output.correct.to(torch.float64)
         totals[2] += count
         totals[3 : 3 + len(BODY_SLOTS)] += output.per_slot_correct.to(torch.float64)
-        totals[3 + len(BODY_SLOTS) :] += output.per_slot_count.to(torch.float64)
+        totals[3 + len(BODY_SLOTS) : base_count] += output.per_slot_count.to(torch.float64)
+        if alignment_enabled:
+            assert condition_alignment is not None and metadata is not None
+            selected_indices = deterministic_condition_indices(
+                batch["names"],
+                float(condition_alignment["eval_fraction"]),
+                seed=alignment_seed,
+                epoch=0,
+                batch_index=batch_index,
+            )
+            for modality in condition_alignment["eval_modalities"]:
+                corruption = build_condition_corruption(
+                    modality,
+                    inputs=inputs,
+                    metadata=metadata,
+                    names=batch["names"],
+                    selected_indices=selected_indices,
+                    alignment=condition_alignment,
+                    seed=alignment_seed,
+                    epoch=0,
+                    batch_index=batch_index,
+                )
+                if not corruption.selected_indices.numel():
+                    continue
+                negative_inputs = corrupted_model_inputs(inputs, corruption)
+                selected_mask = corruption.target_mask.index_select(
+                    0, corruption.selected_indices
+                )
+                positive_loss = output.per_token_loss.index_select(
+                    0, corruption.selected_indices
+                )
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=autocast_enabled,
+                ):
+                    negative_output = model(
+                        **negative_inputs, return_token_losses=True
+                    )
+                    _, gap = counterfactual_likelihood_loss(
+                        positive_token_loss=positive_loss,
+                        negative_token_loss=negative_output.per_token_loss,
+                        target_mask=selected_mask,
+                        margin_nats=float(condition_alignment["margin_nats"]),
+                    )
+                offset = base_count + (0 if modality == "audio" else 2)
+                totals[offset] += gap.to(torch.float64).sum()
+                totals[offset + 1] += gap.numel()
     totals = reduce_sums(totals, distributed)
     model.train()
     denominator = max(1.0, float(totals[2]))
     slot_correct = totals[3 : 3 + len(BODY_SLOTS)]
-    slot_count = totals[3 + len(BODY_SLOTS) :]
+    slot_count = totals[3 + len(BODY_SLOTS) : base_count]
     per_slot = {}
     for slot, spec in enumerate(BODY_SLOTS):
         per_slot[f"{spec.part}_q{spec.quantizer}"] = (
             float(slot_correct[slot]) / max(1.0, float(slot_count[slot]))
         )
+    condition_gaps = {}
+    for modality, offset in (("audio", base_count), ("text", base_count + 2)):
+        if float(totals[offset + 1]) > 0:
+            condition_gaps[modality] = float(totals[offset]) / float(totals[offset + 1])
     return {
         "loss": float(totals[0]) / denominator,
         "slot_accuracy": float(totals[1]) / denominator,
         "per_slot_accuracy": per_slot,
+        "condition_gap_nats_per_token": condition_gaps,
     }
 
 
@@ -528,6 +623,96 @@ def validate_auxiliary_loss_config(config: Mapping[str, Any]) -> dict[str, Any]:
     return auxiliary
 
 
+def validate_condition_alignment_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    alignment = section(config, "condition_alignment")
+    alignment.setdefault("enabled", False)
+    alignment.setdefault("evaluate", alignment["enabled"])
+    alignment.setdefault("modalities", [])
+    alignment.setdefault("eval_modalities", alignment["modalities"])
+    alignment.setdefault("sub_batch_fraction", 0.25)
+    alignment.setdefault("eval_fraction", 0.25)
+    alignment.setdefault("weight", 0.03)
+    alignment.setdefault("margin_nats", 0.05)
+    alignment.setdefault("warmup_start_epoch", 5.0)
+    alignment.setdefault("ramp_epochs", 3.0)
+    alignment.setdefault("audio_past_shift_anchors", 2)
+    alignment["enabled"] = bool(alignment["enabled"])
+    alignment["evaluate"] = bool(alignment["evaluate"])
+    modalities = [str(value) for value in alignment["modalities"]]
+    eval_modalities = [str(value) for value in alignment["eval_modalities"]]
+    for key, values in (("modalities", modalities), ("eval_modalities", eval_modalities)):
+        unknown = sorted(set(values) - {"audio", "text"})
+        if unknown or len(values) != len(set(values)):
+            raise ValueError(f"Invalid or duplicate condition_alignment {key}: {values}")
+    if alignment["enabled"] and not modalities:
+        raise ValueError("Enabled condition alignment requires training modalities")
+    if alignment["evaluate"] and not eval_modalities:
+        raise ValueError("Condition alignment evaluation requires eval_modalities")
+    alignment["modalities"] = modalities
+    alignment["eval_modalities"] = eval_modalities
+    for key in ("sub_batch_fraction", "eval_fraction"):
+        alignment[key] = float(alignment[key])
+        if not 0 < alignment[key] <= 1:
+            raise ValueError(f"condition_alignment.{key} must be in (0, 1]")
+    for key in ("weight", "margin_nats", "warmup_start_epoch", "ramp_epochs"):
+        alignment[key] = float(alignment[key])
+        if alignment[key] < 0:
+            raise ValueError(f"condition_alignment.{key} must be non-negative")
+    if alignment["enabled"] and alignment["weight"] <= 0:
+        raise ValueError("Enabled condition_alignment requires a positive weight")
+    alignment["audio_past_shift_anchors"] = int(alignment["audio_past_shift_anchors"])
+    if alignment["audio_past_shift_anchors"] <= 0:
+        raise ValueError("condition_alignment.audio_past_shift_anchors must be positive")
+    return alignment
+
+
+def condition_alignment_weight(epoch_progress: float, config: Mapping[str, Any]) -> float:
+    if not bool(config["enabled"]):
+        return 0.0
+    start = float(config["warmup_start_epoch"])
+    if epoch_progress <= start:
+        return 0.0
+    ramp = float(config["ramp_epochs"])
+    progress = 1.0 if ramp <= 0 else min(1.0, (epoch_progress - start) / ramp)
+    return float(config["weight"]) * max(0.0, progress)
+
+
+def build_condition_corruption(
+    modality: str,
+    *,
+    inputs: Mapping[str, torch.Tensor],
+    metadata: Mapping[str, torch.Tensor],
+    names: Sequence[str],
+    selected_indices: Sequence[int],
+    alignment: Mapping[str, Any],
+    seed: int,
+    epoch: int,
+    batch_index: int,
+) -> ConditionCorruption:
+    if modality == "audio":
+        return corrupt_audio_with_causal_past(
+            input_ids=inputs["input_ids"],
+            audio_codes=inputs["audio_codes"],
+            audio_anchor_ids=metadata["audio_anchor_ids"],
+            target_anchor_ids=metadata["target_anchor_ids"],
+            selected_indices=selected_indices,
+            shift_anchors=int(alignment["audio_past_shift_anchors"]),
+        )
+    if modality == "text":
+        return corrupt_text_condition(
+            input_ids=inputs["input_ids"],
+            audio_codes=inputs["audio_codes"],
+            text_mask=metadata["text_mask"],
+            target_anchor_ids=metadata["target_anchor_ids"],
+            names=names,
+            selected_indices=selected_indices,
+            seed=seed,
+            epoch=epoch,
+            batch_index=batch_index,
+        )
+    raise ValueError(f"Unsupported condition modality: {modality}")
+
+
 def auxiliary_weight_at_epoch(
     epoch_progress: float, *, maximum: float, warmup_epochs: float
 ) -> float:
@@ -593,15 +778,24 @@ def run_rank0_rollout_evaluation(
 
 def main() -> None:
     args = parse_args()
+    if args.resume_from_checkpoint is not None and args.init_from_checkpoint is not None:
+        raise ValueError("Choose either --resume_from_checkpoint or --init_from_checkpoint")
     config = load_config(args.config.resolve())
     paths = resolve_data_paths(config)
+    if args.output_dir is not None:
+        paths["output_dir"] = args.output_dir.resolve()
     distributed, rank, local_rank, world_size, device = setup_distributed()
     training = section(config, "training")
+    if args.num_train_epochs is not None:
+        if args.num_train_epochs <= 0:
+            raise ValueError("--num_train_epochs must be positive")
+        training["num_train_epochs"] = int(args.num_train_epochs)
     data_config = section(config, "data")
     mimi_codebooks_used = mimi_codebooks_from_config(config)
     data_config["mimi_codebooks_used"] = mimi_codebooks_used
     generated_history = validate_generated_history_config(config)
     auxiliary_loss = validate_auxiliary_loss_config(config)
+    condition_alignment = validate_condition_alignment_config(config)
     if bool(generated_history["enabled"]) and (
         data_config.get("generated_anchor_dir")
         or float(data_config.get("generated_prefix_probability", 0.0)) > 0
@@ -612,7 +806,11 @@ def main() -> None:
     seed = int(training.get("seed", 42))
     seed_everything(seed, rank)
     resume = args.resume_from_checkpoint.resolve() if args.resume_from_checkpoint else None
-    validate_paths(paths, resume)
+    init_checkpoint = (
+        args.init_from_checkpoint.resolve() if args.init_from_checkpoint else None
+    )
+    model_checkpoint = resume or init_checkpoint
+    validate_paths(paths, model_checkpoint)
 
     use_bf16 = bool(training.get("bf16", True))
     if use_bf16 and device.type == "cuda" and not torch.cuda.is_bf16_supported():
@@ -622,7 +820,7 @@ def main() -> None:
         print(f"Loading tokenizer/model on rank {rank}, device={device}, dtype={dtype}")
     model, tokenizer, added_tokens = build_model_and_tokenizer(
         base_model=paths["base_model"],
-        resume=resume,
+        resume=model_checkpoint,
         dtype=dtype,
         mimi_codebooks_used=mimi_codebooks_used,
     )
@@ -768,7 +966,7 @@ def main() -> None:
         total = sum(parameter.numel() for parameter in model.parameters())
         print("=" * 76)
         print("Phase 1 fixed-gap multipart planner")
-        print(f"Base/resume:       {resume or paths['base_model']}")
+        print(f"Base/init/resume:  {model_checkpoint or paths['base_model']}")
         print(f"Output:            {paths['output_dir']}")
         print(f"Motion tokens:     {paths['motion_token_dir']}")
         print(f"Mimi tokens:       {paths['mimi_token_dir']}")
@@ -790,6 +988,16 @@ def main() -> None:
             f"type={auxiliary_loss['type']}, weight={auxiliary_loss['weight']}, "
             f"warmup={auxiliary_loss['warmup_epochs']} epochs, "
             f"apply_to={auxiliary_loss['apply_to']}"
+        )
+        print(
+            "Condition loss:    "
+            f"enabled={condition_alignment['enabled']}, "
+            f"evaluate={condition_alignment['evaluate']}, "
+            f"modalities={condition_alignment['modalities']}, "
+            f"eval_modalities={condition_alignment['eval_modalities']}, "
+            f"weight={condition_alignment['weight']}, "
+            f"warmup={condition_alignment['warmup_start_epoch']}+"
+            f"{condition_alignment['ramp_epochs']} epochs"
         )
         print("=" * 76)
 
@@ -813,6 +1021,9 @@ def main() -> None:
     # clean loss/correct/count, generated loss/correct/count, eight detached
     # rollout statistics, then CE sum, expected-distortion sum/count.
     running = torch.zeros(base_metric_count + 17, dtype=torch.float64, device=device)
+    # Counterfactual loss sum, correct-minus-corrupt log-likelihood gap sum,
+    # example count, audio examples, text examples.
+    alignment_running = torch.zeros(5, dtype=torch.float64, device=device)
     run_start = time.perf_counter()
 
     completed_epochs = start_epoch
@@ -835,6 +1046,7 @@ def main() -> None:
                 else contextlib.nullcontext()
             )
             inputs = move_batch(batch, device)
+            condition_metadata = move_condition_metadata(batch, device)
             validate_generated_labels(inputs)
             epoch_progress = epoch + batch_index / max(1, len(train_loader))
             current_auxiliary_weight = auxiliary_weight_at_epoch(
@@ -842,6 +1054,15 @@ def main() -> None:
                 maximum=float(auxiliary_loss["weight"]),
                 warmup_epochs=float(auxiliary_loss["warmup_epochs"]),
             )
+            current_condition_weight = condition_alignment_weight(
+                epoch_progress, condition_alignment
+            )
+            condition_modality = None
+            if current_condition_weight > 0:
+                modalities = condition_alignment["modalities"]
+                condition_modality = modalities[
+                    (epoch * len(train_loader) + batch_index) % len(modalities)
+                ]
             generated_probability = (
                 generated_history_probability(
                     epoch_progress,
@@ -892,9 +1113,68 @@ def main() -> None:
                         **inputs,
                         expected_distortion_weight=current_auxiliary_weight,
                         expected_distortion_example_mask=auxiliary_example_mask,
+                        return_token_losses=current_condition_weight > 0,
                     )
                     scaled_loss = output.loss / group_size
                 scaled_loss.backward()
+            counterfactual_loss = None
+            condition_gap = None
+            condition_examples = 0
+            if condition_modality is not None:
+                selected_indices = deterministic_condition_indices(
+                    batch["names"],
+                    float(condition_alignment["sub_batch_fraction"]),
+                    seed=seed,
+                    epoch=epoch,
+                    batch_index=batch_index,
+                )
+                corruption = build_condition_corruption(
+                    condition_modality,
+                    inputs=inputs,
+                    metadata=condition_metadata,
+                    names=batch["names"],
+                    selected_indices=selected_indices,
+                    alignment=condition_alignment,
+                    seed=seed,
+                    epoch=epoch,
+                    batch_index=batch_index,
+                )
+                if corruption.selected_indices.numel():
+                    negative_inputs = corrupted_model_inputs(inputs, corruption)
+                    selected_target_mask = corruption.target_mask.index_select(
+                        0, corruption.selected_indices
+                    )
+                    positive_token_loss = output.per_token_loss.index_select(
+                        0, corruption.selected_indices
+                    ).detach()
+                    negative_sync_context = (
+                        model.no_sync()
+                        if isinstance(model, DistributedDataParallel) and not should_step
+                        else contextlib.nullcontext()
+                    )
+                    with negative_sync_context:
+                        with torch.autocast(
+                            device_type=device.type,
+                            dtype=torch.bfloat16,
+                            enabled=autocast_enabled,
+                        ):
+                            negative_output = model(
+                                **negative_inputs,
+                                return_token_losses=True,
+                            )
+                            counterfactual_loss, condition_gap = (
+                                counterfactual_likelihood_loss(
+                                    positive_token_loss=positive_token_loss,
+                                    negative_token_loss=negative_output.per_token_loss,
+                                    target_mask=selected_target_mask,
+                                    margin_nats=float(condition_alignment["margin_nats"]),
+                                )
+                            )
+                            scaled_counterfactual = (
+                                current_condition_weight * counterfactual_loss / group_size
+                            )
+                        scaled_counterfactual.backward()
+                    condition_examples = int(corruption.selected_indices.numel())
             count = output.count.detach().to(torch.float64)
             running[0] += output.loss.detach().to(torch.float64) * count
             running[1] += output.correct.detach().to(torch.float64)
@@ -932,6 +1212,15 @@ def main() -> None:
                 output.expected_distortion_loss.detach().to(torch.float64) * auxiliary_count
             )
             running[split_offset + 16] += auxiliary_count
+            if counterfactual_loss is not None and condition_gap is not None:
+                alignment_running[0] += (
+                    counterfactual_loss.detach().to(torch.float64) * condition_examples
+                )
+                alignment_running[1] += condition_gap.to(torch.float64).sum()
+                alignment_running[2] += condition_examples
+                alignment_running[3 if condition_modality == "audio" else 4] += (
+                    condition_examples
+                )
 
             if not should_step:
                 continue
@@ -943,6 +1232,7 @@ def main() -> None:
 
             if global_step % log_steps == 0:
                 totals = reduce_sums(running.clone(), distributed)
+                alignment_totals = reduce_sums(alignment_running.clone(), distributed)
                 denominator = max(1.0, float(totals[2]))
                 if is_main(rank):
                     split_offset = base_metric_count
@@ -951,6 +1241,7 @@ def main() -> None:
                     rollout_tokens = max(1.0, float(totals[split_offset + 8]))
                     rollout_q0_tokens = max(1.0, float(totals[split_offset + 11]))
                     expected_distortion_count = max(1.0, float(totals[split_offset + 16]))
+                    alignment_count = max(1.0, float(alignment_totals[2]))
                     train_metrics = {
                         "train/loss": float(totals[0]) / denominator,
                         "train/cross_entropy": float(totals[split_offset + 14]) / denominator,
@@ -961,7 +1252,24 @@ def main() -> None:
                         "curriculum/generated_clips": float(totals[split_offset + 6]),
                         "curriculum/generated_anchors": float(totals[split_offset + 7]),
                         "auxiliary/weight": current_auxiliary_weight,
+                        "condition/weight": current_condition_weight,
                     }
+                    if float(alignment_totals[2]) > 0:
+                        train_metrics.update(
+                            {
+                                "condition/counterfactual_loss": float(alignment_totals[0])
+                                / alignment_count,
+                                "condition/gap_nats_per_token": float(alignment_totals[1])
+                                / alignment_count,
+                                "condition/audio_examples": float(alignment_totals[3]),
+                                "condition/text_examples": float(alignment_totals[4]),
+                            }
+                        )
+                        train_metrics["train/objective"] = (
+                            train_metrics["train/loss"]
+                            + current_condition_weight
+                            * train_metrics["condition/counterfactual_loss"]
+                        )
                     if float(totals[split_offset + 16]) > 0:
                         train_metrics["auxiliary/expected_distortion"] = (
                             float(totals[split_offset + 15]) / expected_distortion_count
@@ -995,6 +1303,7 @@ def main() -> None:
                     if wandb_run is not None:
                         wandb_run.log(train_metrics, step=global_step)
                 running.zero_()
+                alignment_running.zero_()
 
             if eval_steps > 0 and global_step % eval_steps == 0:
                 eval_metrics = evaluate(
@@ -1003,6 +1312,8 @@ def main() -> None:
                     device=device,
                     distributed=distributed,
                     use_bf16=use_bf16,
+                    condition_alignment=condition_alignment,
+                    alignment_seed=seed,
                 )
                 if is_main(rank):
                     print(
@@ -1010,6 +1321,14 @@ def main() -> None:
                         f"slot_acc={eval_metrics['slot_accuracy']:.4%}"
                     )
                     print("[eval slots]", json.dumps(eval_metrics["per_slot_accuracy"], sort_keys=True))
+                    if eval_metrics["condition_gap_nats_per_token"]:
+                        print(
+                            "[eval condition gaps]",
+                            json.dumps(
+                                eval_metrics["condition_gap_nats_per_token"],
+                                sort_keys=True,
+                            ),
+                        )
                     if wandb_run is not None:
                         wandb_payload = {
                             "eval/loss": eval_metrics["loss"],
@@ -1019,6 +1338,14 @@ def main() -> None:
                             {
                                 f"eval_slot/{name}": value
                                 for name, value in eval_metrics["per_slot_accuracy"].items()
+                            }
+                        )
+                        wandb_payload.update(
+                            {
+                                f"eval_condition/{name}_gap_nats_per_token": value
+                                for name, value in eval_metrics[
+                                    "condition_gap_nats_per_token"
+                                ].items()
                             }
                         )
                         wandb_run.log(wandb_payload, step=global_step)
@@ -1049,6 +1376,8 @@ def main() -> None:
             device=device,
             distributed=distributed,
             use_bf16=use_bf16,
+            condition_alignment=condition_alignment,
+            alignment_seed=seed,
         )
         if is_main(rank):
             print(
@@ -1056,6 +1385,13 @@ def main() -> None:
                 f"slot_acc={eval_metrics['slot_accuracy']:.4%}"
             )
             print("[epoch eval slots]", json.dumps(eval_metrics["per_slot_accuracy"], sort_keys=True))
+            if eval_metrics["condition_gap_nats_per_token"]:
+                print(
+                    "[epoch eval condition gaps]",
+                    json.dumps(
+                        eval_metrics["condition_gap_nats_per_token"], sort_keys=True
+                    ),
+                )
             if wandb_run is not None:
                 wandb_payload = {
                     "eval/loss": eval_metrics["loss"],
@@ -1066,6 +1402,14 @@ def main() -> None:
                     {
                         f"eval_slot/{name}": value
                         for name, value in eval_metrics["per_slot_accuracy"].items()
+                    }
+                )
+                wandb_payload.update(
+                    {
+                        f"eval_condition/{name}_gap_nats_per_token": value
+                        for name, value in eval_metrics[
+                            "condition_gap_nats_per_token"
+                        ].items()
                     }
                 )
                 wandb_run.log(wandb_payload, step=global_step)

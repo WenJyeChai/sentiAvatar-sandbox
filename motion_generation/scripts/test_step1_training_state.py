@@ -6,8 +6,10 @@ import torch
 
 from train_step1_multipart_fixed_gap3 import (
     auxiliary_weight_at_epoch,
+    condition_alignment_weight,
     load_training_state,
     validate_auxiliary_loss_config,
+    validate_condition_alignment_config,
 )
 
 
@@ -80,3 +82,36 @@ def test_auxiliary_control_defaults_to_disabled() -> None:
     config = validate_auxiliary_loss_config({})
     assert config["type"] == "none"
     assert config["weight"] == 0.0
+
+
+def test_condition_alignment_control_can_evaluate_without_training_loss() -> None:
+    config = validate_condition_alignment_config(
+        {
+            "condition_alignment": {
+                "enabled": False,
+                "evaluate": True,
+                "modalities": [],
+                "eval_modalities": ["audio", "text"],
+            }
+        }
+    )
+    assert config["enabled"] is False
+    assert config["eval_modalities"] == ["audio", "text"]
+    assert condition_alignment_weight(20.0, config) == 0.0
+
+
+def test_condition_alignment_weight_has_ce_warmup_and_linear_ramp() -> None:
+    config = validate_condition_alignment_config(
+        {
+            "condition_alignment": {
+                "enabled": True,
+                "modalities": ["audio"],
+                "weight": 0.03,
+                "warmup_start_epoch": 5,
+                "ramp_epochs": 3,
+            }
+        }
+    )
+    assert condition_alignment_weight(5.0, config) == 0.0
+    assert math.isclose(condition_alignment_weight(6.5, config), 0.015)
+    assert condition_alignment_weight(8.0, config) == 0.03

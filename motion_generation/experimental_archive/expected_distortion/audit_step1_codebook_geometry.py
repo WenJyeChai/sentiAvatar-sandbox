@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Archived diagnostic; not part of the active condition-alignment experiment.
 """Audit whether RVQ embedding distance predicts decoded motion damage.
 
 The expected-distortion loss is justified only if its frozen codebook metric
@@ -19,7 +20,7 @@ import torch
 from scipy.stats import spearmanr
 
 
-PROJECT_DIR = Path(__file__).resolve().parents[2]
+PROJECT_DIR = Path(__file__).resolve().parents[3]
 MODULE_DIR = PROJECT_DIR / "motion_generation"
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))

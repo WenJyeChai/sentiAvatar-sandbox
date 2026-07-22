@@ -1,4 +1,7 @@
-# Step 1: 6K CE + Codec Expected-Distortion Experiment
+# Archived Step 1: 6K CE + Codec Expected-Distortion Experiment
+
+This experiment is intentionally inactive while the loss-only condition-alignment
+suite is evaluated. Its implementation is retained for reproducibility.
 
 ## Objective
 
@@ -17,8 +20,8 @@ The arms differ only in `auxiliary_loss` and their output/monitoring names:
 
 | Arm | Config | Training objective |
 |---|---|---|
-| Control | `configs/step1_multipart_gap3_6k_scratch_ce.yaml` | CE |
-| Treatment | `configs/step1_multipart_gap3_6k_scratch_expected_distortion.yaml` | CE + expected distortion |
+| Control | `experimental_archive/expected_distortion/step1_multipart_gap3_6k_scratch_ce_control.yaml` | CE |
+| Treatment | `experimental_archive/expected_distortion/step1_multipart_gap3_6k_scratch_expected_distortion.yaml` | CE + expected distortion |
 
 Both use:
 
@@ -61,7 +64,7 @@ and correlates embedding distance with decoded feature/geodesic damage.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python \
-  motion_generation/scripts/audit_step1_codebook_geometry.py \
+  motion_generation/experimental_archive/expected_distortion/audit_step1_codebook_geometry.py \
   --device cuda:0 \
   --samples_per_slot 32 \
   --alternatives_per_sample 8 \
@@ -77,11 +80,11 @@ do not hide a failing RVQ level behind the aggregate median.
 
 ```bash
 python motion_generation/scripts/validate_step1_fixed_gap_data.py \
-  --config motion_generation/configs/step1_multipart_gap3_6k_scratch_ce.yaml \
+  --config motion_generation/experimental_archive/expected_distortion/step1_multipart_gap3_6k_scratch_ce_control.yaml \
   --output_json checkpoints/step1_multipart_gap3_6k_scratch_ce/data_preflight.json
 
 python motion_generation/scripts/validate_step1_fixed_gap_data.py \
-  --config motion_generation/configs/step1_multipart_gap3_6k_scratch_expected_distortion.yaml \
+  --config motion_generation/experimental_archive/expected_distortion/step1_multipart_gap3_6k_scratch_expected_distortion.yaml \
   --output_json checkpoints/step1_multipart_gap3_6k_scratch_expected_distortion/data_preflight.json
 ```
 
@@ -99,7 +102,7 @@ Control:
 CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
 torchrun --nproc_per_node=4 --master_port=29514 \
   motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
-  --config motion_generation/configs/step1_multipart_gap3_6k_scratch_ce.yaml
+  --config motion_generation/experimental_archive/expected_distortion/step1_multipart_gap3_6k_scratch_ce_control.yaml
 ```
 
 Treatment:
@@ -108,7 +111,7 @@ Treatment:
 CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
 torchrun --nproc_per_node=4 --master_port=29515 \
   motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
-  --config motion_generation/configs/step1_multipart_gap3_6k_scratch_expected_distortion.yaml
+  --config motion_generation/experimental_archive/expected_distortion/step1_multipart_gap3_6k_scratch_expected_distortion.yaml
 ```
 
 The treatment logs `train/cross_entropy`,
@@ -152,4 +155,3 @@ decision metric for this experiment.
 - **Treatment improves full rollout and decoded/FID metrics:** proceed to a
   small lambda ablation around the observed gradient scale before changing
   Step 2.
-

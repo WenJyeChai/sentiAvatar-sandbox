@@ -1,0 +1,77 @@
+paths:
+  base_model: checkpoints/llm
+  output_dir: checkpoints/step1_gap3_6k_pretrain_p1_audio_cf
+  data_dir: SuSuInterActs/SuSuInterActs
+  motion_token_dir: SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4
+  mimi_token_dir: SuSuInterActs/SuSuInterActs/audio_tokens_mimi_12p5hz_8cb
+  text_json: SuSuInterActs/SuSuInterActs/text_data/motion2text.json
+  train_split: motion_generation/data_splits/step1_balanced_seed42/train_step1_main_6000.txt
+  eval_split: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+
+data:
+  fixed_gap: 3
+  max_length: 2560
+  mimi_codebooks_used: [0, 1, 2, 3]
+  num_workers: 4
+  persistent_workers: false
+  require_causal_motion: true
+  max_duration_mismatch_seconds: 0.12
+  seed_mode: mixed_known
+  neutral_seed_json: null
+  neutral_seed_probability: 0.5
+  previous_seed_probability: 0.5
+  generated_anchor_dir: null
+  generated_prefix_probability: 0.0
+
+audio:
+  mimi_codebooks_used: [0, 1, 2, 3]
+  fusion: concat_linear
+  sparse_audio_embedding: true
+
+generated_history:
+  enabled: false
+
+auxiliary_loss:
+  type: none
+
+condition_alignment:
+  enabled: true
+  evaluate: true
+  modalities: [audio]
+  eval_modalities: [audio, text]
+  sub_batch_fraction: 0.25
+  eval_fraction: 0.25
+  weight: 0.03
+  margin_nats: 0.05
+  warmup_start_epoch: 5
+  ramp_epochs: 3
+  audio_past_shift_anchors: 2
+
+training:
+  seed: 42
+  num_train_epochs: 50
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  adam_betas: [0.9, 0.95]
+  adam_epsilon: 1.0e-8
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 10
+  eval_steps: 0
+  save_steps: 235
+  save_best: true
+  early_stopping_patience: 0
+
+monitoring:
+  report_to: wandb
+  wandb_project: sentiavatar-step1-planner
+  wandb_run_name: step1_6k_pretrain_p1_audio_cf
+  wandb_tags: [phase1, pretrain, teacher-forced, main6k, q0q3, p1, audio-cf]
+  wandb_mode: online
+  wandb_entity: null
+

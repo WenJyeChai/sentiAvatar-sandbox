@@ -135,6 +135,9 @@ class Step1Sequence:
     audio_codes: list[list[int]]
     target_slots: list[int]
     motion_local_labels: list[int]
+    text_mask: list[int]
+    audio_anchor_ids: list[int]
+    target_anchor_ids: list[int]
     anchor_times: tuple[int, ...]
     audio_boundaries: tuple[int, ...]
     generated_prefix_anchors: int
@@ -283,6 +286,9 @@ class Step1FixedGapDataset(Dataset):
             "audio_codes": sequence.audio_codes,
             "target_slots": sequence.target_slots,
             "motion_local_labels": sequence.motion_local_labels,
+            "text_mask": sequence.text_mask,
+            "audio_anchor_ids": sequence.audio_anchor_ids,
+            "target_anchor_ids": sequence.target_anchor_ids,
             "anchor_times": sequence.anchor_times,
             "audio_boundaries": sequence.audio_boundaries,
             "generated_prefix_anchors": sequence.generated_prefix_anchors,
@@ -319,18 +325,40 @@ class Step1FixedGapDataset(Dataset):
 
         prompt = f"Human: {STEP1_ROLE_TOKEN}{self.text_map[name]}<|im_end|>\nAssistant:"
         input_ids = [int(value) for value in self.tokenizer.encode(prompt, add_special_tokens=False)]
+        role_id = self._single_token_ids[STEP1_ROLE_TOKEN]
+        im_end_ids = self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
+        if len(im_end_ids) != 1:
+            raise ValueError("<|im_end|> must be a single token")
+        try:
+            role_position = input_ids.index(role_id)
+            text_end = input_ids.index(int(im_end_ids[0]), role_position + 1)
+        except ValueError as error:
+            raise ValueError("Could not locate the transcript span in the Step 1 prompt") from error
+        text_mask = [
+            int(role_position < position < text_end)
+            for position in range(len(input_ids))
+        ]
         empty_audio = [-1] * len(self.mimi_codebooks_used)
         audio_codes = [empty_audio.copy() for _ in input_ids]
         target_slots = [-1] * len(input_ids)
         motion_local_labels = [IGNORE_INDEX] * len(input_ids)
+        audio_anchor_ids = [-1] * len(input_ids)
+        target_anchor_ids = [-1] * len(input_ids)
 
         def append_control(token: str) -> None:
             input_ids.append(self._single_token_ids[token])
             audio_codes.append(empty_audio.copy())
             target_slots.append(-1)
             motion_local_labels.append(IGNORE_INDEX)
+            text_mask.append(0)
+            audio_anchor_ids.append(-1)
+            target_anchor_ids.append(-1)
 
-        def append_anchor(input_anchor: Sequence[int], target_anchor: Optional[Sequence[int]]) -> None:
+        def append_anchor(
+            input_anchor: Sequence[int],
+            target_anchor: Optional[Sequence[int]],
+            anchor_group: int = -1,
+        ) -> None:
             validate_anchor(input_anchor)
             if target_anchor is not None:
                 validate_anchor(target_anchor)
@@ -341,12 +369,16 @@ class Step1FixedGapDataset(Dataset):
                     raise ValueError(f"Tokenizer is missing body token for slot {slot}, id {input_local_id}")
                 input_ids.append(int(token_id))
                 audio_codes.append(empty_audio.copy())
+                text_mask.append(0)
+                audio_anchor_ids.append(-1)
                 if target_anchor is None:
                     target_slots.append(-1)
                     motion_local_labels.append(IGNORE_INDEX)
+                    target_anchor_ids.append(-1)
                 else:
                     target_slots.append(slot)
                     motion_local_labels.append(int(target_anchor[slot]))
+                    target_anchor_ids.append(int(anchor_group))
 
         append_control(MOTION_START_TOKEN)
         selected_seed_mode, seed_anchor = self._select_seed(name, motion_tokens[0])
@@ -364,6 +396,7 @@ class Step1FixedGapDataset(Dataset):
             for frame_codes in mimi_codes[:, audio_cursor:next_audio_boundary].T:
                 append_control(MIMI_FRAME_TOKEN)
                 audio_codes[-1] = [int(code) for code in frame_codes]
+                audio_anchor_ids[-1] = anchor_index - 1
             audio_cursor = next_audio_boundary
 
             gt_anchor = tuple(int(v) for v in motion_tokens[target_time])
@@ -377,7 +410,11 @@ class Step1FixedGapDataset(Dataset):
             ):
                 input_anchor = generated[target_time]
                 generated_prefix_anchors += 1
-            append_anchor(input_anchor, target_anchor=gt_anchor)
+            append_anchor(
+                input_anchor,
+                target_anchor=gt_anchor,
+                anchor_group=anchor_index - 1,
+            )
 
         if audio_cursor != mimi_codes.shape[1]:
             raise AssertionError(
@@ -386,15 +423,23 @@ class Step1FixedGapDataset(Dataset):
             )
         append_control(AUDIO_END_TOKEN)
         append_control(MOTION_END_TOKEN)
-        im_end_ids = self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
-        if len(im_end_ids) != 1:
-            raise ValueError("<|im_end|> must be a single token")
         input_ids.append(int(im_end_ids[0]))
         audio_codes.append(empty_audio.copy())
         target_slots.append(-1)
         motion_local_labels.append(IGNORE_INDEX)
+        text_mask.append(0)
+        audio_anchor_ids.append(-1)
+        target_anchor_ids.append(-1)
 
-        lengths = {len(input_ids), len(audio_codes), len(target_slots), len(motion_local_labels)}
+        lengths = {
+            len(input_ids),
+            len(audio_codes),
+            len(target_slots),
+            len(motion_local_labels),
+            len(text_mask),
+            len(audio_anchor_ids),
+            len(target_anchor_ids),
+        }
         if len(lengths) != 1:
             raise AssertionError(f"Serialized field lengths differ for {name}: {lengths}")
         if len(input_ids) > self.max_length:
@@ -412,6 +457,9 @@ class Step1FixedGapDataset(Dataset):
             audio_codes=audio_codes,
             target_slots=target_slots,
             motion_local_labels=motion_local_labels,
+            text_mask=text_mask,
+            audio_anchor_ids=audio_anchor_ids,
+            target_anchor_ids=target_anchor_ids,
             anchor_times=anchor_times,
             audio_boundaries=audio_boundaries,
             generated_prefix_anchors=generated_prefix_anchors,
@@ -437,6 +485,13 @@ class Step1PlannerCollator:
                 rows.append(values + [fill] * (longest - len(values)))
             return torch.tensor(rows, dtype=torch.long)
 
+        def padded_optional(key: str, fill: int) -> torch.Tensor:
+            rows = []
+            for example in examples:
+                values = list(example.get(key, [fill] * len(example["input_ids"])))
+                rows.append(values + [fill] * (longest - len(values)))
+            return torch.tensor(rows, dtype=torch.long)
+
         input_ids = padded("input_ids", self.pad_token_id)
         codebook_counts = {
             len(frame_codes)
@@ -457,6 +512,9 @@ class Step1PlannerCollator:
             "audio_codes": torch.tensor(padded_audio, dtype=torch.long),
             "target_slots": padded("target_slots", -1),
             "motion_local_labels": padded("motion_local_labels", IGNORE_INDEX),
+            "text_mask": padded_optional("text_mask", 0).bool(),
+            "audio_anchor_ids": padded_optional("audio_anchor_ids", -1),
+            "target_anchor_ids": padded_optional("target_anchor_ids", -1),
             "names": [str(example["name"]) for example in examples],
             "generated_prefix_anchors": torch.tensor(
                 [int(example["generated_prefix_anchors"]) for example in examples], dtype=torch.long
@@ -501,6 +559,7 @@ class MimiQwenPlannerOutput(ModelOutput):
     per_example_loss_sum: Optional[torch.Tensor] = None
     per_example_correct: Optional[torch.Tensor] = None
     per_example_count: Optional[torch.Tensor] = None
+    per_token_loss: Optional[torch.Tensor] = None
 
 
 class MimiQwenPlanner(PreTrainedModel):
@@ -692,6 +751,7 @@ class MimiQwenPlanner(PreTrainedModel):
         motion_local_labels: torch.Tensor,
         expected_distortion_weight: float = 0.0,
         expected_distortion_example_mask: Optional[torch.Tensor] = None,
+        return_token_losses: bool = False,
         **kwargs: Any,
     ) -> MimiQwenPlannerOutput:
         del kwargs
@@ -746,6 +806,11 @@ class MimiQwenPlanner(PreTrainedModel):
         per_example_count = torch.zeros(input_ids.shape[0], device=hidden.device, dtype=torch.long)
         distortion_sum = hidden.new_zeros((), dtype=torch.float32)
         distortion_count = torch.zeros((), device=hidden.device, dtype=torch.long)
+        per_token_loss = (
+            torch.zeros_like(input_ids, dtype=torch.float32)
+            if bool(return_token_losses)
+            else None
+        )
         for slot in range(BODY_SLOT_COUNT):
             mask = shifted_slots.eq(slot)
             slot_count = mask.sum()
@@ -787,6 +852,12 @@ class MimiQwenPlanner(PreTrainedModel):
             per_example_count.scatter_add_(
                 0, example_indices, torch.ones_like(example_indices, dtype=torch.long)
             )
+            if per_token_loss is not None:
+                positions = mask.nonzero(as_tuple=False)
+                flat_indices = positions[:, 0] * input_ids.shape[1] + positions[:, 1] + 1
+                per_token_loss = per_token_loss.reshape(-1).scatter(
+                    0, flat_indices, token_losses
+                ).view_as(input_ids)
         if not bool(count):
             raise ValueError("Batch contains no supervised anchor tokens")
         ce_loss = loss_sum / count
@@ -810,6 +881,7 @@ class MimiQwenPlanner(PreTrainedModel):
             per_example_loss_sum=per_example_loss_sum,
             per_example_correct=per_example_correct,
             per_example_count=per_example_count,
+            per_token_loss=per_token_loss,
         )
 
     @torch.inference_mode()
