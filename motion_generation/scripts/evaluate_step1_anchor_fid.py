@@ -148,6 +148,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--fid_batch_size", type=int, default=64)
     parser.add_argument("--diversity_times", type=int, default=300)
+    parser.add_argument(
+        "--metric_seed",
+        type=int,
+        default=42,
+        help="Reset NumPy before every FID/diversity row for paired diversity sampling.",
+    )
     parser.add_argument("--no_bf16", action="store_true")
     parser.add_argument(
         "--no_canonicalize_raw_root",
@@ -446,6 +452,7 @@ def compute_anchor_fid(
     device: torch.device,
     batch_size: int,
     diversity_times: int,
+    metric_seed: int,
     canonicalize_raw_root: bool,
 ) -> pd.DataFrame:
     helpers = load_official_evaluator_helpers(evaluation_dir)
@@ -493,6 +500,10 @@ def compute_anchor_fid(
     metric_fn = helpers["compute_fid_diversity_metrics"]
     for reference, reference_latents in references.items():
         for condition in conditions:
+            # The official diversity helper samples random latent pairs. Resetting
+            # here makes the reference pairs identical across conditions and makes
+            # reruns reproducible. FID itself is deterministic.
+            np.random.seed(metric_seed)
             metrics = metric_fn(
                 reference_latents,
                 latents_by_condition[condition],
@@ -668,6 +679,7 @@ def main() -> None:
         device=device,
         batch_size=args.fid_batch_size,
         diversity_times=args.diversity_times,
+        metric_seed=args.metric_seed,
         canonicalize_raw_root=canonicalize_raw_root,
     )
     fid.to_csv(output_dir / "anchor_fid_metrics.csv", index=False)
@@ -678,6 +690,7 @@ def main() -> None:
             "fixed_gap": fixed_gap,
             "canonicalize_raw_root": canonicalize_raw_root,
             "codec_relative_reference": "causal_codec_reconstruction",
+            "metric_seed": args.metric_seed,
             "warning": (
                 "Non-anchor tokens are GT. These scores isolate anchor damage and "
                 "must not be reported as end-to-end Step 1 plus Step 2 FID."

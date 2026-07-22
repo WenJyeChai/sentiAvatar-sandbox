@@ -491,6 +491,9 @@ class MimiQwenPlannerConfig(PretrainedConfig):
 @dataclass
 class MimiQwenPlannerOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
+    ce_loss: Optional[torch.Tensor] = None
+    expected_distortion_loss: Optional[torch.Tensor] = None
+    expected_distortion_count: Optional[torch.Tensor] = None
     correct: Optional[torch.Tensor] = None
     count: Optional[torch.Tensor] = None
     per_slot_correct: Optional[torch.Tensor] = None
@@ -569,9 +572,28 @@ class MimiQwenPlanner(PreTrainedModel):
                 f"got {tuple(motion_token_ids.shape)}"
             )
         self.register_buffer("motion_token_ids", motion_token_ids, persistent=True)
+        # This table is derived from frozen codec checkpoints at training time.
+        # It is deliberately excluded from planner checkpoints (~16 MiB fp32).
+        self.register_buffer(
+            "motion_codebook_distances",
+            torch.empty(0, dtype=torch.float32),
+            persistent=False,
+        )
         if not 0 <= config.audio_placeholder_id < language_model.config.vocab_size:
             raise ValueError("audio_placeholder_id is outside the Qwen vocabulary")
         self.post_init()
+
+    def set_motion_codebook_distances(self, distances: torch.Tensor) -> None:
+        expected = (BODY_SLOT_COUNT, BODY_CODEBOOK_SIZE, BODY_CODEBOOK_SIZE)
+        distances = torch.as_tensor(distances, dtype=torch.float32)
+        if tuple(distances.shape) != expected:
+            raise ValueError(f"motion codebook distances must have shape {expected}")
+        if not torch.isfinite(distances).all() or bool((distances < 0).any()):
+            raise ValueError("motion codebook distances must be finite and non-negative")
+        diagonal = distances.diagonal(dim1=-2, dim2=-1)
+        if not torch.allclose(diagonal, torch.zeros_like(diagonal), atol=1e-6):
+            raise ValueError("motion codebook distance diagonals must be zero")
+        self.motion_codebook_distances = distances.contiguous()
 
     @classmethod
     def from_qwen_pretrained(
@@ -668,6 +690,8 @@ class MimiQwenPlanner(PreTrainedModel):
         audio_codes: torch.Tensor,
         target_slots: torch.Tensor,
         motion_local_labels: torch.Tensor,
+        expected_distortion_weight: float = 0.0,
+        expected_distortion_example_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> MimiQwenPlannerOutput:
         del kwargs
@@ -686,6 +710,19 @@ class MimiQwenPlanner(PreTrainedModel):
             raise ValueError("target_slots and motion_local_labels masks must match")
         if target_mask[:, 0].any():
             raise ValueError("The first sequence position cannot be an autoregressive target")
+        expected_distortion_weight = float(expected_distortion_weight)
+        if expected_distortion_weight < 0:
+            raise ValueError("expected_distortion_weight must be non-negative")
+        if expected_distortion_example_mask is not None:
+            if tuple(expected_distortion_example_mask.shape) != (input_ids.shape[0],):
+                raise ValueError("expected_distortion_example_mask must have shape [B]")
+            expected_distortion_example_mask = expected_distortion_example_mask.to(
+                device=input_ids.device, dtype=torch.bool
+            )
+        if expected_distortion_weight > 0 and not self.motion_codebook_distances.numel():
+            raise RuntimeError(
+                "Expected-distortion loss is enabled but codec distance tables were not loaded"
+            )
 
         inputs_embeds = self.prepare_input_embeddings(input_ids, audio_codes)
         base_outputs = self._base_model_forward(
@@ -707,6 +744,8 @@ class MimiQwenPlanner(PreTrainedModel):
         per_example_loss_sum = torch.zeros(input_ids.shape[0], device=hidden.device, dtype=torch.float32)
         per_example_correct = torch.zeros(input_ids.shape[0], device=hidden.device, dtype=torch.long)
         per_example_count = torch.zeros(input_ids.shape[0], device=hidden.device, dtype=torch.long)
+        distortion_sum = hidden.new_zeros((), dtype=torch.float32)
+        distortion_count = torch.zeros((), device=hidden.device, dtype=torch.long)
         for slot in range(BODY_SLOT_COUNT):
             mask = shifted_slots.eq(slot)
             slot_count = mask.sum()
@@ -726,6 +765,23 @@ class MimiQwenPlanner(PreTrainedModel):
             per_slot_correct[slot] = slot_correct
             per_slot_count[slot] = slot_count
             example_indices = mask.nonzero(as_tuple=False)[:, 0]
+            if expected_distortion_weight > 0:
+                auxiliary_mask = (
+                    torch.ones_like(example_indices, dtype=torch.bool)
+                    if expected_distortion_example_mask is None
+                    else expected_distortion_example_mask.index_select(0, example_indices)
+                )
+                if bool(auxiliary_mask.any()):
+                    auxiliary_logits = logits[auxiliary_mask]
+                    auxiliary_labels = labels[auxiliary_mask]
+                    costs = self.motion_codebook_distances[slot].index_select(
+                        0, auxiliary_labels
+                    )
+                    token_distortion = (
+                        F.softmax(auxiliary_logits, dim=-1) * costs
+                    ).sum(dim=-1)
+                    distortion_sum = distortion_sum + token_distortion.sum()
+                    distortion_count = distortion_count + auxiliary_mask.sum()
             per_example_loss_sum.scatter_add_(0, example_indices, token_losses)
             per_example_correct.scatter_add_(0, example_indices, token_correct.to(torch.long))
             per_example_count.scatter_add_(
@@ -733,9 +789,20 @@ class MimiQwenPlanner(PreTrainedModel):
             )
         if not bool(count):
             raise ValueError("Batch contains no supervised anchor tokens")
-        loss = loss_sum / count
+        ce_loss = loss_sum / count
+        if expected_distortion_weight > 0 and not bool(distortion_count):
+            raise ValueError("No supervised tokens were selected for expected-distortion loss")
+        expected_distortion_loss = (
+            distortion_sum / distortion_count
+            if bool(distortion_count)
+            else distortion_sum
+        )
+        loss = ce_loss + expected_distortion_weight * expected_distortion_loss
         return MimiQwenPlannerOutput(
             loss=loss,
+            ce_loss=ce_loss,
+            expected_distortion_loss=expected_distortion_loss,
+            expected_distortion_count=distortion_count,
             correct=correct,
             count=count,
             per_slot_correct=per_slot_correct,

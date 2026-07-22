@@ -56,6 +56,9 @@ from utils.step1_self_forcing import (  # noqa: E402
     rollout_quality_metrics,
     validate_generated_labels,
 )
+from utils.step1_expected_distortion import (  # noqa: E402
+    load_normalized_codebook_distance_table,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -468,12 +471,18 @@ def validate_generated_history_config(config: Mapping[str, Any]) -> dict[str, An
     generated.setdefault("rollout_q0_accuracy_min", 0.03)
     generated.setdefault("milestone_epochs", [5, 15, 25, 35, 50])
     generated.setdefault("rollout_eval_epochs", [5, 15, 25, 35, 50])
+    generated.setdefault("start_immediately", False)
     if generated["decoding"] != "greedy":
         raise ValueError("Only greedy generated-history decoding is currently supported")
-    for key in ("minimum_teacher_epochs", "ramp_epochs", "rollout_microbatch_size", "rollout_eval_clips"):
+    for key in ("minimum_teacher_epochs", "ramp_epochs"):
+        generated[key] = int(generated[key])
+        if generated[key] < 0:
+            raise ValueError(f"generated_history.{key} must be non-negative")
+    for key in ("rollout_microbatch_size", "rollout_eval_clips"):
         generated[key] = int(generated[key])
         if generated[key] <= 0:
             raise ValueError(f"generated_history.{key} must be positive")
+    generated["start_immediately"] = bool(generated["start_immediately"])
     generated["max_probability"] = float(generated["max_probability"])
     if not 0 <= generated["max_probability"] <= 1:
         raise ValueError("generated_history.max_probability must be in [0, 1]")
@@ -485,6 +494,48 @@ def validate_generated_history_config(config: Mapping[str, Any]) -> dict[str, An
             raise ValueError(f"generated_history.{key} must contain positive epochs")
         generated[key] = sorted(set(values))
     return generated
+
+
+def validate_auxiliary_loss_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    auxiliary = section(config, "auxiliary_loss")
+    auxiliary.setdefault("type", "none")
+    auxiliary.setdefault("weight", 0.0)
+    auxiliary.setdefault("warmup_epochs", 0.0)
+    auxiliary.setdefault("apply_to", "clean")
+    auxiliary_type = str(auxiliary["type"])
+    if auxiliary_type not in {"none", "expected_distortion"}:
+        raise ValueError("auxiliary_loss.type must be 'none' or 'expected_distortion'")
+    auxiliary["weight"] = float(auxiliary["weight"])
+    auxiliary["warmup_epochs"] = float(auxiliary["warmup_epochs"])
+    if auxiliary["weight"] < 0 or auxiliary["warmup_epochs"] < 0:
+        raise ValueError("auxiliary loss weight and warmup_epochs must be non-negative")
+    if auxiliary_type == "none":
+        auxiliary["weight"] = 0.0
+    elif auxiliary["weight"] <= 0:
+        raise ValueError("expected_distortion requires a positive auxiliary_loss.weight")
+    if auxiliary["apply_to"] not in {"clean", "all"}:
+        raise ValueError("auxiliary_loss.apply_to must be 'clean' or 'all'")
+    checkpoints = auxiliary.get("codec_checkpoints", {})
+    if auxiliary_type == "expected_distortion":
+        if not isinstance(checkpoints, dict):
+            raise ValueError("auxiliary_loss.codec_checkpoints must be a mapping")
+        missing = [part for part in ("upper", "lower", "feet", "hands") if part not in checkpoints]
+        if missing:
+            raise ValueError(f"Missing auxiliary codec checkpoints: {missing}")
+        auxiliary["codec_checkpoints"] = {
+            part: project_path(checkpoints[part]) for part in ("upper", "lower", "feet", "hands")
+        }
+    return auxiliary
+
+
+def auxiliary_weight_at_epoch(
+    epoch_progress: float, *, maximum: float, warmup_epochs: float
+) -> float:
+    if maximum <= 0:
+        return 0.0
+    if warmup_epochs <= 0:
+        return float(maximum)
+    return float(maximum) * min(1.0, max(0.0, float(epoch_progress) / warmup_epochs))
 
 
 def run_rank0_rollout_evaluation(
@@ -550,6 +601,7 @@ def main() -> None:
     mimi_codebooks_used = mimi_codebooks_from_config(config)
     data_config["mimi_codebooks_used"] = mimi_codebooks_used
     generated_history = validate_generated_history_config(config)
+    auxiliary_loss = validate_auxiliary_loss_config(config)
     if bool(generated_history["enabled"]) and (
         data_config.get("generated_anchor_dir")
         or float(data_config.get("generated_prefix_probability", 0.0)) > 0
@@ -581,6 +633,14 @@ def main() -> None:
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
     model.language_model.config.use_cache = False
+    if auxiliary_loss["type"] == "expected_distortion":
+        if is_main(rank):
+            print("Loading frozen causal-codec geometry for expected-distortion loss")
+        distances = load_normalized_codebook_distance_table(
+            auxiliary_loss["codec_checkpoints"]
+        )
+        model.set_motion_codebook_distances(distances)
+        del distances
     model.to(device)
 
     text_map = load_text_map(paths["text_json"])
@@ -694,6 +754,14 @@ def main() -> None:
         curriculum_activation_epoch,
         best_rollout_accuracy,
     ) = load_training_state(resume, optimizer, scheduler, device)
+    if (
+        resume is None
+        and bool(generated_history["enabled"])
+        and bool(generated_history["start_immediately"])
+    ):
+        # -1 makes epoch_progress=0 immediately exceed the activation point,
+        # including when ramp_epochs=0 requests a fixed probability.
+        curriculum_activation_epoch = -1
 
     if is_main(rank):
         trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
@@ -717,6 +785,12 @@ def main() -> None:
             f"ramp={generated_history['ramp_epochs']} epochs, "
             f"p_max={generated_history['max_probability']}"
         )
+        print(
+            "Auxiliary loss:    "
+            f"type={auxiliary_loss['type']}, weight={auxiliary_loss['weight']}, "
+            f"warmup={auxiliary_loss['warmup_epochs']} epochs, "
+            f"apply_to={auxiliary_loss['apply_to']}"
+        )
         print("=" * 76)
 
     paths["output_dir"].mkdir(parents=True, exist_ok=True)
@@ -736,9 +810,9 @@ def main() -> None:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     base_metric_count = 3 + 2 * len(BODY_SLOTS)
-    # clean loss/correct/count, generated loss/correct/count, then eight
-    # detached rollout statistics.
-    running = torch.zeros(base_metric_count + 14, dtype=torch.float64, device=device)
+    # clean loss/correct/count, generated loss/correct/count, eight detached
+    # rollout statistics, then CE sum, expected-distortion sum/count.
+    running = torch.zeros(base_metric_count + 17, dtype=torch.float64, device=device)
     run_start = time.perf_counter()
 
     completed_epochs = start_epoch
@@ -763,6 +837,11 @@ def main() -> None:
             inputs = move_batch(batch, device)
             validate_generated_labels(inputs)
             epoch_progress = epoch + batch_index / max(1, len(train_loader))
+            current_auxiliary_weight = auxiliary_weight_at_epoch(
+                epoch_progress,
+                maximum=float(auxiliary_loss["weight"]),
+                warmup_epochs=float(auxiliary_loss["warmup_epochs"]),
+            )
             generated_probability = (
                 generated_history_probability(
                     epoch_progress,
@@ -804,7 +883,16 @@ def main() -> None:
                     dtype=torch.bfloat16,
                     enabled=autocast_enabled,
                 ):
-                    output = model(**inputs)
+                    auxiliary_example_mask = (
+                        ~generated_mask
+                        if auxiliary_loss["apply_to"] == "clean"
+                        else None
+                    )
+                    output = model(
+                        **inputs,
+                        expected_distortion_weight=current_auxiliary_weight,
+                        expected_distortion_example_mask=auxiliary_example_mask,
+                    )
                     scaled_loss = output.loss / group_size
                 scaled_loss.backward()
             count = output.count.detach().to(torch.float64)
@@ -835,9 +923,15 @@ def main() -> None:
                 rollout_stats.confidence_sum,
                 rollout_stats.entropy_sum,
             )
-            running[split_offset + 6 :] += torch.tensor(
+            running[split_offset + 6 : split_offset + 14] += torch.tensor(
                 rollout_values, dtype=torch.float64, device=device
             )
+            running[split_offset + 14] += output.ce_loss.detach().to(torch.float64) * count
+            auxiliary_count = output.expected_distortion_count.detach().to(torch.float64)
+            running[split_offset + 15] += (
+                output.expected_distortion_loss.detach().to(torch.float64) * auxiliary_count
+            )
+            running[split_offset + 16] += auxiliary_count
 
             if not should_step:
                 continue
@@ -856,15 +950,22 @@ def main() -> None:
                     generated_count = max(1.0, float(totals[split_offset + 5]))
                     rollout_tokens = max(1.0, float(totals[split_offset + 8]))
                     rollout_q0_tokens = max(1.0, float(totals[split_offset + 11]))
+                    expected_distortion_count = max(1.0, float(totals[split_offset + 16]))
                     train_metrics = {
                         "train/loss": float(totals[0]) / denominator,
+                        "train/cross_entropy": float(totals[split_offset + 14]) / denominator,
                         "train/slot_accuracy": float(totals[1]) / denominator,
                         "train/learning_rate": scheduler.get_last_lr()[0],
                         "train/epoch": epoch + (batch_index + 1) / max(1, len(train_loader)),
                         "curriculum/generated_history_probability": generated_probability,
                         "curriculum/generated_clips": float(totals[split_offset + 6]),
                         "curriculum/generated_anchors": float(totals[split_offset + 7]),
+                        "auxiliary/weight": current_auxiliary_weight,
                     }
+                    if float(totals[split_offset + 16]) > 0:
+                        train_metrics["auxiliary/expected_distortion"] = (
+                            float(totals[split_offset + 15]) / expected_distortion_count
+                        )
                     if float(totals[split_offset + 2]) > 0:
                         train_metrics.update(
                             {

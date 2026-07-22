@@ -37,6 +37,9 @@ from utils.adaptive_anchor_tokens import (  # noqa: E402
     parse_body_token,
     split_body_global_id,
 )
+from utils.step1_expected_distortion import (  # noqa: E402
+    normalized_codebook_distance_table,
+)
 
 
 @pytest.fixture(scope="module")
@@ -313,6 +316,72 @@ def test_tiny_planner_slot_loss_backprop_and_save_load(tmp_path: Path):
             motion_local_labels=motion_labels,
         )
     assert torch.isfinite(reloaded_output.loss)
+
+
+def test_normalized_codebook_distances_are_symmetric_and_unit_scaled():
+    generator = torch.Generator().manual_seed(9)
+    codebooks = {
+        part: torch.randn(4, 512, 7, generator=generator)
+        for part in ("upper", "lower", "feet", "hands")
+    }
+    distances = normalized_codebook_distance_table(codebooks)
+    assert distances.shape == (16, 512, 512)
+    assert torch.allclose(distances, distances.transpose(-1, -2), atol=1e-6)
+    assert torch.count_nonzero(distances.diagonal(dim1=-2, dim2=-1)) == 0
+    # Includes zero self-pairs, matching the normalization identity exactly.
+    assert torch.allclose(
+        distances.mean(dim=(-1, -2)), torch.ones(16), rtol=2e-4, atol=2e-4
+    )
+
+
+def test_expected_distortion_adds_to_ce_and_can_select_examples():
+    planner = _tiny_planner()
+    distances = torch.ones(16, 512, 512)
+    distances.diagonal(dim1=-2, dim2=-1).zero_()
+    planner.set_motion_codebook_distances(distances)
+    labels = torch.tensor([(slot * 13 + 5) % 512 for slot in range(16)], dtype=torch.long)
+    input_ids = torch.zeros((1, 18), dtype=torch.long)
+    for slot in range(16):
+        input_ids[0, 2 + slot] = planner.motion_token_ids[slot, labels[slot]]
+    target_slots = torch.full_like(input_ids, -1)
+    target_slots[0, 2:] = torch.arange(16)
+    motion_labels = torch.full_like(input_ids, IGNORE_INDEX)
+    motion_labels[0, 2:] = labels
+    output = planner(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        audio_codes=torch.full_like(input_ids, -1),
+        target_slots=target_slots,
+        motion_local_labels=motion_labels,
+        expected_distortion_weight=0.25,
+        expected_distortion_example_mask=torch.tensor([True]),
+    )
+    assert int(output.expected_distortion_count) == 16
+    assert float(output.expected_distortion_loss.detach()) > 0
+    assert torch.allclose(
+        output.loss,
+        output.ce_loss + 0.25 * output.expected_distortion_loss,
+    )
+    output.loss.backward()
+    assert planner.language_model.get_output_embeddings().weight.grad is not None
+
+
+def test_expected_distortion_requires_loaded_codec_geometry():
+    planner = _tiny_planner()
+    input_ids = torch.zeros((1, 3), dtype=torch.long)
+    target_slots = torch.full_like(input_ids, -1)
+    target_slots[0, 2] = 0
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    labels[0, 2] = 1
+    with pytest.raises(RuntimeError, match="distance tables"):
+        planner(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            audio_codes=torch.full_like(input_ids, -1),
+            target_slots=target_slots,
+            motion_local_labels=labels,
+            expected_distortion_weight=0.1,
+        )
 
 
 def test_audio_code_must_match_placeholder_positions():

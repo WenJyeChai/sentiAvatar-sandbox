@@ -4,7 +4,11 @@ import math
 
 import torch
 
-from train_step1_multipart_fixed_gap3 import load_training_state
+from train_step1_multipart_fixed_gap3 import (
+    auxiliary_weight_at_epoch,
+    load_training_state,
+    validate_auxiliary_loss_config,
+)
 
 
 def test_training_state_restores_early_stopping_fields(tmp_path) -> None:
@@ -64,3 +68,15 @@ def test_old_training_state_is_backward_compatible(tmp_path) -> None:
     assert math.isinf(best_loss)
     assert activation_epoch is None
     assert math.isinf(best_rollout) and best_rollout < 0
+
+
+def test_auxiliary_weight_ramps_without_changing_control() -> None:
+    assert auxiliary_weight_at_epoch(0.5, maximum=0.1, warmup_epochs=1.0) == 0.05
+    assert auxiliary_weight_at_epoch(2.0, maximum=0.1, warmup_epochs=1.0) == 0.1
+    assert auxiliary_weight_at_epoch(2.0, maximum=0.0, warmup_epochs=1.0) == 0.0
+
+
+def test_auxiliary_control_defaults_to_disabled() -> None:
+    config = validate_auxiliary_loss_config({})
+    assert config["type"] == "none"
+    assert config["weight"] == 0.0
