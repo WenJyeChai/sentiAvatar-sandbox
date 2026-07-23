@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from types import MethodType
 
+import pytest
 import torch
 
 
@@ -22,6 +23,8 @@ from scripts.train_audio_mask_multipart_variable_c2f import (
     load_pretrained_with_audio_fusion,
     load_pretrained_with_layout_expansion,
     parse_args,
+    sha256_file,
+    validate_motion_token_contract,
 )
 from transformers import TrainingArguments
 
@@ -170,6 +173,77 @@ def test_moss_nano_all16_two_stage_configs_preserve_audio_contract():
     assert stage2.model_name_or_path == base.output_dir
     assert base.self_forcing_max_prob == 0.0
     assert stage2.self_forcing_max_prob == 0.5
+
+
+def test_body_causal_nano_configs_match_step1_token_contract():
+    base = parse_args(
+        [
+            "--config",
+            str(
+                MOTION_GENERATION_DIR
+                / "configs"
+                / "audio_c2f_body_causal_moss_nano_all16_fixed_targets_no_sf_scratch.yaml"
+            ),
+        ]
+    )
+    stage2 = parse_args(
+        [
+            "--config",
+            str(
+                MOTION_GENERATION_DIR
+                / "configs"
+                / "audio_c2f_body_causal_moss_nano_all16_soft_recovery_sf05_stage2.yaml"
+            ),
+        ]
+    )
+    for args in (base, stage2):
+        assert args.motion_token_dir.endswith(
+            "motion_token_data_multipart_causal_512x4"
+        )
+        assert args.part_order == "upper,lower,feet,hands"
+        assert args.require_complete_audio_coverage
+        assert args.require_causal_motion_tokens
+        assert args.require_motion_checkpoint_match
+        assert "causal_multipart_rvqvae" in str(args.upper_ckpt)
+        assert args.audio_num_codebooks == 16
+    assert base.model_name_or_path is None
+    assert stage2.model_name_or_path == base.output_dir
+
+
+def test_required_causal_motion_contract_checks_checkpoint_fingerprints(
+    tmp_path: Path,
+):
+    parts = ["upper", "lower", "feet", "hands"]
+    checkpoints = {}
+    fingerprints = {}
+    for index, part in enumerate(parts):
+        path = tmp_path / f"{part}.pth"
+        path.write_bytes(f"checkpoint-{index}".encode())
+        checkpoints[part] = path
+        fingerprints[part] = {"sha256": sha256_file(path)}
+    manifest = {
+        "part_order": parts,
+        "body_causal": True,
+        "causal_by_part": {part: True for part in parts},
+        "checkpoint_fingerprints": fingerprints,
+    }
+    validate_motion_token_contract(
+        manifest,
+        part_order=parts,
+        checkpoint_paths=checkpoints,
+        require_causal=True,
+        require_checkpoint_match=True,
+    )
+
+    checkpoints["hands"].write_bytes(b"different-checkpoint")
+    with pytest.raises(ValueError, match="do not match the token export"):
+        validate_motion_token_contract(
+            manifest,
+            part_order=parts,
+            checkpoint_paths=checkpoints,
+            require_causal=True,
+            require_checkpoint_match=True,
+        )
 
 
 def test_routed_audio_starts_as_an_exact_legacy_checkpoint_clone():

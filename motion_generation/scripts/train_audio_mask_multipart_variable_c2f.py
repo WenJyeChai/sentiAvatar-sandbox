@@ -10,6 +10,7 @@ objective, with optional hard or distributional residual-recovery supervision.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import random
@@ -1021,6 +1022,75 @@ def parse_float_list(text: str, expected: int, name: str) -> list[float]:
     return values
 
 
+def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_motion_token_contract(
+    manifest: Optional[Mapping[str, Any]],
+    *,
+    part_order: Sequence[str],
+    checkpoint_paths: Optional[Mapping[str, Path]] = None,
+    require_causal: bool,
+    require_checkpoint_match: bool,
+) -> None:
+    if not (require_causal or require_checkpoint_match):
+        return
+    if manifest is None:
+        raise FileNotFoundError(
+            "A consolidated motion-token export_manifest.json is required"
+        )
+
+    manifest_parts = [str(part) for part in manifest.get("part_order", [])]
+    expected_parts = [str(part) for part in part_order]
+    if manifest_parts != expected_parts:
+        raise ValueError(
+            f"Motion-token manifest parts {manifest_parts} do not match "
+            f"training parts {expected_parts}"
+        )
+
+    if require_causal:
+        causal_by_part = manifest.get("causal_by_part")
+        if manifest.get("body_causal") is not True or not isinstance(
+            causal_by_part, Mapping
+        ):
+            raise ValueError("Motion-token manifest does not certify body_causal=true")
+        noncausal = [
+            part for part in expected_parts if causal_by_part.get(part) is not True
+        ]
+        if noncausal:
+            raise ValueError(f"Motion-token manifest has noncausal parts: {noncausal}")
+
+    if require_checkpoint_match:
+        if checkpoint_paths is None:
+            raise ValueError("checkpoint_paths are required for fingerprint validation")
+        fingerprints = manifest.get("checkpoint_fingerprints")
+        if not isinstance(fingerprints, Mapping):
+            raise ValueError("Motion-token manifest lacks checkpoint fingerprints")
+        mismatches = []
+        for part in expected_parts:
+            checkpoint_path = Path(checkpoint_paths[part])
+            entry = fingerprints.get(part)
+            expected_sha = entry.get("sha256") if isinstance(entry, Mapping) else None
+            if not expected_sha:
+                mismatches.append(f"{part}: missing manifest SHA256")
+                continue
+            actual_sha = sha256_file(checkpoint_path)
+            if actual_sha != str(expected_sha):
+                mismatches.append(
+                    f"{part}: checkpoint SHA256 {actual_sha} != manifest {expected_sha}"
+                )
+        if mismatches:
+            raise ValueError(
+                "Motion codec checkpoints do not match the token export: "
+                + "; ".join(mismatches)
+            )
+
+
 def load_yaml_defaults(path: Path) -> Dict[str, Any]:
     import yaml
 
@@ -1064,6 +1134,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--train_windows_per_sequence", type=int, default=1)
     parser.add_argument("--eval_windows_per_sequence", type=int, default=4)
     parser.add_argument("--require_complete_audio_coverage", action="store_true")
+    parser.add_argument("--require_causal_motion_tokens", action="store_true")
+    parser.add_argument("--require_motion_checkpoint_match", action="store_true")
 
     parser.add_argument("--min_gap_frames", type=int, default=1)
     parser.add_argument("--max_gap_frames", type=int, default=15)
@@ -1363,6 +1435,19 @@ def main() -> None:
     )
     manifest = load_manifest(token_dir)
     part_order = parse_part_order(args.part_order, manifest)
+    if manifest and manifest.get("part_order"):
+        manifest_parts = [str(part) for part in manifest["part_order"]]
+        if manifest_parts != list(part_order):
+            raise ValueError(
+                f"Configured part order {list(part_order)} does not match "
+                f"motion-token manifest {manifest_parts}"
+            )
+    validate_motion_token_contract(
+        manifest,
+        part_order=part_order,
+        require_causal=args.require_causal_motion_tokens,
+        require_checkpoint_match=False,
+    )
     num_quantizers = int(
         args.num_quantizers_per_part
         or (manifest.get("num_quantizers") if manifest else None)
@@ -1550,12 +1635,29 @@ def main() -> None:
         setattr(model.config, key, value)
 
     checkpoint_paths = {part: Path(getattr(args, f"{part}_ckpt")) for part in part_order}
+    validate_motion_token_contract(
+        manifest,
+        part_order=part_order,
+        checkpoint_paths=checkpoint_paths,
+        require_causal=args.require_causal_motion_tokens,
+        require_checkpoint_match=args.require_motion_checkpoint_match,
+    )
     codebooks = MultipartCodebookSet.from_checkpoints(
         checkpoint_paths, torch.device("cpu"), part_order
     )
     if codebooks.codebook_size != codebook_size or codebooks.num_quantizers != num_quantizers:
         raise ValueError("Codec checkpoints do not match token manifest")
     model.config.part_checkpoints = {part: str(path) for part, path in checkpoint_paths.items()}
+    model.config.motion_token_dir = str(token_dir)
+    model.config.motion_token_body_causal = (
+        manifest.get("body_causal") if manifest else None
+    )
+    model.config.motion_token_export_signature = (
+        manifest.get("export_signature") if manifest else None
+    )
+    model.config.motion_token_checkpoint_fingerprints = (
+        manifest.get("checkpoint_fingerprints") if manifest else None
+    )
     target_builder = ResidualTargetBuilder(
         codebooks.codebooks, part_order, codebook_size, num_quantizers
     )

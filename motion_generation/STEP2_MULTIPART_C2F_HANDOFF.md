@@ -1041,3 +1041,40 @@ features. Do not feed those features into a checkpoint whose
 `audio_representation` is `moss_nano_quantized_latent_q0_q15`. Runtime Nano
 feature extraction and checkpoint-driven dispatch remain a separate
 integration task.
+
+### 24.5 Body-only causal run selected for Step 1 compatibility
+
+The first Nano Step 2 run is body-only. It must use the exact causal multipart
+motion export already used by Step 1:
+
+`SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4`
+
+The four motion codec checkpoints are:
+
+- `checkpoints/causal_multipart_rvqvae/causal_rvq_upper_512x4_scratch/model/best.pth`
+- `checkpoints/causal_multipart_rvqvae/causal_rvq_lower_512x4_scratch/model/best.pth`
+- `checkpoints/causal_multipart_rvqvae/causal_rvq_feet_512x4_scratch/model/best.pth`
+- `checkpoints/causal_multipart_rvqvae/causal_rvq_hands_512x4_scratch/model/best.pth`
+
+The body model has 16 motion slots per frame and therefore a maximum Step 2
+sequence length of `17 * 16 = 272` tokens for gaps 1-15. Its Nano audio still
+uses all q0-q15 layers.
+
+Stage 1:
+
+`motion_generation/configs/audio_c2f_body_causal_moss_nano_all16_fixed_targets_no_sf_scratch.yaml`
+
+Stage 2:
+
+`motion_generation/configs/audio_c2f_body_causal_moss_nano_all16_soft_recovery_sf05_stage2.yaml`
+
+Both configs require:
+
+- a consolidated causal motion-token manifest with `body_causal=true`;
+- all four parts marked causal;
+- exact SHA256 agreement between the token-export checkpoints and the codec
+  checkpoints used by Step 2 latent losses;
+- complete Nano audio coverage for every available motion clip; and
+- 768-D Nano feature arrays.
+
+The face Nano configs remain available but are not part of this first run.

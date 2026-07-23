@@ -1,0 +1,72 @@
+experiment:
+  output_dir: checkpoints/mask_multipart_body_causal_moss_nano_all16_variable_c2f_soft_recovery_sf05_stage2_gap1_15
+  model_name_or_path: checkpoints/mask_multipart_body_causal_moss_nano_all16_variable_c2f_fixed_targets_no_sf_scratch_gap1_15
+
+audio_conditioning:
+  audio_fusion_mode: legacy_additive
+  audio_representation: moss_nano_quantized_latent_q0_q15
+  audio_feat_dim: 768
+  audio_fps: 12.5
+  audio_sample_rate: 48000
+  audio_num_codebooks: 16
+  audio_codebook_size: 1024
+  audio_alignment: nearest_motion_time
+
+data:
+  data_dir: SuSuInterActs/SuSuInterActs
+  motion_token_dir: SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4
+  audio_feat_dir: SuSuInterActs/SuSuInterActs/audio_features_moss_nano_all16_12p5hz_768d
+  train_split_file: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  eval_split_file: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+  train_windows_per_sequence: 8
+  eval_windows_per_sequence: 4
+  require_complete_audio_coverage: true
+  require_causal_motion_tokens: true
+  require_motion_checkpoint_match: true
+  part_order: upper,lower,feet,hands
+  upper_ckpt: checkpoints/causal_multipart_rvqvae/causal_rvq_upper_512x4_scratch/model/best.pth
+  lower_ckpt: checkpoints/causal_multipart_rvqvae/causal_rvq_lower_512x4_scratch/model/best.pth
+  feet_ckpt: checkpoints/causal_multipart_rvqvae/causal_rvq_feet_512x4_scratch/model/best.pth
+  hands_ckpt: checkpoints/causal_multipart_rvqvae/causal_rvq_hands_512x4_scratch/model/best.pth
+
+masking:
+  min_gap_frames: 1
+  max_gap_frames: 15
+  gap_bucket_weights: [0.35, 0.35, 0.30]
+  stage_weights: [0.35, 0.25, 0.20, 0.20]
+
+objectives:
+  adaptive_target_mode: never
+  self_forcing_warmup_ratio: 0.10
+  self_forcing_ramp_ratio: 0.30
+  self_forcing_max_prob: 0.50
+  embedding_loss_weight: 0.1
+  final_latent_loss_weight: 0.1
+  soft_recovery_weight: 0.1
+  soft_recovery_topk: 8
+  soft_recovery_sigma_scale: 1.0
+  soft_recovery_include_correct_prefix: false
+
+optimization:
+  num_train_epochs: 200
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  per_device_train_batch_size: 256
+  per_device_eval_batch_size: 256
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+
+monitoring:
+  logging_steps: 20
+  eval_steps: 1000
+  save_steps: 1000
+  save_total_limit: 3
+  report_to: wandb
+  wandb_project: sentiavatar-body-infill
+  wandb_mode: online
+  wandb_run_name: body_causal_moss_nano_all16_variable_c2f_soft_recovery_sf05_stage2_gap1_15
+  wandb_tags: [body, causal_motion, step1_compatible, multipart, moss_nano, audio_all16, variable_gap, c2f, soft_recovery, self_forcing, sf05, stage2]
