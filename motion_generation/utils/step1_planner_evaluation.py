@@ -24,7 +24,7 @@ from models.step1_mimi_planner import (
     IGNORE_INDEX,
     MimiQwenPlanner,
     canonical_data_path,
-    load_mimi_tokens,
+    load_audio_tokens,
     load_motion_tokens,
 )
 from scripts.export_multipart_motion_tokens import LoadedPartCodec
@@ -543,7 +543,7 @@ def write_rollout_cache(results: Sequence[RolloutResult], output_dir: Path) -> N
 
 
 class ShuffledAudioDataset(Dataset):
-    """Keep targets fixed while replacing configured Mimi streams with a donor clip."""
+    """Keep targets fixed while replacing configured audio streams with a donor clip."""
 
     def __init__(
         self,
@@ -567,8 +567,20 @@ class ShuffledAudioDataset(Dataset):
         donor_path = canonical_data_path(
             self.mimi_token_dir, self.donor_names[index], ".npz"
         )
-        codebooks = tuple(getattr(self.base_dataset, "mimi_codebooks_used", (0,)))
-        donor = np.asarray(load_mimi_tokens(donor_path)["codes"])[list(codebooks)]
+        codebooks = tuple(getattr(self.base_dataset, "audio_codebooks_used", (0,)))
+        donor = np.asarray(
+            load_audio_tokens(
+                donor_path,
+                codec=str(getattr(self.base_dataset, "audio_codec", "mimi")),
+                sample_rate=int(getattr(self.base_dataset, "audio_sample_rate", 24_000)),
+                frame_rate=float(getattr(self.base_dataset, "audio_frame_rate", 12.5)),
+                frame_size=int(getattr(self.base_dataset, "audio_frame_size", 1_920)),
+                stored_codebooks=int(
+                    getattr(self.base_dataset, "audio_codebooks_stored", 8)
+                ),
+                cardinality=int(getattr(self.base_dataset, "audio_cardinality", 2_048)),
+            )["codes"]
+        )[list(codebooks)]
         audio_codes = np.asarray(item["audio_codes"], dtype=np.int64)
         if audio_codes.ndim == 1:
             audio_codes = audio_codes[:, None]

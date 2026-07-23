@@ -21,12 +21,18 @@ from models.step1_mimi_planner import (  # noqa: E402
     MimiQwenPlannerConfig,
     Step1FixedGapDataset,
     Step1PlannerCollator,
+    parse_structured_text,
 )
 from utils.adaptive_anchor_tokens import (  # noqa: E402
+    ACTION_MISSING_TOKEN,
+    ACTION_TOKEN,
     BODY_CODEBOOK_SIZE,
     BODY_SLOT_COUNT,
+    EXPRESSION_MISSING_TOKEN,
+    EXPRESSION_TOKEN,
     GAP_TOKENS,
     MIMI_FRAME_TOKEN,
+    TRANSCRIPT_TOKEN,
     body_global_id,
     body_token,
     causal_audio_boundaries,
@@ -50,7 +56,7 @@ from utils.step1_condition_alignment import (  # noqa: E402
 @pytest.fixture(scope="module")
 def step1_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained(PROJECT_DIR / "checkpoints" / "llm", local_files_only=True)
-    ensure_step1_special_tokens(tokenizer)
+    ensure_step1_special_tokens(tokenizer, include_structured_text=True)
     return tokenizer
 
 
@@ -173,6 +179,111 @@ def test_dataset_serializes_synchronous_q0_q3_frames(tmp_path: Path, step1_token
     )
     assert observed.shape == (45, 4)
     assert np.array_equal(observed, codes[:4].T)
+
+
+def test_structured_text_parser_distinguishes_missing_from_explicit_no_action():
+    both = parse_structured_text(
+        "\u3010\u8868\u60c5\uff1a\u773c\u795e\u8ba4\u771f\u3011"
+        "\u3010\u52a8\u4f5c\uff1a\u65e0\u52a8\u4f5c\u3011"
+        "\u8bf7\u8bf4\u5b9e\u8bdd\u3002"
+    )
+    assert both.expression == "\u773c\u795e\u8ba4\u771f"
+    assert both.action == "\u65e0\u52a8\u4f5c"
+    assert both.transcript == "\u8bf7\u8bf4\u5b9e\u8bdd\u3002"
+    assert both.annotation_pattern == "expression+action"
+    missing = parse_structured_text("\u53ea\u6709\u5bf9\u8bdd\u3002")
+    assert missing.expression is None
+    assert missing.action is None
+    assert missing.annotation_pattern == "no-tags"
+
+
+def test_structured_serialization_has_field_specific_markers_and_masks(
+    tmp_path: Path, step1_tokenizer
+):
+    names = ["both", "transcript_only"]
+    text_map = {
+        "both": (
+            "\u3010\u8868\u60c5\uff1a\u773c\u795e\u8ba4\u771f\u3011"
+            "\u3010\u52a8\u4f5c\uff1a\u65e0\u52a8\u4f5c\u3011"
+            "\u5b89\u5b89\uff0c\u8bf4\u5b9e\u8bdd\u3002"
+        ),
+        "transcript_only": "\u4e3a\u4ec0\u4e48\u8fd9\u6837\u60f3\uff1f",
+    }
+    items = []
+    for name in names:
+        motion_dir, audio_dir, _, _ = _write_synthetic_clip(tmp_path, name)
+        dataset = Step1FixedGapDataset(
+            [name],
+            tokenizer=step1_tokenizer,
+            motion_token_dir=motion_dir,
+            mimi_token_dir=audio_dir,
+            text_map=text_map,
+            text_serialization="structured_fields",
+        )
+        items.append(dataset[0])
+    both, transcript_only = items
+    assert step1_tokenizer.convert_tokens_to_ids(EXPRESSION_TOKEN) in both["input_ids"]
+    assert step1_tokenizer.convert_tokens_to_ids(ACTION_TOKEN) in both["input_ids"]
+    assert step1_tokenizer.convert_tokens_to_ids(TRANSCRIPT_TOKEN) in both["input_ids"]
+    assert sum(both["expression_mask"]) > 0
+    assert sum(both["action_mask"]) > 0
+    assert sum(both["transcript_mask"]) > 0
+    assert both["annotation_pattern"] == "expression+action"
+    assert step1_tokenizer.convert_tokens_to_ids(EXPRESSION_MISSING_TOKEN) in transcript_only["input_ids"]
+    assert step1_tokenizer.convert_tokens_to_ids(ACTION_MISSING_TOKEN) in transcript_only["input_ids"]
+    assert sum(transcript_only["expression_mask"]) == 0
+    assert sum(transcript_only["action_mask"]) == 0
+    assert sum(transcript_only["transcript_mask"]) > 0
+    assert transcript_only["annotation_pattern"] == "no-tags"
+
+
+def test_nano_q0_q3_contract_reads_all_16_stored_codebooks(
+    tmp_path: Path, step1_tokenizer
+):
+    name = "nano/clip"
+    motion_dir, audio_dir, tokens, _ = _write_synthetic_clip(tmp_path, name)
+    audio_path = audio_dir / f"{name}.npz"
+    nano_frames = 45
+    nano_codes = np.stack(
+        [
+            (np.arange(nano_frames, dtype=np.uint16) + codebook * 50) % 1024
+            for codebook in range(16)
+        ]
+    )
+    np.savez_compressed(
+        audio_path,
+        codes=nano_codes,
+        format_version=np.asarray(2, dtype=np.int32),
+        codec=np.asarray("moss_audio_tokenizer_nano"),
+        name=np.asarray(name),
+        sample_rate=np.asarray(48_000, dtype=np.int32),
+        num_samples=np.asarray(len(tokens) * 4_800, dtype=np.int64),
+        frame_rate=np.asarray(12.5, dtype=np.float32),
+        frame_size=np.asarray(3_840, dtype=np.int32),
+        num_codebooks=np.asarray(16, dtype=np.int32),
+        cardinality=np.asarray(1_024, dtype=np.int32),
+    )
+    dataset = Step1FixedGapDataset(
+        [name],
+        tokenizer=step1_tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "\u6d4b\u8bd5"},
+        audio_codec="moss_audio_tokenizer_nano",
+        audio_sample_rate=48_000,
+        audio_frame_rate=12.5,
+        audio_frame_size=3_840,
+        audio_codebooks_stored=16,
+        audio_cardinality=1_024,
+        audio_codebooks_used=[0, 1, 2, 3],
+        text_serialization="structured_fields",
+    )
+    item = dataset[0]
+    observed = np.asarray(
+        [frame for frame in item["audio_codes"] if all(code >= 0 for code in frame)]
+    )
+    assert observed.shape == (nano_frames, 4)
+    assert np.array_equal(observed, nano_codes[:4].T)
 
 
 def test_generated_prefix_changes_inputs_but_keeps_gt_labels(tmp_path: Path, step1_tokenizer):
@@ -540,6 +651,38 @@ def test_q0_q3_sparse_audio_fusion_backpropagates_all_codebooks(tmp_path: Path):
     assert reloaded.config.mimi_codebooks_used == [0, 1, 2, 3]
     assert len(reloaded.additional_audio_embeddings) == 3
     assert torch.equal(reloaded.audio_fusion.weight, planner.audio_fusion.weight)
+
+
+def test_nano_planner_uses_1024_way_audio_embeddings():
+    base = _tiny_planner()
+    qwen = base.language_model
+    planner = MimiQwenPlanner(
+        MimiQwenPlannerConfig(
+            language_model_config=qwen.config.to_dict(),
+            audio_placeholder_id=base.config.audio_placeholder_id,
+            motion_token_ids=base.motion_token_ids.tolist(),
+            audio_codec="moss_audio_tokenizer_nano",
+            audio_sample_rate=48_000,
+            audio_frame_rate=12.5,
+            audio_frame_size=3_840,
+            audio_cardinality=1024,
+            audio_codebooks_stored=16,
+            audio_codebooks_used=[0, 1, 2, 3],
+        ),
+        language_model=qwen,
+    )
+    assert planner.config.audio_codec == "moss_audio_tokenizer_nano"
+    assert planner.config.audio_sample_rate == 48_000
+    assert planner.config.audio_frame_size == 3_840
+    assert planner.config.audio_cardinality == 1024
+    assert planner.config.audio_codebooks_stored == 16
+    assert planner.config.audio_codebooks_used == [0, 1, 2, 3]
+    assert planner.config.mimi_cardinality == 1024
+    assert planner.audio_embedding.num_embeddings == 1024
+    assert all(
+        embedding.num_embeddings == 1024
+        for embedding in planner.additional_audio_embeddings
+    )
 
 
 def test_q0_q3_rejects_partial_audio_frames():

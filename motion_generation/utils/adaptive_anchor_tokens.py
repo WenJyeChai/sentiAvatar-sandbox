@@ -28,6 +28,11 @@ AUDIO_END_TOKEN = "[audio_end]"
 SEED_NEUTRAL_TOKEN = "[seed_neutral]"
 SEED_OBSERVED_TOKEN = "[seed_observed]"
 SEED_PREVIOUS_TOKEN = "[seed_previous]"
+EXPRESSION_TOKEN = "[expression]"
+EXPRESSION_MISSING_TOKEN = "[expression_missing]"
+ACTION_TOKEN = "[action]"
+ACTION_MISSING_TOKEN = "[action_missing]"
+TRANSCRIPT_TOKEN = "[transcript]"
 GAP_TOKENS = tuple(f"[gap_{gap}]" for gap in range(MAX_GAP + 1))
 
 STEP1_CONTROL_TOKENS = (
@@ -41,6 +46,14 @@ STEP1_CONTROL_TOKENS = (
     SEED_OBSERVED_TOKEN,
     SEED_PREVIOUS_TOKEN,
     *GAP_TOKENS,
+)
+
+STRUCTURED_TEXT_TOKENS = (
+    EXPRESSION_TOKEN,
+    EXPRESSION_MISSING_TOKEN,
+    ACTION_TOKEN,
+    ACTION_MISSING_TOKEN,
+    TRANSCRIPT_TOKEN,
 )
 
 SEED_TOKEN_BY_MODE = {
@@ -236,10 +249,18 @@ def plan_from_dense_tokens(
     return SparseAnchorPlan(token_length=len(dense_tokens), times=times, anchors=anchors)
 
 
-def ensure_step1_special_tokens(tokenizer: Any, model: Any | None = None) -> list[str]:
+def ensure_step1_special_tokens(
+    tokenizer: Any,
+    model: Any | None = None,
+    *,
+    include_structured_text: bool = False,
+) -> list[str]:
     """Add only missing Step 1 controls while preserving legacy special tokens."""
 
-    missing = [token for token in STEP1_CONTROL_TOKENS if tokenizer.convert_tokens_to_ids(token) is None]
+    required_tokens = STEP1_CONTROL_TOKENS
+    if include_structured_text:
+        required_tokens = (*required_tokens, *STRUCTURED_TEXT_TOKENS)
+    missing = [token for token in required_tokens if tokenizer.convert_tokens_to_ids(token) is None]
     if missing:
         # Transformers 4.57 renamed ``additional_special_tokens`` to
         # ``extra_special_tokens``. Support both APIs without replacing the

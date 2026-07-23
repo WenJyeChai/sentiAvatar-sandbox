@@ -1,0 +1,81 @@
+paths:
+  base_model: checkpoints/llm
+  output_dir: checkpoints/step1_gap3_6k_nano_q0q3_structured_text_ce
+  data_dir: SuSuInterActs/SuSuInterActs
+  motion_token_dir: SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4
+  audio_token_dir: SuSuInterActs/SuSuInterActs/audio_tokens_moss_nano_48k_12p5hz_16cb
+  text_json: SuSuInterActs/SuSuInterActs/text_data/motion2text.json
+  train_split: motion_generation/data_splits/step1_balanced_seed42/train_step1_main_6000.txt
+  eval_split: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+
+data:
+  fixed_gap: 3
+  max_length: 2560
+  num_workers: 4
+  persistent_workers: false
+  require_causal_motion: true
+  max_duration_mismatch_seconds: 0.12
+  seed_mode: mixed_known
+  neutral_seed_json: null
+  neutral_seed_probability: 0.5
+  previous_seed_probability: 0.5
+  generated_anchor_dir: null
+  generated_prefix_probability: 0.0
+
+audio:
+  codec: moss_audio_tokenizer_nano
+  sample_rate: 48000
+  frame_rate: 12.5
+  frame_size: 3840
+  stored_codebooks: 16
+  cardinality: 1024
+  codebooks_used: [0, 1, 2, 3]
+  fusion: concat_linear
+  sparse_audio_embedding: true
+
+text:
+  serialization: structured_fields
+  fields: [expression, action, transcript]
+  missing_markers: true
+
+# This is a clean teacher-forced CE pretraining run. Generated-history
+# self-forcing remains a separate fine-tuning stage.
+generated_history:
+  enabled: false
+
+auxiliary_loss:
+  type: none
+
+condition_alignment:
+  enabled: false
+  evaluate: false
+  modalities: []
+  eval_modalities: []
+
+training:
+  seed: 42
+  num_train_epochs: 50
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  adam_betas: [0.9, 0.95]
+  adam_epsilon: 1.0e-8
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 10
+  eval_steps: 0
+  save_steps: 235
+  save_best: true
+  early_stopping_patience: 0
+
+monitoring:
+  report_to: wandb
+  wandb_project: sentiavatar-step1-planner
+  wandb_run_name: step1_gap3_6k_nano_q0q3_structured_text_ce
+  wandb_tags: [phase1, pretrain, teacher-forced, main6k, nano, q0q3, structured-text, ce]
+  wandb_mode: online
+  wandb_entity: null

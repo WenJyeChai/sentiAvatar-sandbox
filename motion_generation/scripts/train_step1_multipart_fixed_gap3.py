@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the Phase 1 causal Mimi -> fixed-gap multipart anchor planner."""
+"""Train the causal audio-token -> fixed-gap multipart Step 1 planner."""
 
 from __future__ import annotations
 
@@ -100,27 +100,92 @@ def section(config: Mapping[str, Any], name: str) -> dict[str, Any]:
     return dict(value)
 
 
-def mimi_codebooks_from_config(config: Mapping[str, Any]) -> list[int]:
+def audio_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     audio = section(config, "audio")
     data = section(config, "data")
-    values = audio.get("mimi_codebooks_used", data.get("mimi_codebooks_used", [0]))
+    codec = str(audio.get("codec", data.get("audio_codec", "mimi")))
+    codec_defaults = {
+        "mimi": {
+            "sample_rate": 24_000,
+            "frame_rate": 12.5,
+            "frame_size": 1_920,
+            "stored_codebooks": 8,
+            "cardinality": 2_048,
+        },
+        "moss_audio_tokenizer_nano": {
+            "sample_rate": 48_000,
+            "frame_rate": 12.5,
+            "frame_size": 3_840,
+            "stored_codebooks": 16,
+            "cardinality": 1_024,
+        },
+    }
+    if codec not in codec_defaults:
+        raise ValueError(f"Unsupported Step 1 audio codec: {codec}")
+    defaults = codec_defaults[codec]
+    values = audio.get(
+        "codebooks_used",
+        audio.get(
+            "mimi_codebooks_used",
+            data.get("audio_codebooks_used", data.get("mimi_codebooks_used", [0])),
+        ),
+    )
     if not isinstance(values, list) or not values:
-        raise ValueError("audio.mimi_codebooks_used must be a non-empty list")
+        raise ValueError("audio.codebooks_used must be a non-empty list")
     codebooks = [int(value) for value in values]
     if codebooks[0] != 0:
-        raise ValueError("audio.mimi_codebooks_used must begin with q0")
-    if len(set(codebooks)) != len(codebooks) or any(not 0 <= value < 8 for value in codebooks):
-        raise ValueError("audio.mimi_codebooks_used must contain unique indices in [0, 7]")
+        raise ValueError("audio.codebooks_used must begin with q0")
+    stored_codebooks = int(audio.get("stored_codebooks", defaults["stored_codebooks"]))
+    if len(set(codebooks)) != len(codebooks) or any(
+        not 0 <= value < stored_codebooks for value in codebooks
+    ):
+        raise ValueError(
+            f"audio.codebooks_used must contain unique indices in [0, {stored_codebooks - 1}]"
+        )
     if "mimi_codebooks_used" in audio and "mimi_codebooks_used" in data:
         data_codebooks = [int(value) for value in data["mimi_codebooks_used"]]
         if data_codebooks != codebooks:
             raise ValueError("audio and data Mimi codebook configurations disagree")
+    if "audio_codebooks_used" in data:
+        data_codebooks = [int(value) for value in data["audio_codebooks_used"]]
+        if data_codebooks != codebooks:
+            raise ValueError("audio and data audio-codebook configurations disagree")
     if len(codebooks) > 1:
         if str(audio.get("fusion", "concat_linear")) != "concat_linear":
             raise ValueError("q0-q3 currently supports only concat_linear audio fusion")
         if not bool(audio.get("sparse_audio_embedding", True)):
             raise ValueError("q0-q3 requires sparse_audio_embedding on 24 GB GPUs")
-    return codebooks
+    contract = {
+        "codec": codec,
+        "sample_rate": int(audio.get("sample_rate", defaults["sample_rate"])),
+        "frame_rate": float(audio.get("frame_rate", defaults["frame_rate"])),
+        "frame_size": int(audio.get("frame_size", defaults["frame_size"])),
+        "stored_codebooks": stored_codebooks,
+        "cardinality": int(audio.get("cardinality", defaults["cardinality"])),
+        "codebooks_used": codebooks,
+    }
+    derived_rate = contract["sample_rate"] / contract["frame_size"]
+    if not math.isclose(derived_rate, contract["frame_rate"], rel_tol=0, abs_tol=1e-6):
+        raise ValueError(
+            "audio sample_rate / frame_size must equal frame_rate; "
+            f"got {contract['sample_rate']} / {contract['frame_size']} != "
+            f"{contract['frame_rate']}"
+        )
+    return contract
+
+
+def mimi_codebooks_from_config(config: Mapping[str, Any]) -> list[int]:
+    """Legacy public helper retained for evaluation scripts."""
+
+    return list(audio_contract_from_config(config)["codebooks_used"])
+
+
+def data_config_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    data = section(config, "data")
+    data["_audio_contract"] = audio_contract_from_config(config)
+    text = section(config, "text")
+    data["text_serialization"] = str(text.get("serialization", "raw"))
+    return data
 
 
 def project_path(value: str | Path) -> Path:
@@ -188,8 +253,11 @@ def resolve_data_paths(config: Mapping[str, Any]) -> dict[str, Path]:
         "motion_token_dir": project_path(
             paths.get("motion_token_dir", data_dir / "motion_token_data_multipart_causal_512x4")
         ),
-        "mimi_token_dir": project_path(
-            paths.get("mimi_token_dir", data_dir / "audio_tokens_mimi_12p5hz_8cb")
+        "audio_token_dir": project_path(
+            paths.get(
+                "audio_token_dir",
+                paths.get("mimi_token_dir", data_dir / "audio_tokens_mimi_12p5hz_8cb"),
+            )
         ),
         "text_json": project_path(paths.get("text_json", data_dir / "text_data/motion2text.json")),
         "train_split": project_path(paths.get("train_split", data_dir / "split/train_file_list.txt")),
@@ -199,7 +267,7 @@ def resolve_data_paths(config: Mapping[str, Any]) -> dict[str, Path]:
 
 def validate_paths(paths: Mapping[str, Path], resume: Optional[Path]) -> None:
     files = ("text_json", "train_split", "eval_split")
-    directories = ("motion_token_dir", "mimi_token_dir")
+    directories = ("motion_token_dir", "audio_token_dir")
     if resume is None and not paths["base_model"].is_dir():
         raise FileNotFoundError(f"Base Qwen checkpoint not found: {paths['base_model']}")
     for key in files:
@@ -215,7 +283,8 @@ def build_model_and_tokenizer(
     base_model: Path,
     resume: Optional[Path],
     dtype: torch.dtype,
-    mimi_codebooks_used: list[int],
+    audio_contract: Mapping[str, Any],
+    text_serialization: str = "raw",
 ) -> tuple[MimiQwenPlanner, Any, list[str]]:
     if resume is not None:
         resume = resume.resolve()
@@ -225,16 +294,40 @@ def build_model_and_tokenizer(
             torch_dtype=dtype,
             local_files_only=True,
         )
-        added = ensure_step1_special_tokens(tokenizer)
+        added = ensure_step1_special_tokens(
+            tokenizer,
+            include_structured_text=text_serialization == "structured_fields",
+        )
         if added:
             raise RuntimeError(f"Resume checkpoint is missing Step 1 controls: {added}")
         expected_table = torch.tensor(motion_token_id_table(tokenizer), dtype=torch.long)
         if not torch.equal(model.motion_token_ids.cpu(), expected_table):
             raise RuntimeError("Resume checkpoint motion-token classifier table does not match tokenizer")
-        if list(model.config.mimi_codebooks_used) != list(mimi_codebooks_used):
+        requested_codebooks = list(audio_contract["codebooks_used"])
+        if list(model.config.audio_codebooks_used) != requested_codebooks:
             raise RuntimeError(
-                "Resume checkpoint Mimi codebooks do not match the requested configuration: "
-                f"checkpoint={model.config.mimi_codebooks_used}, requested={mimi_codebooks_used}"
+                "Resume checkpoint audio codebooks do not match the requested configuration: "
+                f"checkpoint={model.config.audio_codebooks_used}, requested={requested_codebooks}"
+            )
+        expected_audio = (
+            str(audio_contract["codec"]),
+            int(audio_contract["sample_rate"]),
+            float(audio_contract["frame_rate"]),
+            int(audio_contract["frame_size"]),
+            int(audio_contract["cardinality"]),
+            int(audio_contract["stored_codebooks"]),
+        )
+        actual_audio = (
+            str(model.config.audio_codec),
+            int(model.config.audio_sample_rate),
+            float(model.config.audio_frame_rate),
+            int(model.config.audio_frame_size),
+            int(model.config.audio_cardinality),
+            int(model.config.audio_codebooks_stored),
+        )
+        if actual_audio != expected_audio:
+            raise RuntimeError(
+                f"Resume checkpoint audio contract {actual_audio} != requested {expected_audio}"
             )
         return model, tokenizer, []
 
@@ -245,7 +338,11 @@ def build_model_and_tokenizer(
         local_files_only=True,
         trust_remote_code=True,
     )
-    added = ensure_step1_special_tokens(tokenizer, language_model)
+    added = ensure_step1_special_tokens(
+        tokenizer,
+        language_model,
+        include_structured_text=text_serialization == "structured_fields",
+    )
     language_model.config.use_cache = False
     table = motion_token_id_table(tokenizer)
     audio_placeholder_id = int(tokenizer.convert_tokens_to_ids(MIMI_FRAME_TOKEN))
@@ -253,9 +350,16 @@ def build_model_and_tokenizer(
         language_model_config=language_model.config.to_dict(),
         audio_placeholder_id=audio_placeholder_id,
         motion_token_ids=table,
-        mimi_cardinality=2_048,
-        mimi_codebooks_stored=8,
-        mimi_codebooks_used=mimi_codebooks_used,
+        audio_codec=str(audio_contract["codec"]),
+        audio_sample_rate=int(audio_contract["sample_rate"]),
+        audio_frame_rate=float(audio_contract["frame_rate"]),
+        audio_frame_size=int(audio_contract["frame_size"]),
+        audio_cardinality=int(audio_contract["cardinality"]),
+        audio_codebooks_stored=int(audio_contract["stored_codebooks"]),
+        audio_codebooks_used=list(audio_contract["codebooks_used"]),
+        mimi_cardinality=int(audio_contract["cardinality"]),
+        mimi_codebooks_stored=int(audio_contract["stored_codebooks"]),
+        mimi_codebooks_used=list(audio_contract["codebooks_used"]),
     )
     model = MimiQwenPlanner(planner_config, language_model=language_model)
     model.tie_weights()
@@ -274,11 +378,25 @@ def build_dataset(
 ) -> Step1FixedGapDataset:
     generated_anchor_dir_value = data_config.get("generated_anchor_dir") if training else None
     generated_anchor_dir = project_path(generated_anchor_dir_value) if generated_anchor_dir_value else None
+    audio_contract = dict(data_config.get("_audio_contract", {}))
+    if not audio_contract:
+        audio_contract = {
+            "codec": str(data_config.get("audio_codec", "mimi")),
+            "sample_rate": int(data_config.get("audio_sample_rate", 24_000)),
+            "frame_rate": float(data_config.get("audio_frame_rate", 12.5)),
+            "frame_size": int(data_config.get("audio_frame_size", 1_920)),
+            "stored_codebooks": int(data_config.get("audio_codebooks_stored", 8)),
+            "cardinality": int(data_config.get("audio_cardinality", 2_048)),
+            "codebooks_used": data_config.get(
+                "audio_codebooks_used",
+                data_config.get("mimi_codebooks_used", [0]),
+            ),
+        }
     return Step1FixedGapDataset(
         names,
         tokenizer=tokenizer,
         motion_token_dir=paths["motion_token_dir"],
-        mimi_token_dir=paths["mimi_token_dir"],
+        mimi_token_dir=paths.get("audio_token_dir", paths.get("mimi_token_dir")),
         text_map=text_map,
         fixed_gap=int(data_config.get("fixed_gap", 3)),
         max_length=int(data_config.get("max_length", 2_048)),
@@ -293,7 +411,15 @@ def build_dataset(
         random_seed=int(data_config.get("random_seed", 42)),
         require_causal_motion=bool(data_config.get("require_causal_motion", True)),
         max_duration_mismatch_seconds=float(data_config.get("max_duration_mismatch_seconds", 0.12)),
-        mimi_codebooks_used=data_config.get("mimi_codebooks_used", [0]),
+        audio_codec=str(audio_contract["codec"]),
+        audio_sample_rate=int(audio_contract["sample_rate"]),
+        audio_frame_rate=float(audio_contract["frame_rate"]),
+        audio_frame_size=int(audio_contract["frame_size"]),
+        audio_codebooks_stored=int(audio_contract["stored_codebooks"]),
+        audio_cardinality=int(audio_contract["cardinality"]),
+        audio_codebooks_used=audio_contract["codebooks_used"],
+        text_serialization=str(data_config.get("text_serialization", "raw")),
+        drop_structured_tags=bool(data_config.get("drop_structured_tags", False)),
     )
 
 
@@ -787,9 +913,8 @@ def main() -> None:
         if args.num_train_epochs <= 0:
             raise ValueError("--num_train_epochs must be positive")
         training["num_train_epochs"] = int(args.num_train_epochs)
-    data_config = section(config, "data")
-    mimi_codebooks_used = mimi_codebooks_from_config(config)
-    data_config["mimi_codebooks_used"] = mimi_codebooks_used
+    data_config = data_config_from_config(config)
+    audio_contract = audio_contract_from_config(config)
     generated_history = validate_generated_history_config(config)
     auxiliary_loss = validate_auxiliary_loss_config(config)
     condition_alignment = validate_condition_alignment_config(config)
@@ -819,7 +944,8 @@ def main() -> None:
         base_model=paths["base_model"],
         resume=model_checkpoint,
         dtype=dtype,
-        mimi_codebooks_used=mimi_codebooks_used,
+        audio_contract=audio_contract,
+        text_serialization=str(data_config.get("text_serialization", "raw")),
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -974,8 +1100,13 @@ def main() -> None:
         print(f"Base/init/resume:  {model_checkpoint or paths['base_model']}")
         print(f"Output:            {paths['output_dir']}")
         print(f"Motion tokens:     {paths['motion_token_dir']}")
-        print(f"Mimi tokens:       {paths['mimi_token_dir']}")
-        print(f"Mimi codebooks:    {mimi_codebooks_used}")
+        print(f"Audio tokens:      {paths['audio_token_dir']}")
+        print(
+            "Audio contract:    "
+            f"{audio_contract['codec']} q{audio_contract['codebooks_used']} "
+            f"({audio_contract['cardinality']}-way, {audio_contract['frame_rate']} Hz)"
+        )
+        print(f"Text serialization:{data_config.get('text_serialization', 'raw')}")
         print(f"Train/eval clips:  {len(train_dataset)}/{len(eval_dataset)}")
         print(f"World size:        {world_size}")
         print(f"Added controls:    {added_tokens}")

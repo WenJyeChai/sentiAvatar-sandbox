@@ -20,11 +20,10 @@ if str(MODULE_DIR) not in sys.path:
 
 from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     build_dataset,
+    data_config_from_config,
     load_config,
     load_neutral_seed,
-    mimi_codebooks_from_config,
     resolve_data_paths,
-    section,
     validate_paths,
 )
 from models.step1_mimi_planner import load_text_map, read_split_names  # noqa: E402
@@ -32,7 +31,7 @@ from utils.adaptive_anchor_tokens import ensure_step1_special_tokens, gap_from_a
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate Phase 1 Mimi/motion/text alignment")
+    parser = argparse.ArgumentParser(description="Validate Step 1 audio/motion/text alignment")
     parser.add_argument(
         "--config",
         type=Path,
@@ -65,6 +64,7 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
     audio_counts: list[int] = []
     target_counts: list[int] = []
     gap_counts = Counter()
+    annotation_patterns = Counter()
     errors = []
     for index, name in enumerate(dataset.names):
         try:
@@ -73,6 +73,7 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
             anchor_counts.append(len(item["anchor_times"]))
             audio_counts.append(item["audio_boundaries"][-1])
             target_counts.append(sum(slot >= 0 for slot in item["target_slots"]))
+            annotation_patterns[item.get("annotation_pattern", "unknown")] += 1
             for left, right in zip(item["anchor_times"], item["anchor_times"][1:]):
                 gap_counts[gap_from_anchor_times(left, right)] += 1
         except Exception as exc:  # collect multiple data failures in one audit
@@ -88,7 +89,9 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
         "reported_errors": errors,
         "sequence_lengths": percentile_summary(sequence_lengths),
         "anchor_counts": percentile_summary(anchor_counts),
+        "audio_frame_counts": percentile_summary(audio_counts),
         "mimi_frame_counts": percentile_summary(audio_counts),
+        "annotation_patterns": dict(sorted(annotation_patterns.items())),
         "supervised_token_counts": percentile_summary(target_counts),
         "gap_counts": {str(key): value for key, value in sorted(gap_counts.items())},
     }
@@ -99,10 +102,12 @@ def main() -> None:
     config = load_config(args.config.resolve())
     paths = resolve_data_paths(config)
     validate_paths(paths, resume=None)
-    data_config = section(config, "data")
-    data_config["mimi_codebooks_used"] = mimi_codebooks_from_config(config)
+    data_config = data_config_from_config(config)
     tokenizer = AutoTokenizer.from_pretrained(paths["base_model"], local_files_only=True)
-    added = ensure_step1_special_tokens(tokenizer)
+    added = ensure_step1_special_tokens(
+        tokenizer,
+        include_structured_text=data_config.get("text_serialization") == "structured_fields",
+    )
     print(f"Tokenizer controls added in-memory: {len(added)}")
     text_map = load_text_map(paths["text_json"])
     neutral_seed = load_neutral_seed(data_config.get("neutral_seed_json"))

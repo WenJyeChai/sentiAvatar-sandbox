@@ -1,10 +1,15 @@
-"""Causal Mimi-conditioned Qwen planner and fixed-gap Phase 1 dataset."""
+"""Causal audio-token-conditioned Qwen planner and fixed-gap Step 1 dataset.
+
+The historical class names retain ``Mimi`` for checkpoint compatibility, while
+the runtime audio contract now supports both Mimi and MOSS Nano tokens.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Optional, Sequence
@@ -18,17 +23,22 @@ from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig, Pre
 from transformers.utils import ModelOutput
 
 from utils.adaptive_anchor_tokens import (
+    ACTION_MISSING_TOKEN,
+    ACTION_TOKEN,
     ANCHOR_TOKEN,
     AUDIO_END_TOKEN,
     BODY_CODEBOOK_SIZE,
     BODY_PART_ORDER,
     BODY_SLOT_COUNT,
+    EXPRESSION_MISSING_TOKEN,
+    EXPRESSION_TOKEN,
     GAP_TOKENS,
     MIMI_FRAME_TOKEN,
     MOTION_END_TOKEN,
     MOTION_START_TOKEN,
     SEED_TOKEN_BY_MODE,
     STEP1_ROLE_TOKEN,
+    TRANSCRIPT_TOKEN,
     body_token,
     causal_audio_boundaries,
     fixed_anchor_times,
@@ -45,6 +55,7 @@ MIMI_FRAME_SIZE = 1_920
 MIMI_CARDINALITY = 2_048
 MIMI_STORED_CODEBOOKS = 8
 MOTION_TOKEN_FPS = 10.0
+STRUCTURED_TAG_PATTERN = re.compile(r"【\s*(表情|动作)\s*[:：]\s*(.*?)\s*】")
 
 
 def canonical_data_path(root: Path, name: str, suffix: str) -> Path:
@@ -67,29 +78,98 @@ def load_text_map(path: Path) -> dict[str, str]:
     return {str(name).replace("\\", "/"): str(text) for name, text in payload.items()}
 
 
-def load_mimi_tokens(path: Path) -> dict[str, Any]:
+def load_audio_tokens(
+    path: Path,
+    *,
+    codec: str,
+    sample_rate: int,
+    frame_rate: float,
+    frame_size: int,
+    stored_codebooks: int,
+    cardinality: int,
+) -> dict[str, Any]:
     with np.load(path, allow_pickle=False) as payload:
         codes = np.asarray(payload["codes"])
         result = {key: payload[key].item() for key in payload.files if key != "codes"}
-    if codes.ndim != 2 or codes.shape[0] != MIMI_STORED_CODEBOOKS:
-        raise ValueError(f"Expected Mimi codes [8, T], got {codes.shape} in {path}")
+    if codes.ndim != 2 or codes.shape[0] != int(stored_codebooks):
+        raise ValueError(
+            f"Expected {codec} codes [{stored_codebooks}, T], got {codes.shape} in {path}"
+        )
     if not np.issubdtype(codes.dtype, np.integer):
-        raise ValueError(f"Mimi codes must be integer, got {codes.dtype} in {path}")
-    if codes.size and (int(codes.min()) < 0 or int(codes.max()) >= MIMI_CARDINALITY):
-        raise ValueError(f"Mimi code outside [0, {MIMI_CARDINALITY - 1}] in {path}")
+        raise ValueError(f"{codec} codes must be integer, got {codes.dtype} in {path}")
+    if codes.size and (int(codes.min()) < 0 or int(codes.max()) >= int(cardinality)):
+        raise ValueError(f"{codec} code outside [0, {cardinality - 1}] in {path}")
     expected = {
-        "sample_rate": MIMI_SAMPLE_RATE,
-        "frame_size": MIMI_FRAME_SIZE,
-        "num_codebooks": MIMI_STORED_CODEBOOKS,
-        "cardinality": MIMI_CARDINALITY,
+        "sample_rate": int(sample_rate),
+        "frame_size": int(frame_size),
+        "num_codebooks": int(stored_codebooks),
+        "cardinality": int(cardinality),
     }
     for key, value in expected.items():
         if int(result.get(key, -1)) != value:
-            raise ValueError(f"Mimi metadata {key}={result.get(key)}; expected {value} in {path}")
-    if not math.isclose(float(result.get("frame_rate", -1)), MIMI_FRAME_RATE):
-        raise ValueError(f"Mimi frame rate mismatch in {path}")
+            raise ValueError(
+                f"{codec} metadata {key}={result.get(key)}; expected {value} in {path}"
+            )
+    if not math.isclose(float(result.get("frame_rate", -1)), float(frame_rate)):
+        raise ValueError(
+            f"{codec} frame rate {result.get('frame_rate')}; expected {frame_rate} in {path}"
+        )
     result["codes"] = codes.astype(np.int64, copy=False)
     return result
+
+
+def load_mimi_tokens(path: Path) -> dict[str, Any]:
+    """Backward-compatible loader for existing Mimi checkpoints and tests."""
+
+    return load_audio_tokens(
+        path,
+        codec="mimi",
+        sample_rate=MIMI_SAMPLE_RATE,
+        frame_rate=MIMI_FRAME_RATE,
+        frame_size=MIMI_FRAME_SIZE,
+        stored_codebooks=MIMI_STORED_CODEBOOKS,
+        cardinality=MIMI_CARDINALITY,
+    )
+
+
+@dataclass(frozen=True)
+class StructuredText:
+    expression: Optional[str]
+    action: Optional[str]
+    transcript: str
+
+    @property
+    def annotation_pattern(self) -> str:
+        if self.expression and self.action:
+            return "expression+action"
+        if self.expression:
+            return "expression-only"
+        if self.action:
+            return "action-only"
+        return "no-tags"
+
+
+def parse_structured_text(raw_text: str) -> StructuredText:
+    """Extract optional Chinese expression/action tags without conflating absence.
+
+    Explicit values such as ``【动作：无动作】`` remain present action
+    annotations. Repeated annotations are retained in source order and joined
+    with a Chinese semicolon.
+    """
+
+    values: dict[str, list[str]] = {"表情": [], "动作": []}
+    for match in STRUCTURED_TAG_PATTERN.finditer(str(raw_text)):
+        kind, value = match.groups()
+        value = " ".join(value.split()).strip()
+        if value and value not in values[kind]:
+            values[kind].append(value)
+    transcript = STRUCTURED_TAG_PATTERN.sub("", str(raw_text))
+    transcript = " ".join(transcript.split()).strip()
+    return StructuredText(
+        expression="；".join(values["表情"]) or None,
+        action="；".join(values["动作"]) or None,
+        transcript=transcript,
+    )
 
 
 def load_motion_tokens(path: Path, require_causal: bool = True) -> tuple[list[list[int]], dict[str, Any]]:
@@ -136,18 +216,22 @@ class Step1Sequence:
     target_slots: list[int]
     motion_local_labels: list[int]
     text_mask: list[int]
+    expression_mask: list[int]
+    action_mask: list[int]
+    transcript_mask: list[int]
     audio_anchor_ids: list[int]
     target_anchor_ids: list[int]
     anchor_times: tuple[int, ...]
     audio_boundaries: tuple[int, ...]
     generated_prefix_anchors: int
+    annotation_pattern: str
 
 
 class Step1FixedGapDataset(Dataset):
     """One causal, interleaved planner sequence per utterance.
 
     Text is fully visible at the beginning.  A runtime gap control is followed
-    by only the new causal Mimi frames for that interval, then a 16-slot anchor.
+    by only the new causal audio-token frames for that interval, then a 16-slot anchor.
     Only anchor slots are supervised in Phase 1.
     """
 
@@ -171,6 +255,15 @@ class Step1FixedGapDataset(Dataset):
         require_causal_motion: bool = True,
         max_duration_mismatch_seconds: float = 0.12,
         mimi_codebooks_used: Optional[Sequence[int]] = None,
+        audio_codec: str = "mimi",
+        audio_sample_rate: int = MIMI_SAMPLE_RATE,
+        audio_frame_rate: float = MIMI_FRAME_RATE,
+        audio_frame_size: int = MIMI_FRAME_SIZE,
+        audio_codebooks_stored: int = MIMI_STORED_CODEBOOKS,
+        audio_cardinality: int = MIMI_CARDINALITY,
+        audio_codebooks_used: Optional[Sequence[int]] = None,
+        text_serialization: str = "raw",
+        drop_structured_tags: bool = False,
     ) -> None:
         if seed_mode not in {"observed", "previous", "neutral", "mixed_known", "mixed_all"}:
             raise ValueError(
@@ -202,15 +295,34 @@ class Step1FixedGapDataset(Dataset):
         self.random_seed = int(random_seed)
         self.require_causal_motion = bool(require_causal_motion)
         self.max_duration_mismatch_seconds = float(max_duration_mismatch_seconds)
-        self.mimi_codebooks_used = tuple(int(value) for value in (mimi_codebooks_used or [0]))
-        if not self.mimi_codebooks_used:
-            raise ValueError("At least one Mimi codebook must be used")
-        if len(set(self.mimi_codebooks_used)) != len(self.mimi_codebooks_used):
-            raise ValueError("Mimi codebook indices must be unique")
-        if any(not 0 <= value < MIMI_STORED_CODEBOOKS for value in self.mimi_codebooks_used):
+        self.audio_codec = str(audio_codec)
+        self.audio_sample_rate = int(audio_sample_rate)
+        self.audio_frame_rate = float(audio_frame_rate)
+        self.audio_frame_size = int(audio_frame_size)
+        self.audio_codebooks_stored = int(audio_codebooks_stored)
+        self.audio_cardinality = int(audio_cardinality)
+        selected_codebooks = audio_codebooks_used
+        if selected_codebooks is None:
+            selected_codebooks = mimi_codebooks_used or [0]
+        self.audio_codebooks_used = tuple(int(value) for value in selected_codebooks)
+        # Legacy alias used by rollout/evaluation helpers.
+        self.mimi_codebooks_used = self.audio_codebooks_used
+        if not self.audio_codebooks_used:
+            raise ValueError("At least one audio codebook must be used")
+        if len(set(self.audio_codebooks_used)) != len(self.audio_codebooks_used):
+            raise ValueError("Audio codebook indices must be unique")
+        if any(not 0 <= value < self.audio_codebooks_stored for value in self.audio_codebooks_used):
             raise ValueError(
-                f"Mimi codebook indices must be in [0, {MIMI_STORED_CODEBOOKS - 1}]"
+                f"Audio codebook indices must be in [0, {self.audio_codebooks_stored - 1}]"
             )
+        if self.audio_sample_rate <= 0 or self.audio_frame_rate <= 0 or self.audio_frame_size <= 0:
+            raise ValueError("Audio sample rate, frame rate, and frame size must be positive")
+        if self.audio_codebooks_stored <= 0 or self.audio_cardinality <= 1:
+            raise ValueError("Audio codebook count/cardinality is invalid")
+        if text_serialization not in {"raw", "structured_fields"}:
+            raise ValueError("text_serialization must be raw or structured_fields")
+        self.text_serialization = str(text_serialization)
+        self.drop_structured_tags = bool(drop_structured_tags)
         self.epoch = 0
         self._single_token_ids = self._build_single_token_ids()
 
@@ -225,6 +337,16 @@ class Step1FixedGapDataset(Dataset):
             *GAP_TOKENS,
             *SEED_TOKEN_BY_MODE.values(),
         }
+        if self.text_serialization == "structured_fields":
+            tokens.update(
+                {
+                    EXPRESSION_TOKEN,
+                    EXPRESSION_MISSING_TOKEN,
+                    ACTION_TOKEN,
+                    ACTION_MISSING_TOKEN,
+                    TRANSCRIPT_TOKEN,
+                }
+            )
         result = {}
         for token in tokens:
             encoded = self.tokenizer.encode(token, add_special_tokens=False)
@@ -278,6 +400,89 @@ class Step1FixedGapDataset(Dataset):
             )
         return load_generated_anchors(path)
 
+    def _build_text_prefix(
+        self,
+        raw_text: str,
+    ) -> tuple[list[int], list[int], list[int], list[int], list[int], str]:
+        parsed = parse_structured_text(raw_text)
+        if self.text_serialization == "raw":
+            prompt = f"Human: {STEP1_ROLE_TOKEN}{raw_text}<|im_end|>\nAssistant:"
+            input_ids = [int(value) for value in self.tokenizer.encode(prompt, add_special_tokens=False)]
+            role_id = self._single_token_ids[STEP1_ROLE_TOKEN]
+            im_end_ids = self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
+            if len(im_end_ids) != 1:
+                raise ValueError("<|im_end|> must be a single token")
+            try:
+                role_position = input_ids.index(role_id)
+                text_end = input_ids.index(int(im_end_ids[0]), role_position + 1)
+            except ValueError as error:
+                raise ValueError("Could not locate the transcript span in the Step 1 prompt") from error
+            text_mask = [
+                int(role_position < position < text_end)
+                for position in range(len(input_ids))
+            ]
+            zeros = [0] * len(input_ids)
+            return (
+                input_ids,
+                text_mask,
+                zeros.copy(),
+                zeros.copy(),
+                text_mask.copy(),
+                parsed.annotation_pattern,
+            )
+
+        input_ids: list[int] = []
+        expression_mask: list[int] = []
+        action_mask: list[int] = []
+        transcript_mask: list[int] = []
+
+        def append_ids(ids: Sequence[int], field: Optional[str] = None) -> None:
+            values = [int(value) for value in ids]
+            input_ids.extend(values)
+            expression_mask.extend([int(field == "expression")] * len(values))
+            action_mask.extend([int(field == "action")] * len(values))
+            transcript_mask.extend([int(field == "transcript")] * len(values))
+
+        def append_text(text: str, field: Optional[str] = None) -> None:
+            append_ids(self.tokenizer.encode(text, add_special_tokens=False), field)
+
+        def append_control(token: str) -> None:
+            append_ids([self._single_token_ids[token]])
+
+        expression = None if self.drop_structured_tags else parsed.expression
+        action = None if self.drop_structured_tags else parsed.action
+        append_text("Human: ")
+        append_control(STEP1_ROLE_TOKEN)
+        append_text("\n")
+        append_control(EXPRESSION_TOKEN if expression else EXPRESSION_MISSING_TOKEN)
+        if expression:
+            append_text(f" {expression}", field="expression")
+        append_text("\n")
+        append_control(ACTION_TOKEN if action else ACTION_MISSING_TOKEN)
+        if action:
+            append_text(f" {action}", field="action")
+        append_text("\n")
+        append_control(TRANSCRIPT_TOKEN)
+        if parsed.transcript:
+            append_text(f" {parsed.transcript}", field="transcript")
+        append_text("<|im_end|>\nAssistant:")
+        text_mask = [
+            int(bool(expression_value or action_value or transcript_value))
+            for expression_value, action_value, transcript_value in zip(
+                expression_mask,
+                action_mask,
+                transcript_mask,
+            )
+        ]
+        return (
+            input_ids,
+            text_mask,
+            expression_mask,
+            action_mask,
+            transcript_mask,
+            parsed.annotation_pattern,
+        )
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         sequence = self.build_sequence(self.names[index])
         return {
@@ -287,23 +492,35 @@ class Step1FixedGapDataset(Dataset):
             "target_slots": sequence.target_slots,
             "motion_local_labels": sequence.motion_local_labels,
             "text_mask": sequence.text_mask,
+            "expression_mask": sequence.expression_mask,
+            "action_mask": sequence.action_mask,
+            "transcript_mask": sequence.transcript_mask,
             "audio_anchor_ids": sequence.audio_anchor_ids,
             "target_anchor_ids": sequence.target_anchor_ids,
             "anchor_times": sequence.anchor_times,
             "audio_boundaries": sequence.audio_boundaries,
             "generated_prefix_anchors": sequence.generated_prefix_anchors,
+            "annotation_pattern": sequence.annotation_pattern,
         }
 
     def build_sequence(self, name: str) -> Step1Sequence:
         motion_path = canonical_data_path(self.motion_token_dir, name, ".json")
         audio_path = canonical_data_path(self.mimi_token_dir, name, ".npz")
         motion_tokens, _ = load_motion_tokens(motion_path, require_causal=self.require_causal_motion)
-        mimi_payload = load_mimi_tokens(audio_path)
-        mimi_codes = np.asarray(mimi_payload["codes"])[list(self.mimi_codebooks_used)]
+        audio_payload = load_audio_tokens(
+            audio_path,
+            codec=self.audio_codec,
+            sample_rate=self.audio_sample_rate,
+            frame_rate=self.audio_frame_rate,
+            frame_size=self.audio_frame_size,
+            stored_codebooks=self.audio_codebooks_stored,
+            cardinality=self.audio_cardinality,
+        )
+        audio_token_codes = np.asarray(audio_payload["codes"])[list(self.audio_codebooks_used)]
         if name not in self.text_map:
             raise KeyError(f"Missing text annotation for {name}")
 
-        audio_duration = int(mimi_payload["num_samples"]) / MIMI_SAMPLE_RATE
+        audio_duration = int(audio_payload["num_samples"]) / self.audio_sample_rate
         motion_duration = len(motion_tokens) / MOTION_TOKEN_FPS
         mismatch = abs(audio_duration - motion_duration)
         if mismatch > self.max_duration_mismatch_seconds:
@@ -315,30 +532,26 @@ class Step1FixedGapDataset(Dataset):
         anchor_times = fixed_anchor_times(len(motion_tokens), gap=self.fixed_gap)
         audio_boundaries = causal_audio_boundaries(
             anchor_times,
-            audio_frames=mimi_codes.shape[1],
-            audio_fps=MIMI_FRAME_RATE,
+            audio_frames=audio_token_codes.shape[1],
+            audio_fps=self.audio_frame_rate,
             motion_fps=MOTION_TOKEN_FPS,
         )
         if len(anchor_times) != len(audio_boundaries):
             raise AssertionError("Anchor/audio boundary count mismatch")
         generated = self._generated_anchors(name)
 
-        prompt = f"Human: {STEP1_ROLE_TOKEN}{self.text_map[name]}<|im_end|>\nAssistant:"
-        input_ids = [int(value) for value in self.tokenizer.encode(prompt, add_special_tokens=False)]
-        role_id = self._single_token_ids[STEP1_ROLE_TOKEN]
+        (
+            input_ids,
+            text_mask,
+            expression_mask,
+            action_mask,
+            transcript_mask,
+            annotation_pattern,
+        ) = self._build_text_prefix(self.text_map[name])
         im_end_ids = self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
         if len(im_end_ids) != 1:
             raise ValueError("<|im_end|> must be a single token")
-        try:
-            role_position = input_ids.index(role_id)
-            text_end = input_ids.index(int(im_end_ids[0]), role_position + 1)
-        except ValueError as error:
-            raise ValueError("Could not locate the transcript span in the Step 1 prompt") from error
-        text_mask = [
-            int(role_position < position < text_end)
-            for position in range(len(input_ids))
-        ]
-        empty_audio = [-1] * len(self.mimi_codebooks_used)
+        empty_audio = [-1] * len(self.audio_codebooks_used)
         audio_codes = [empty_audio.copy() for _ in input_ids]
         target_slots = [-1] * len(input_ids)
         motion_local_labels = [IGNORE_INDEX] * len(input_ids)
@@ -351,6 +564,9 @@ class Step1FixedGapDataset(Dataset):
             target_slots.append(-1)
             motion_local_labels.append(IGNORE_INDEX)
             text_mask.append(0)
+            expression_mask.append(0)
+            action_mask.append(0)
+            transcript_mask.append(0)
             audio_anchor_ids.append(-1)
             target_anchor_ids.append(-1)
 
@@ -370,6 +586,9 @@ class Step1FixedGapDataset(Dataset):
                 input_ids.append(int(token_id))
                 audio_codes.append(empty_audio.copy())
                 text_mask.append(0)
+                expression_mask.append(0)
+                action_mask.append(0)
+                transcript_mask.append(0)
                 audio_anchor_ids.append(-1)
                 if target_anchor is None:
                     target_slots.append(-1)
@@ -393,7 +612,7 @@ class Step1FixedGapDataset(Dataset):
             gap = gap_from_anchor_times(left_time, target_time)
             append_control(GAP_TOKENS[gap])
             next_audio_boundary = audio_boundaries[anchor_index]
-            for frame_codes in mimi_codes[:, audio_cursor:next_audio_boundary].T:
+            for frame_codes in audio_token_codes[:, audio_cursor:next_audio_boundary].T:
                 append_control(MIMI_FRAME_TOKEN)
                 audio_codes[-1] = [int(code) for code in frame_codes]
                 audio_anchor_ids[-1] = anchor_index - 1
@@ -416,10 +635,10 @@ class Step1FixedGapDataset(Dataset):
                 anchor_group=anchor_index - 1,
             )
 
-        if audio_cursor != mimi_codes.shape[1]:
+        if audio_cursor != audio_token_codes.shape[1]:
             raise AssertionError(
-                f"Did not consume all Mimi frames for {name}: "
-                f"{audio_cursor}/{mimi_codes.shape[1]}"
+                f"Did not consume all {self.audio_codec} frames for {name}: "
+                f"{audio_cursor}/{audio_token_codes.shape[1]}"
             )
         append_control(AUDIO_END_TOKEN)
         append_control(MOTION_END_TOKEN)
@@ -428,6 +647,9 @@ class Step1FixedGapDataset(Dataset):
         target_slots.append(-1)
         motion_local_labels.append(IGNORE_INDEX)
         text_mask.append(0)
+        expression_mask.append(0)
+        action_mask.append(0)
+        transcript_mask.append(0)
         audio_anchor_ids.append(-1)
         target_anchor_ids.append(-1)
 
@@ -437,6 +659,9 @@ class Step1FixedGapDataset(Dataset):
             len(target_slots),
             len(motion_local_labels),
             len(text_mask),
+            len(expression_mask),
+            len(action_mask),
+            len(transcript_mask),
             len(audio_anchor_ids),
             len(target_anchor_ids),
         }
@@ -458,11 +683,15 @@ class Step1FixedGapDataset(Dataset):
             target_slots=target_slots,
             motion_local_labels=motion_local_labels,
             text_mask=text_mask,
+            expression_mask=expression_mask,
+            action_mask=action_mask,
+            transcript_mask=transcript_mask,
             audio_anchor_ids=audio_anchor_ids,
             target_anchor_ids=target_anchor_ids,
             anchor_times=anchor_times,
             audio_boundaries=audio_boundaries,
             generated_prefix_anchors=generated_prefix_anchors,
+            annotation_pattern=annotation_pattern,
         )
 
 
@@ -499,7 +728,7 @@ class Step1PlannerCollator:
             for frame_codes in example["audio_codes"]
         }
         if len(codebook_counts) != 1:
-            raise ValueError(f"Examples use inconsistent Mimi codebook counts: {codebook_counts}")
+            raise ValueError(f"Examples use inconsistent audio codebook counts: {codebook_counts}")
         codebook_count = codebook_counts.pop()
         padded_audio = []
         for example in examples:
@@ -513,9 +742,15 @@ class Step1PlannerCollator:
             "target_slots": padded("target_slots", -1),
             "motion_local_labels": padded("motion_local_labels", IGNORE_INDEX),
             "text_mask": padded_optional("text_mask", 0).bool(),
+            "expression_mask": padded_optional("expression_mask", 0).bool(),
+            "action_mask": padded_optional("action_mask", 0).bool(),
+            "transcript_mask": padded_optional("transcript_mask", 0).bool(),
             "audio_anchor_ids": padded_optional("audio_anchor_ids", -1),
             "target_anchor_ids": padded_optional("target_anchor_ids", -1),
             "names": [str(example["name"]) for example in examples],
+            "annotation_patterns": [
+                str(example.get("annotation_pattern", "unknown")) for example in examples
+            ],
             "generated_prefix_anchors": torch.tensor(
                 [int(example["generated_prefix_anchors"]) for example in examples], dtype=torch.long
             ),
@@ -534,6 +769,13 @@ class MimiQwenPlannerConfig(PretrainedConfig):
         mimi_cardinality: int = MIMI_CARDINALITY,
         mimi_codebooks_stored: int = MIMI_STORED_CODEBOOKS,
         mimi_codebooks_used: Optional[Sequence[int]] = None,
+        audio_codec: str = "mimi",
+        audio_sample_rate: int = MIMI_SAMPLE_RATE,
+        audio_frame_rate: float = MIMI_FRAME_RATE,
+        audio_frame_size: int = MIMI_FRAME_SIZE,
+        audio_cardinality: Optional[int] = None,
+        audio_codebooks_stored: Optional[int] = None,
+        audio_codebooks_used: Optional[Sequence[int]] = None,
         **kwargs: Any,
     ) -> None:
         kwargs.setdefault("tie_word_embeddings", False)
@@ -541,9 +783,25 @@ class MimiQwenPlannerConfig(PretrainedConfig):
         self.language_model_config = language_model_config or {}
         self.audio_placeholder_id = int(audio_placeholder_id)
         self.motion_token_ids = [list(map(int, row)) for row in (motion_token_ids or [])]
-        self.mimi_cardinality = int(mimi_cardinality)
-        self.mimi_codebooks_stored = int(mimi_codebooks_stored)
-        self.mimi_codebooks_used = list(map(int, mimi_codebooks_used or [0]))
+        self.audio_codec = str(audio_codec)
+        self.audio_sample_rate = int(audio_sample_rate)
+        self.audio_frame_rate = float(audio_frame_rate)
+        self.audio_frame_size = int(audio_frame_size)
+        self.audio_cardinality = int(
+            mimi_cardinality if audio_cardinality is None else audio_cardinality
+        )
+        self.audio_codebooks_stored = int(
+            mimi_codebooks_stored if audio_codebooks_stored is None else audio_codebooks_stored
+        )
+        selected_codebooks = audio_codebooks_used
+        if selected_codebooks is None:
+            selected_codebooks = mimi_codebooks_used or [0]
+        self.audio_codebooks_used = list(map(int, selected_codebooks))
+        # Preserve legacy config fields so existing rollout/evaluation code and
+        # old Mimi checkpoints remain loadable.
+        self.mimi_cardinality = self.audio_cardinality
+        self.mimi_codebooks_stored = self.audio_codebooks_stored
+        self.mimi_codebooks_used = list(self.audio_codebooks_used)
 
 
 @dataclass
@@ -563,7 +821,7 @@ class MimiQwenPlannerOutput(ModelOutput):
 
 
 class MimiQwenPlanner(PreTrainedModel):
-    """Qwen with codebook-specific causal Mimi embeddings and slot CE."""
+    """Qwen with codebook-specific causal audio embeddings and slot CE."""
 
     config_class = MimiQwenPlannerConfig
     base_model_prefix = "language_model"
@@ -582,24 +840,27 @@ class MimiQwenPlanner(PreTrainedModel):
         self.language_model = language_model
         hidden_size = int(language_model.config.hidden_size)
         embedding_dtype = language_model.get_input_embeddings().weight.dtype
-        if not config.mimi_codebooks_used:
-            raise ValueError("At least one Mimi codebook must be configured")
-        if config.mimi_codebooks_used[0] != 0:
-            raise ValueError("The first configured Mimi codebook must be q0")
-        if len(set(config.mimi_codebooks_used)) != len(config.mimi_codebooks_used):
-            raise ValueError("Configured Mimi codebooks must be unique")
-        if any(not 0 <= value < config.mimi_codebooks_stored for value in config.mimi_codebooks_used):
-            raise ValueError("Configured Mimi codebook index is outside the stored Mimi streams")
+        if not config.audio_codebooks_used:
+            raise ValueError("At least one audio codebook must be configured")
+        if config.audio_codebooks_used[0] != 0:
+            raise ValueError("The first configured audio codebook must be q0")
+        if len(set(config.audio_codebooks_used)) != len(config.audio_codebooks_used):
+            raise ValueError("Configured audio codebooks must be unique")
+        if any(
+            not 0 <= value < config.audio_codebooks_stored
+            for value in config.audio_codebooks_used
+        ):
+            raise ValueError("Configured audio codebook index is outside the stored streams")
 
         # Preserve the historical q0 parameter name so q0-only checkpoints remain loadable.
         self.audio_embedding = nn.Embedding(
-            config.mimi_cardinality, hidden_size, dtype=embedding_dtype
+            config.audio_cardinality, hidden_size, dtype=embedding_dtype
         )
         self.additional_audio_embeddings = nn.ModuleList(
-            nn.Embedding(config.mimi_cardinality, hidden_size, dtype=embedding_dtype)
-            for _ in config.mimi_codebooks_used[1:]
+            nn.Embedding(config.audio_cardinality, hidden_size, dtype=embedding_dtype)
+            for _ in config.audio_codebooks_used[1:]
         )
-        codebook_count = len(config.mimi_codebooks_used)
+        codebook_count = len(config.audio_codebooks_used)
         self.audio_fusion = (
             nn.Linear(
                 codebook_count * hidden_size,
@@ -664,6 +925,13 @@ class MimiQwenPlanner(PreTrainedModel):
         torch_dtype: Optional[torch.dtype] = None,
         local_files_only: bool = True,
         mimi_codebooks_used: Optional[Sequence[int]] = None,
+        audio_codec: str = "mimi",
+        audio_sample_rate: int = MIMI_SAMPLE_RATE,
+        audio_frame_rate: float = MIMI_FRAME_RATE,
+        audio_frame_size: int = MIMI_FRAME_SIZE,
+        audio_cardinality: int = MIMI_CARDINALITY,
+        audio_codebooks_stored: int = MIMI_STORED_CODEBOOKS,
+        audio_codebooks_used: Optional[Sequence[int]] = None,
     ) -> "MimiQwenPlanner":
         language_model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -675,8 +943,15 @@ class MimiQwenPlanner(PreTrainedModel):
             language_model_config=language_model.config.to_dict(),
             audio_placeholder_id=audio_placeholder_id,
             motion_token_ids=motion_token_ids,
-            mimi_cardinality=MIMI_CARDINALITY,
-            mimi_codebooks_stored=MIMI_STORED_CODEBOOKS,
+            audio_codec=audio_codec,
+            audio_sample_rate=audio_sample_rate,
+            audio_frame_rate=audio_frame_rate,
+            audio_frame_size=audio_frame_size,
+            audio_cardinality=audio_cardinality,
+            audio_codebooks_stored=audio_codebooks_stored,
+            audio_codebooks_used=audio_codebooks_used or mimi_codebooks_used or [0],
+            mimi_cardinality=audio_cardinality,
+            mimi_codebooks_stored=audio_codebooks_stored,
             mimi_codebooks_used=mimi_codebooks_used or [0],
         )
         return cls(config, language_model=language_model)
@@ -704,7 +979,7 @@ class MimiQwenPlanner(PreTrainedModel):
     def prepare_input_embeddings(self, input_ids: torch.Tensor, audio_codes: torch.Tensor) -> torch.Tensor:
         if audio_codes.ndim == input_ids.ndim:
             audio_codes = audio_codes.unsqueeze(-1)
-        expected_audio_shape = (*input_ids.shape, len(self.config.mimi_codebooks_used))
+        expected_audio_shape = (*input_ids.shape, len(self.config.audio_codebooks_used))
         if tuple(audio_codes.shape) != expected_audio_shape:
             raise ValueError(
                 f"audio_codes must have shape {expected_audio_shape}, got {tuple(audio_codes.shape)}"
@@ -713,13 +988,13 @@ class MimiQwenPlanner(PreTrainedModel):
         code_mask = audio_codes.ge(0)
         complete_code_mask = code_mask.all(dim=-1)
         if not torch.equal(code_mask.any(dim=-1), complete_code_mask):
-            raise ValueError("Every Mimi frame must provide all configured codebooks")
+            raise ValueError("Every audio frame must provide all configured codebooks")
         if not torch.equal(placeholder_mask, complete_code_mask):
             raise ValueError("audio_codes must be set exactly at [mimi_frame] placeholder positions")
         if complete_code_mask.any():
             selected = audio_codes[complete_code_mask]
-            if int(selected.min()) < 0 or int(selected.max()) >= self.config.mimi_cardinality:
-                raise ValueError("Mimi input code is outside the configured cardinality")
+            if int(selected.min()) < 0 or int(selected.max()) >= self.config.audio_cardinality:
+                raise ValueError("Audio input code is outside the configured cardinality")
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
         if not bool(complete_code_mask.any()):
             return text_embeddings

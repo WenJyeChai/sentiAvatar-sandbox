@@ -32,12 +32,11 @@ from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     build_condition_corruption,
     build_dataset,
     corrupted_model_inputs,
+    data_config_from_config,
     load_neutral_seed,
-    mimi_codebooks_from_config,
     move_batch,
     move_condition_metadata,
     resolve_data_paths,
-    section,
     validate_condition_alignment_config,
 )
 from utils.step1_condition_alignment import (  # noqa: E402
@@ -193,8 +192,7 @@ def main() -> None:
     alignment["evaluate"] = True
     alignment["eval_modalities"] = ["audio", "text"]
     paths = resolve_data_paths(config)
-    data_config = section(config, "data")
-    data_config["mimi_codebooks_used"] = mimi_codebooks_from_config(config)
+    data_config = data_config_from_config(config)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
     dtype = torch.float32 if args.no_bf16 else torch.bfloat16
     model = MimiQwenPlanner.from_pretrained(
@@ -265,4 +263,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

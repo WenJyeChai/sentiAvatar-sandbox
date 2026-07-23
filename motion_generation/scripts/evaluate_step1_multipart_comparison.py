@@ -38,7 +38,9 @@ from models.step1_mimi_planner import (  # noqa: E402
     read_split_names,
 )
 from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
+    audio_contract_from_config,
     build_dataset,
+    data_config_from_config,
     load_neutral_seed,
     resolve_data_paths,
     section,
@@ -186,13 +188,8 @@ def make_dataset_and_loader(
     preserve_times: bool,
 ):
     paths = resolve_data_paths(source_config)
-    data_config = section(source_config, "data")
+    data_config = data_config_from_config(source_config)
     training_config = section(source_config, "training")
-    model_audio = section(source_config, "audio")
-    if "mimi_codebooks_used" not in data_config:
-        data_config["mimi_codebooks_used"] = model_audio.get(
-            "mimi_codebooks_used", [0]
-        )
     data_config["random_seed"] = int(training_config.get("seed", 42))
     tokenizer = AutoTokenizer.from_pretrained(
         checkpoint, local_files_only=True, trust_remote_code=True
@@ -300,7 +297,7 @@ def main() -> None:
         candidate_paths = resolve_data_paths(config)
         candidate_data = section(config, "data")
         candidate_training = section(config, "training")
-        candidate_audio = section(config, "audio")
+        candidate_audio = audio_contract_from_config(config)
         candidate_generated = section(config, "generated_history")
         train_names = read_split_names(candidate_paths["train_split"])
         if int(candidate_data.get("fixed_gap", 3)) != fixed_gap:
@@ -309,15 +306,18 @@ def main() -> None:
             "motion_token_dir"
         ].resolve():
             raise ValueError(f"{label} uses a different multipart token export")
-        codebooks = candidate_data.get(
-            "mimi_codebooks_used", candidate_audio.get("mimi_codebooks_used", [0])
-        )
+        codebooks = candidate_audio["codebooks_used"]
         contracts.append(
             {
                 "checkpoint": label,
                 "checkpoint_path": str(checkpoint),
                 "training_clips": len(train_names),
                 "configured_epochs": int(candidate_training.get("num_train_epochs", 0)),
+                "audio_codec": candidate_audio["codec"],
+                "audio_cardinality": int(candidate_audio["cardinality"]),
+                "audio_codebooks_stored": int(candidate_audio["stored_codebooks"]),
+                "audio_codebooks_used": json.dumps(list(codebooks)),
+                # Kept so older notebooks reading this column continue to work.
                 "mimi_codebooks_used": json.dumps(list(codebooks)),
                 "generated_history_enabled": bool(candidate_generated.get("enabled", False)),
                 "generated_history_max_probability": float(
