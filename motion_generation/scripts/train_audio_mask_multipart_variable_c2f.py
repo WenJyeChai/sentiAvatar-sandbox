@@ -1055,15 +1055,21 @@ def validate_motion_token_contract(
 
     if require_causal:
         causal_by_part = manifest.get("causal_by_part")
-        if manifest.get("body_causal") is not True or not isinstance(
-            causal_by_part, Mapping
-        ):
+        if manifest.get("body_causal") is not True:
             raise ValueError("Motion-token manifest does not certify body_causal=true")
-        noncausal = [
-            part for part in expected_parts if causal_by_part.get(part) is not True
-        ]
-        if noncausal:
-            raise ValueError(f"Motion-token manifest has noncausal parts: {noncausal}")
+        # Shard manifests contain the per-part map, while the consolidated
+        # verifier historically retained only their derived body_causal flag.
+        # body_causal=true already means every required body part was causal.
+        if causal_by_part is not None:
+            if not isinstance(causal_by_part, Mapping):
+                raise ValueError("Motion-token causal_by_part field is malformed")
+            noncausal = [
+                part for part in expected_parts if causal_by_part.get(part) is not True
+            ]
+            if noncausal:
+                raise ValueError(
+                    f"Motion-token manifest has noncausal parts: {noncausal}"
+                )
 
     if require_checkpoint_match:
         if checkpoint_paths is None:

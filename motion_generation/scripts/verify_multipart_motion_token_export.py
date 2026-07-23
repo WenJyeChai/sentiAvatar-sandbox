@@ -259,6 +259,7 @@ def verify_export(
         "split_names_sha256": names_sha256(split_names),
         "export_signature": reference["export_signature"],
         "body_causal": reference["body_causal"],
+        "causal_by_part": reference["causal_by_part"],
         "part_order": reference["part_order"],
         "tokens_per_frame": reference["tokens_per_frame"],
         "codebook_size": reference["codebook_size"],

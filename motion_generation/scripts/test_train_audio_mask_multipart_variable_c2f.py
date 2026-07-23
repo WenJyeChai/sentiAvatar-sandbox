@@ -235,6 +235,16 @@ def test_required_causal_motion_contract_checks_checkpoint_fingerprints(
         require_checkpoint_match=True,
     )
 
+    consolidated_manifest = dict(manifest)
+    consolidated_manifest.pop("causal_by_part")
+    validate_motion_token_contract(
+        consolidated_manifest,
+        part_order=parts,
+        checkpoint_paths=checkpoints,
+        require_causal=True,
+        require_checkpoint_match=True,
+    )
+
     checkpoints["hands"].write_bytes(b"different-checkpoint")
     with pytest.raises(ValueError, match="do not match the token export"):
         validate_motion_token_contract(
