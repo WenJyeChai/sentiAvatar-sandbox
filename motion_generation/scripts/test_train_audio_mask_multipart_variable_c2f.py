@@ -133,6 +133,45 @@ def test_face_two_stage_yaml_configs_preserve_training_contract():
     assert stage2.soft_recovery_weight == 0.1
 
 
+def test_moss_nano_all16_two_stage_configs_preserve_audio_contract():
+    base = parse_args(
+        [
+            "--config",
+            str(
+                MOTION_GENERATION_DIR
+                / "configs"
+                / "audio_c2f_face_moss_nano_all16_fixed_targets_no_sf_scratch.yaml"
+            ),
+        ]
+    )
+    stage2 = parse_args(
+        [
+            "--config",
+            str(
+                MOTION_GENERATION_DIR
+                / "configs"
+                / "audio_c2f_face_moss_nano_all16_soft_recovery_sf05_stage2.yaml"
+            ),
+        ]
+    )
+    for args in (base, stage2):
+        assert args.audio_representation == "moss_nano_quantized_latent_q0_q15"
+        assert args.audio_feat_dim == 768
+        assert args.audio_fps == 12.5
+        assert args.audio_sample_rate == 48_000
+        assert args.audio_num_codebooks == 16
+        assert args.audio_codebook_size == 1_024
+        assert args.audio_alignment == "nearest_motion_time"
+        assert args.require_complete_audio_coverage
+        assert args.audio_feat_dir.endswith(
+            "audio_features_moss_nano_all16_12p5hz_768d"
+        )
+    assert base.model_name_or_path is None
+    assert stage2.model_name_or_path == base.output_dir
+    assert base.self_forcing_max_prob == 0.0
+    assert stage2.self_forcing_max_prob == 0.5
+
+
 def test_routed_audio_starts_as_an_exact_legacy_checkpoint_clone():
     torch.manual_seed(101)
     legacy = AudioMotionTransformer(tiny_config()).eval()

@@ -1063,6 +1063,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max_eval_clips", type=int, default=None)
     parser.add_argument("--train_windows_per_sequence", type=int, default=1)
     parser.add_argument("--eval_windows_per_sequence", type=int, default=4)
+    parser.add_argument("--require_complete_audio_coverage", action="store_true")
 
     parser.add_argument("--min_gap_frames", type=int, default=1)
     parser.add_argument("--max_gap_frames", type=int, default=15)
@@ -1090,6 +1091,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--intermediate_size", type=int, default=1536)
     parser.add_argument("--max_position_embeddings", type=int, default=512)
     parser.add_argument("--audio_feat_dim", type=int, default=768)
+    parser.add_argument("--audio_representation", default="hubert_layer9")
+    parser.add_argument("--audio_sample_rate", type=int, default=16000)
+    parser.add_argument("--audio_num_codebooks", type=int, default=0)
+    parser.add_argument("--audio_codebook_size", type=int, default=0)
+    parser.add_argument(
+        "--audio_alignment",
+        choices=("nearest_motion_time",),
+        default="nearest_motion_time",
+    )
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument(
         "--audio_fusion_mode",
@@ -1337,6 +1347,12 @@ def main() -> None:
         raise ValueError("soft_recovery_sigma_scale must be > 0")
     if args.min_gap_frames < 1 or args.max_gap_frames < args.min_gap_frames:
         raise ValueError("Invalid gap range")
+    if args.audio_feat_dim < 1 or args.audio_fps <= 0:
+        raise ValueError("Audio feature dimension and frame rate must be positive")
+    if args.audio_sample_rate < 1:
+        raise ValueError("audio_sample_rate must be positive")
+    if args.audio_num_codebooks < 0 or args.audio_codebook_size < 0:
+        raise ValueError("Audio codebook metadata cannot be negative")
     data_dir = Path(args.data_dir)
     token_dir = Path(
         args.motion_token_dir or data_dir / "motion_token_data_multipart_512x4"
@@ -1372,6 +1388,25 @@ def main() -> None:
 
     train_split = read_split_file(Path(args.train_split_file) if args.train_split_file else None)
     eval_split = read_split_file(Path(args.eval_split_file) if args.eval_split_file else None)
+    if args.require_complete_audio_coverage:
+        for split_name, split_values in (
+            ("train", train_split),
+            ("eval", eval_split),
+        ):
+            if split_values is None:
+                continue
+            missing_audio = [
+                name
+                for name in split_values
+                if (token_dir / f"{name}.json").is_file()
+                and not (audio_dir / f"{name}.npy").is_file()
+            ]
+            if missing_audio:
+                raise FileNotFoundError(
+                    f"Incomplete {split_name} audio coverage for clips with motion "
+                    f"tokens: {len(missing_audio)} files missing "
+                    f"(first: {missing_audio[:3]})"
+                )
     train_names = discover_names(token_dir, audio_dir, train_split)
     if eval_split is not None:
         eval_names = discover_names(token_dir, audio_dir, eval_split)
@@ -1397,6 +1432,23 @@ def main() -> None:
     eval_sequences, eval_stats = load_sequences(
         eval_names, token_dir, audio_dir, max_sequences=args.max_eval_clips, **load_kwargs
     )
+    for split_name, sequences in (
+        ("train", train_sequences),
+        ("eval", eval_sequences),
+    ):
+        bad_feature_dims = [
+            (
+                str(item["name"]),
+                tuple(item["audio_features"].shape),
+            )
+            for item in sequences
+            if item["audio_features"].shape[1] != args.audio_feat_dim
+        ]
+        if bad_feature_dims:
+            raise ValueError(
+                f"{split_name} audio features do not match "
+                f"audio_feat_dim={args.audio_feat_dim}; first: {bad_feature_dims[:3]}"
+            )
     gap_weights = parse_float_list(args.gap_bucket_weights, 3, "gap_bucket_weights")
     train_dataset = VariableGapMaskDataset(
         train_sequences,
@@ -1427,6 +1479,13 @@ def main() -> None:
         else build_token_layout(part_order, num_quantizers)
     )
     audio_config = {
+        "audio_feat_dim": args.audio_feat_dim,
+        "audio_representation": args.audio_representation,
+        "audio_fps": args.audio_fps,
+        "audio_sample_rate": args.audio_sample_rate,
+        "audio_num_codebooks": args.audio_num_codebooks,
+        "audio_codebook_size": args.audio_codebook_size,
+        "audio_alignment": args.audio_alignment,
         "num_parts": len(part_order),
         "num_quantizers_per_part": num_quantizers,
         "max_gap_frames": args.max_gap_frames,
@@ -1466,7 +1525,6 @@ def main() -> None:
             max_position_embeddings=args.max_position_embeddings,
             vocab_size=vocab_size,
             codebook_size=codebook_size,
-            audio_feat_dim=args.audio_feat_dim,
             num_tokens_per_frame=ntpf,
             num_frames=args.max_gap_frames + 2,
             dropout=args.dropout,
@@ -1538,6 +1596,12 @@ def main() -> None:
     print(
         "Audio fusion:     "
         f"mode={args.audio_fusion_mode}"
+    )
+    print(
+        "Audio source:     "
+        f"{args.audio_representation}, {args.audio_fps:g} Hz, "
+        f"{args.audio_feat_dim} dims, codebooks={args.audio_num_codebooks}, "
+        f"alignment={args.audio_alignment}"
     )
     print(
         "Self-forcing:     "

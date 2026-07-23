@@ -1,5 +1,5 @@
 """
-Audio-Motion Mask Transformer Model (Hubert Features Version)
+Audio-Motion Mask Transformer Model
 
 输入: motion_1, motion_5 (各4个motion token) + 5帧的hubert audio特征
 输出: 预测被mask的motion token (motion_2, motion_3, motion_4)
@@ -35,7 +35,13 @@ class AudioMotionConfig(PretrainedConfig):
         max_position_embeddings=512,
         vocab_size=2049,        # 512 * 4 + 1 (mask token)
         codebook_size=512,      # 每个quantizer的codebook大小
-        audio_feat_dim=768,     # hubert layer9 特征维度
+        audio_feat_dim=768,
+        audio_representation="hubert_layer9",
+        audio_fps=10.0,
+        audio_sample_rate=16000,
+        audio_num_codebooks=0,
+        audio_codebook_size=0,
+        audio_alignment="nearest_motion_time",
         num_tokens_per_frame=4, # 每帧motion token数量 (4 quantizers)
         num_frames=5,           # 窗口帧数
         dropout=0.2,
@@ -61,6 +67,12 @@ class AudioMotionConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.codebook_size = codebook_size
         self.audio_feat_dim = audio_feat_dim
+        self.audio_representation = str(audio_representation)
+        self.audio_fps = float(audio_fps)
+        self.audio_sample_rate = int(audio_sample_rate)
+        self.audio_num_codebooks = int(audio_num_codebooks)
+        self.audio_codebook_size = int(audio_codebook_size)
+        self.audio_alignment = str(audio_alignment)
         self.num_tokens_per_frame = num_tokens_per_frame
         self.num_frames = num_frames
         self.dropout = dropout
@@ -97,7 +109,7 @@ class AudioMotionRMSNorm(nn.Module):
 
 
 class AudioEncoder(nn.Module):
-    """将hubert音频原始特征投影到hidden_size空间"""
+    """Project frame-aligned continuous audio features to hidden size."""
 
     def __init__(self, audio_feat_dim, hidden_size, dropout=0.1):
         super().__init__()

@@ -967,3 +967,77 @@ editing code. Do not redesign Step 2 unless an integration blocker requires it.
 | Generic variable-gap evaluation | `motion_generation/notebooks/compare_variable_c2f_infill_metrics.ipynb` |
 | Residual audit | `motion_generation/notebooks/multipart_residual_recoverability_audit.ipynb` |
 | MSD audit | `motion_generation/notebooks/multipart_msd_complexity_error_audit.ipynb` |
+
+---
+
+## 24. MOSS Nano All-16-RVQ Retraining Branch (2026-07)
+
+This section is newer than the HuBERT integration recommendations above. The
+current controlled experiment retrains Step 2 with MOSS Audio Tokenizer Nano
+while leaving the motion side and Step 2 Transformer architecture unchanged.
+
+### 24.1 Audio representation
+
+- Input codec: causal MOSS Audio Tokenizer Nano, 48 kHz.
+- Stored codes: all 16 residual codebooks, q0 through q15, 1,024 entries each.
+- Native token rate: 12.5 Hz.
+- Step 2 feature: the frozen Nano quantizer decodes all q0-q15 contributions,
+  sums the residual-codebook embeddings, and applies its frozen output
+  projection.
+- Resulting tensor: one 768-D continuous quantized latent per Nano frame.
+- Motion alignment: nearest physical-time Nano frame for each 10 Hz motion
+  token frame; no latent interpolation.
+- Step 2 still trains its existing 768-to-512 audio projection. Nano and its
+  quantizer remain frozen and are not loaded by training workers.
+
+This uses every RVQ layer without adding 16 new trainable embedding tables or
+expanding the Step 2 sequence length.
+
+### 24.2 Offline feature export
+
+The existing Nano token export is expected at:
+
+`SuSuInterActs/SuSuInterActs/audio_tokens_moss_nano_48k_12p5hz_16cb`
+
+Decode it with:
+
+`motion_generation/scripts/export_moss_nano_all16_features.py`
+
+The output is:
+
+`SuSuInterActs/SuSuInterActs/audio_features_moss_nano_all16_12p5hz_768d`
+
+Feature files are float16 on disk and are converted to float32 by the existing
+Step 2 loader. Per-shard manifests record the model hashes, all-16 contract,
+feature rate, dimension, and alignment rule. The exporter is safe to resume
+without `--overwrite`.
+
+### 24.3 Two-stage training protocol
+
+Stage 1 is a new model trained from scratch with fixed canonical targets:
+
+`motion_generation/configs/audio_c2f_face_moss_nano_all16_fixed_targets_no_sf_scratch.yaml`
+
+Stage 2 must initialize from that Nano Stage 1 output, never from the HuBERT
+checkpoint:
+
+`motion_generation/configs/audio_c2f_face_moss_nano_all16_soft_recovery_sf05_stage2.yaml`
+
+All motion-side settings are held fixed to the selected face/body Step 2
+protocol: multipart 512x4 tokens, gaps 1-15, q0-to-q3 generation, canonical CE,
+latent auxiliaries, and the established Stage 2 self-forcing/soft-recovery
+schedule.
+
+Both configs require complete Nano audio coverage for every split clip that has
+a multipart face-motion token file. Missing face-motion clips remain excluded,
+matching the existing face-coverage protocol. Training also rejects feature
+arrays whose second dimension is not 768.
+
+### 24.4 Inference status
+
+The training path and checkpoint metadata are wired. Production inference is
+not yet migrated: legacy inference code still extracts Chinese HuBERT
+features. Do not feed those features into a checkpoint whose
+`audio_representation` is `moss_nano_quantized_latent_q0_q15`. Runtime Nano
+feature extraction and checkpoint-driven dispatch remain a separate
+integration task.
