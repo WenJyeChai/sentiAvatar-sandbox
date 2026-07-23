@@ -30,6 +30,18 @@ def test_nano_resampling_has_deterministic_physical_length():
     assert np.isfinite(output).all()
 
 
+def test_nano_uses_only_complete_causal_frames():
+    item = AudioItem(
+        name="partial",
+        source_path=Path("partial.wav"),
+        source_sample_rate=48_000,
+        source_num_samples=223_200,
+        audio_48k=np.zeros(223_200, dtype=np.float32),
+    )
+    assert item.target_frames == 58
+    assert 223_200 // NANO_FRAME_SIZE == 58
+
+
 def test_nano_token_file_stores_all_16_codebooks(tmp_path: Path):
     name = "session/clip"
     item = AudioItem(
@@ -49,5 +61,6 @@ def test_nano_token_file_stores_all_16_codebooks(tmp_path: Path):
         assert payload["codes"].shape == (16, 3)
         assert int(payload["sample_rate"]) == 48_000
         assert int(payload["frame_size"]) == 3_840
+        assert str(payload["frame_count_rule"]) == "floor_complete_frames"
         assert int(payload["cardinality"]) == 1_024
         assert str(payload["codec"]) == "moss_audio_tokenizer_nano"

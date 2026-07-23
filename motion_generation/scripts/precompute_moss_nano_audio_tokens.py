@@ -49,7 +49,11 @@ class AudioItem:
 
     @property
     def target_frames(self) -> int:
-        return math.ceil(len(self.audio_48k) / NANO_FRAME_SIZE)
+        # Nano emits one code frame only after a complete 3,840-sample causal
+        # block is available. Its public encoder therefore uses floor framing
+        # for an unfinished utterance tail instead of padding it into a
+        # look-ahead-like terminal frame.
+        return len(self.audio_48k) // NANO_FRAME_SIZE
 
 
 def canonical_name_path(root: Path, name: str, suffix: str) -> Path:
@@ -204,6 +208,7 @@ def write_token_file(path: Path, item: AudioItem, codes: np.ndarray, *, model_di
                 num_samples=np.asarray(len(item.audio_48k), dtype=np.int64),
                 frame_rate=np.asarray(NANO_FRAME_RATE, dtype=np.float32),
                 frame_size=np.asarray(NANO_FRAME_SIZE, dtype=np.int32),
+                frame_count_rule=np.asarray("floor_complete_frames"),
                 channels=np.asarray(NANO_CHANNELS, dtype=np.int32),
                 mono_to_stereo=np.asarray(True),
                 num_codebooks=np.asarray(NANO_CODEBOOKS, dtype=np.int32),
@@ -220,6 +225,12 @@ def validate_existing_token_file(path: Path, expected_name: str) -> bool:
     try:
         with np.load(path, allow_pickle=False) as payload:
             codes = payload["codes"]
+            num_samples = int(payload["num_samples"].item())
+            frame_rule = (
+                str(payload["frame_count_rule"].item())
+                if "frame_count_rule" in payload.files
+                else "floor_complete_frames"
+            )
             return (
                 str(payload["name"].item()) == expected_name
                 and str(payload["codec"].item()) == "moss_audio_tokenizer_nano"
@@ -230,6 +241,8 @@ def validate_existing_token_file(path: Path, expected_name: str) -> bool:
                 and int(payload["sample_rate"].item()) == NANO_SAMPLE_RATE
                 and float(payload["frame_rate"].item()) == NANO_FRAME_RATE
                 and int(payload["frame_size"].item()) == NANO_FRAME_SIZE
+                and frame_rule == "floor_complete_frames"
+                and codes.shape[1] == num_samples // NANO_FRAME_SIZE
                 and int(payload["cardinality"].item()) == NANO_CARDINALITY
             )
     except Exception:
@@ -388,6 +401,7 @@ def main() -> None:
         "sample_rate": NANO_SAMPLE_RATE,
         "frame_rate": NANO_FRAME_RATE,
         "frame_size": NANO_FRAME_SIZE,
+        "frame_count_rule": "floor_complete_frames",
         "channels": NANO_CHANNELS,
         "mono_to_stereo": True,
         "num_codebooks": NANO_CODEBOOKS,
