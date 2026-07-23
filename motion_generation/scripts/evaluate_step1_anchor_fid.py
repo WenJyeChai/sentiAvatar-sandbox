@@ -42,9 +42,7 @@ from scripts.evaluate_step1_multipart_comparison import (  # noqa: E402
     load_source_config,
     make_dataset_and_loader,
 )
-from scripts.export_multipart_motion_tokens import (  # noqa: E402
-    configure_strict_inference_math,
-)
+from utils.inference_math import configure_strict_inference_math  # noqa: E402
 from utils.multipart_motion import PART_ORDER  # noqa: E402
 from utils.step1_planner_evaluation import (  # noqa: E402
     RolloutResult,

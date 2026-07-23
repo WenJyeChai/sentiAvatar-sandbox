@@ -26,7 +26,7 @@ if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
 from models.step1_mimi_planner import read_split_names  # noqa: E402
-from scripts.export_multipart_motion_tokens import configure_strict_inference_math  # noqa: E402
+from utils.inference_math import configure_strict_inference_math  # noqa: E402
 from utils.legacy_step1_evaluation import (  # noqa: E402
     LegacyGenerationResult,
     build_legacy_example,

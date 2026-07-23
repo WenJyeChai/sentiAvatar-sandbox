@@ -37,13 +37,13 @@ from models.step1_mimi_planner import (  # noqa: E402
     load_text_map,
     read_split_names,
 )
-from scripts.export_multipart_motion_tokens import configure_strict_inference_math  # noqa: E402
 from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     build_dataset,
     load_neutral_seed,
     resolve_data_paths,
     section,
 )
+from utils.inference_math import configure_strict_inference_math  # noqa: E402
 from utils.step1_planner_evaluation import (  # noqa: E402
     Step1EvaluationCollator,
     collect_fixed_gap_targets,

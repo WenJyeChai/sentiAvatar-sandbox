@@ -17,9 +17,9 @@ sys.path.insert(0, str(MODULE_DIR))
 
 from scripts.export_multipart_motion_tokens import (  # noqa: E402
     LoadedPartCodec,
-    configure_strict_inference_math,
     load_part_codec,
 )
+from utils.inference_math import configure_strict_inference_math  # noqa: E402
 from utils.multipart_motion import (  # noqa: E402
     PART_ORDER,
     load_motion_dict,

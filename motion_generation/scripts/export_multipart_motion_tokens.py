@@ -21,6 +21,7 @@ sys.path.insert(0, str(MODULE_DIR))
 FORMAT_VERSION = 2
 
 from models.multipart_rvqvae import MultiPartRVQVAE  # noqa: E402
+from utils.inference_math import configure_strict_inference_math  # noqa: E402
 from utils.multipart_motion import (  # noqa: E402
     FACE_PART,
     MULTIMODAL_PART_ORDER,
@@ -205,25 +206,6 @@ def existing_output_matches(path: Path, name: str, signature: str) -> bool:
         )
     except (OSError, ValueError, TypeError):
         return False
-
-
-def configure_strict_inference_math(device: torch.device) -> Dict[str, object]:
-    """Disable TF32 so full-prefix and streaming RVQ decisions stay stable."""
-    if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-        torch.set_float32_matmul_precision("highest")
-    return {
-        "device_type": device.type,
-        "nvidia_tf32_override": os.environ.get("NVIDIA_TF32_OVERRIDE"),
-        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
-        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
-        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
-        "float32_matmul_precision": torch.get_float32_matmul_precision(),
-    }
 
 
 def build_token_layout(part_order, num_quantizers: int):
