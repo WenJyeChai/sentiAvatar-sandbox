@@ -46,6 +46,13 @@ from utils.adaptive_anchor_tokens import (
     validate_anchor,
     validate_motion_payload,
 )
+from utils.step1_adaptive_schedule import (
+    GapCurriculumPhase,
+    GapSchedule,
+    load_calibration,
+    phase_for_epoch,
+    random_curriculum_schedule,
+)
 
 
 IGNORE_INDEX = -100
@@ -225,6 +232,11 @@ class Step1Sequence:
     audio_boundaries: tuple[int, ...]
     generated_prefix_anchors: int
     annotation_pattern: str
+    gap_target_probs: list[list[float]]
+    gap_target_mask: list[int]
+    gap_loss_weight: float
+    normal_gaps: tuple[int, ...]
+    tail_gap: Optional[int]
 
 
 class Step1FixedGapDataset(Dataset):
@@ -357,6 +369,20 @@ class Step1FixedGapDataset(Dataset):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+
+    def _anchor_schedule(
+        self,
+        name: str,
+        motion_tokens: Sequence[Sequence[int]],
+    ) -> GapSchedule:
+        anchor_times = fixed_anchor_times(len(motion_tokens), gap=self.fixed_gap)
+        gaps = tuple(
+            gap_from_anchor_times(left, right)
+            for left, right in zip(anchor_times[:-1], anchor_times[1:])
+        )
+        normal = tuple(gap for gap in gaps if gap >= 3)
+        tail = gaps[-1] if gaps and gaps[-1] <= 2 else None
+        return GapSchedule(anchor_times, {}, normal, tail, 0.0)
 
     def __len__(self) -> int:
         return len(self.names)
@@ -501,6 +527,11 @@ class Step1FixedGapDataset(Dataset):
             "audio_boundaries": sequence.audio_boundaries,
             "generated_prefix_anchors": sequence.generated_prefix_anchors,
             "annotation_pattern": sequence.annotation_pattern,
+            "gap_target_probs": sequence.gap_target_probs,
+            "gap_target_mask": sequence.gap_target_mask,
+            "gap_loss_weight": sequence.gap_loss_weight,
+            "normal_gaps": sequence.normal_gaps,
+            "tail_gap": sequence.tail_gap,
         }
 
     def build_sequence(self, name: str) -> Step1Sequence:
@@ -529,7 +560,8 @@ class Step1FixedGapDataset(Dataset):
                 f"motion={motion_duration:.4f}s, error={mismatch:.4f}s"
             )
 
-        anchor_times = fixed_anchor_times(len(motion_tokens), gap=self.fixed_gap)
+        schedule = self._anchor_schedule(name, motion_tokens)
+        anchor_times = schedule.anchor_times
         audio_boundaries = causal_audio_boundaries(
             anchor_times,
             audio_frames=audio_token_codes.shape[1],
@@ -557,6 +589,8 @@ class Step1FixedGapDataset(Dataset):
         motion_local_labels = [IGNORE_INDEX] * len(input_ids)
         audio_anchor_ids = [-1] * len(input_ids)
         target_anchor_ids = [-1] * len(input_ids)
+        gap_target_probs = [[0.0] * len(GAP_TOKENS) for _ in input_ids]
+        gap_target_mask = [0] * len(input_ids)
 
         def append_control(token: str) -> None:
             input_ids.append(self._single_token_ids[token])
@@ -569,6 +603,8 @@ class Step1FixedGapDataset(Dataset):
             transcript_mask.append(0)
             audio_anchor_ids.append(-1)
             target_anchor_ids.append(-1)
+            gap_target_probs.append([0.0] * len(GAP_TOKENS))
+            gap_target_mask.append(0)
 
         def append_anchor(
             input_anchor: Sequence[int],
@@ -590,6 +626,8 @@ class Step1FixedGapDataset(Dataset):
                 action_mask.append(0)
                 transcript_mask.append(0)
                 audio_anchor_ids.append(-1)
+                gap_target_probs.append([0.0] * len(GAP_TOKENS))
+                gap_target_mask.append(0)
                 if target_anchor is None:
                     target_slots.append(-1)
                     motion_local_labels.append(IGNORE_INDEX)
@@ -611,6 +649,15 @@ class Step1FixedGapDataset(Dataset):
             target_time = anchor_times[anchor_index]
             gap = gap_from_anchor_times(left_time, target_time)
             append_control(GAP_TOKENS[gap])
+            soft_target = schedule.soft_targets_by_left.get(left_time)
+            if soft_target is not None:
+                if len(soft_target) != len(GAP_TOKENS):
+                    raise ValueError(
+                        f"{name}: gap target at {left_time} has {len(soft_target)} "
+                        f"entries, expected {len(GAP_TOKENS)}"
+                    )
+                gap_target_probs[-1] = [float(value) for value in soft_target]
+                gap_target_mask[-1] = 1
             next_audio_boundary = audio_boundaries[anchor_index]
             for frame_codes in audio_token_codes[:, audio_cursor:next_audio_boundary].T:
                 append_control(MIMI_FRAME_TOKEN)
@@ -652,6 +699,8 @@ class Step1FixedGapDataset(Dataset):
         transcript_mask.append(0)
         audio_anchor_ids.append(-1)
         target_anchor_ids.append(-1)
+        gap_target_probs.append([0.0] * len(GAP_TOKENS))
+        gap_target_mask.append(0)
 
         lengths = {
             len(input_ids),
@@ -664,6 +713,8 @@ class Step1FixedGapDataset(Dataset):
             len(transcript_mask),
             len(audio_anchor_ids),
             len(target_anchor_ids),
+            len(gap_target_probs),
+            len(gap_target_mask),
         }
         if len(lengths) != 1:
             raise AssertionError(f"Serialized field lengths differ for {name}: {lengths}")
@@ -692,7 +743,165 @@ class Step1FixedGapDataset(Dataset):
             audio_boundaries=audio_boundaries,
             generated_prefix_anchors=generated_prefix_anchors,
             annotation_pattern=annotation_pattern,
+            gap_target_probs=gap_target_probs,
+            gap_target_mask=gap_target_mask,
+            gap_loss_weight=float(getattr(schedule, "schedule_loss_weight", 0.0)),
+            normal_gaps=schedule.normal_gaps,
+            tail_gap=schedule.tail_gap,
         )
+
+
+class Step1AdaptiveGapDataset(Step1FixedGapDataset):
+    """Step 1 dataset driven by pre-materialized frozen-Step-2 DP schedules."""
+
+    def __init__(
+        self,
+        *args: Any,
+        curriculum_phases: Sequence[GapCurriculumPhase],
+        calibration_json: Path,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.curriculum_phases = tuple(curriculum_phases)
+        calibration = load_calibration(Path(calibration_json))
+        raw_phases = calibration["phases"]
+        self._phase_schedules: dict[int, dict[str, tuple[tuple[int, ...], dict[int, tuple[float, ...]]]]] = {}
+        for entry in raw_phases:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Calibration phase entries must be mappings")
+            phase_index = int(entry["phase_index"])
+            if not 0 <= phase_index < len(self.curriculum_phases):
+                raise ValueError(f"Calibration has unknown phase index {phase_index}")
+            configured_phase = self.curriculum_phases[phase_index]
+            expected_contract = (
+                configured_phase.min_gap,
+                configured_phase.max_gap,
+                configured_phase.target_mean_gap,
+                configured_phase.temperature,
+            )
+            actual_contract = (
+                int(entry["min_gap"]),
+                int(entry["max_gap"]),
+                float(entry["target_mean_gap"]),
+                float(entry["temperature"]),
+            )
+            if actual_contract != expected_contract:
+                raise ValueError(
+                    f"Calibration phase {phase_index} contract {actual_contract} "
+                    f"does not match config {expected_contract}"
+                )
+            schedule_file = Path(str(entry["schedule_file"]))
+            if not schedule_file.is_absolute():
+                schedule_file = Path(calibration_json).resolve().parent / schedule_file
+            expected_hash = entry.get("schedule_file_sha256")
+            if expected_hash:
+                digest = hashlib.sha256()
+                with schedule_file.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != str(expected_hash):
+                    raise ValueError(
+                        f"Adaptive schedule hash mismatch for {schedule_file}"
+                    )
+            self._phase_schedules[phase_index] = self._load_schedule_file(schedule_file)
+        expected_dp_phases = {
+            index
+            for index, phase in enumerate(self.curriculum_phases)
+            if phase.mode == "step2_dp"
+        }
+        if set(self._phase_schedules) != expected_dp_phases:
+            raise ValueError(
+                "Calibration DP phases do not match config: "
+                f"calibration={sorted(self._phase_schedules)}, "
+                f"config={sorted(expected_dp_phases)}"
+            )
+
+    @staticmethod
+    def _load_schedule_file(
+        path: Path,
+    ) -> dict[str, tuple[tuple[int, ...], dict[int, tuple[float, ...]]]]:
+        if not path.is_file():
+            raise FileNotFoundError(f"Adaptive schedule file not found: {path}")
+        with np.load(path, allow_pickle=False) as payload:
+            names = [str(value) for value in payload["names"].tolist()]
+            offsets = np.asarray(payload["offsets"], dtype=np.int64)
+            anchors = np.asarray(payload["anchors"], dtype=np.int64)
+            probabilities = np.asarray(payload["gap_target_probs"], dtype=np.float32)
+            target_mask = np.asarray(payload["gap_target_mask"], dtype=np.bool_)
+        if offsets.shape != (len(names) + 1,):
+            raise ValueError(f"{path}: offsets do not match names")
+        if probabilities.shape != (len(anchors), len(GAP_TOKENS)):
+            raise ValueError(f"{path}: malformed gap_target_probs {probabilities.shape}")
+        if target_mask.shape != (len(anchors),):
+            raise ValueError(f"{path}: malformed gap_target_mask")
+        result = {}
+        for index, name in enumerate(names):
+            start, end = int(offsets[index]), int(offsets[index + 1])
+            clip_anchors = tuple(int(value) for value in anchors[start:end])
+            targets = {
+                int(clip_anchors[row - start]): tuple(
+                    float(value) for value in probabilities[row]
+                )
+                for row in range(start, end)
+                if bool(target_mask[row])
+            }
+            result[name.replace("\\", "/")] = (clip_anchors, targets)
+        return result
+
+    def _anchor_schedule(
+        self,
+        name: str,
+        motion_tokens: Sequence[Sequence[int]],
+    ) -> GapSchedule:
+        phase_index, phase = phase_for_epoch(self.curriculum_phases, self.epoch)
+        if phase.mode == "random":
+            base = random_curriculum_schedule(
+                len(motion_tokens),
+                min_gap=phase.min_gap,
+                max_gap=phase.max_gap,
+                seed=self.random_seed,
+                epoch=self.epoch,
+                name=name,
+            )
+        else:
+            if phase_index not in self._phase_schedules:
+                raise KeyError(
+                    f"Calibration does not contain DP schedules for phase {phase_index}"
+                )
+            try:
+                anchor_times, soft_targets = self._phase_schedules[phase_index][name]
+            except KeyError as error:
+                raise KeyError(
+                    f"Calibration phase {phase_index} has no schedule for {name}"
+                ) from error
+            if not anchor_times or anchor_times[0] != 0 or anchor_times[-1] != len(motion_tokens) - 1:
+                raise ValueError(
+                    f"{name}: cached schedule endpoints do not match T={len(motion_tokens)}"
+                )
+            gaps = tuple(
+                gap_from_anchor_times(left, right)
+                for left, right in zip(anchor_times[:-1], anchor_times[1:])
+            )
+            base = GapSchedule(
+                anchor_times=anchor_times,
+                soft_targets_by_left=soft_targets,
+                normal_gaps=tuple(gap for gap in gaps if gap >= 3),
+                tail_gap=gaps[-1] if gaps and gaps[-1] <= 2 else None,
+                total_cost=0.0,
+            )
+        # GapSchedule is frozen and intentionally minimal. Attach the phase
+        # weight on a tiny proxy object used only during serialization.
+        return _WeightedGapSchedule(base, phase.loss_weight(self.epoch))
+
+
+class _WeightedGapSchedule:
+    def __init__(self, schedule: GapSchedule, schedule_loss_weight: float) -> None:
+        self.anchor_times = schedule.anchor_times
+        self.soft_targets_by_left = schedule.soft_targets_by_left
+        self.normal_gaps = schedule.normal_gaps
+        self.tail_gap = schedule.tail_gap
+        self.total_cost = schedule.total_cost
+        self.schedule_loss_weight = float(schedule_loss_weight)
 
 
 class Step1PlannerCollator:
@@ -754,6 +963,34 @@ class Step1PlannerCollator:
             "generated_prefix_anchors": torch.tensor(
                 [int(example["generated_prefix_anchors"]) for example in examples], dtype=torch.long
             ),
+            "gap_target_probs": torch.tensor(
+                [
+                    list(example.get("gap_target_probs", [[0.0] * len(GAP_TOKENS)] * len(example["input_ids"])))
+                    + [[0.0] * len(GAP_TOKENS) for _ in range(longest - len(example["input_ids"]))]
+                    for example in examples
+                ],
+                dtype=torch.float32,
+            ),
+            "gap_target_mask": padded_optional("gap_target_mask", 0).bool(),
+            "gap_loss_weights": torch.tensor(
+                [float(example.get("gap_loss_weight", 0.0)) for example in examples],
+                dtype=torch.float32,
+            ),
+            "normal_gap_sum": torch.tensor(
+                [sum(int(value) for value in example.get("normal_gaps", ())) for example in examples],
+                dtype=torch.long,
+            ),
+            "normal_gap_count": torch.tensor(
+                [len(example.get("normal_gaps", ())) for example in examples],
+                dtype=torch.long,
+            ),
+            "tail_gap": torch.tensor(
+                [
+                    -1 if example.get("tail_gap") is None else int(example["tail_gap"])
+                    for example in examples
+                ],
+                dtype=torch.long,
+            ),
         }
 
 
@@ -776,6 +1013,7 @@ class MimiQwenPlannerConfig(PretrainedConfig):
         audio_cardinality: Optional[int] = None,
         audio_codebooks_stored: Optional[int] = None,
         audio_codebooks_used: Optional[Sequence[int]] = None,
+        gap_token_ids: Optional[Sequence[int]] = None,
         **kwargs: Any,
     ) -> None:
         kwargs.setdefault("tie_word_embeddings", False)
@@ -802,6 +1040,7 @@ class MimiQwenPlannerConfig(PretrainedConfig):
         self.mimi_cardinality = self.audio_cardinality
         self.mimi_codebooks_stored = self.audio_codebooks_stored
         self.mimi_codebooks_used = list(self.audio_codebooks_used)
+        self.gap_token_ids = list(map(int, gap_token_ids or []))
 
 
 @dataclass
@@ -818,6 +1057,9 @@ class MimiQwenPlannerOutput(ModelOutput):
     per_example_correct: Optional[torch.Tensor] = None
     per_example_count: Optional[torch.Tensor] = None
     per_token_loss: Optional[torch.Tensor] = None
+    gap_loss: Optional[torch.Tensor] = None
+    gap_count: Optional[torch.Tensor] = None
+    gap_correct: Optional[torch.Tensor] = None
 
 
 class MimiQwenPlanner(PreTrainedModel):
@@ -892,6 +1134,12 @@ class MimiQwenPlanner(PreTrainedModel):
                 f"got {tuple(motion_token_ids.shape)}"
             )
         self.register_buffer("motion_token_ids", motion_token_ids, persistent=True)
+        gap_token_ids = torch.tensor(config.gap_token_ids, dtype=torch.long)
+        if gap_token_ids.numel() not in {0, len(GAP_TOKENS)}:
+            raise ValueError(
+                f"gap_token_ids must be empty or contain {len(GAP_TOKENS)} ids"
+            )
+        self.register_buffer("gap_token_ids", gap_token_ids, persistent=False)
         # This table is derived from frozen codec checkpoints at training time.
         # It is deliberately excluded from planner checkpoints (~16 MiB fp32).
         self.register_buffer(
@@ -915,6 +1163,15 @@ class MimiQwenPlanner(PreTrainedModel):
             raise ValueError("motion codebook distance diagonals must be zero")
         self.motion_codebook_distances = distances.contiguous()
 
+    def set_gap_token_ids(self, token_ids: Sequence[int]) -> None:
+        values = torch.as_tensor(token_ids, dtype=torch.long)
+        if tuple(values.shape) != (len(GAP_TOKENS),):
+            raise ValueError(f"Expected {len(GAP_TOKENS)} gap token ids")
+        if int(values.min()) < 0 or int(values.max()) >= self.language_model.config.vocab_size:
+            raise ValueError("Gap token id is outside the language-model vocabulary")
+        self.gap_token_ids = values.to(self.motion_token_ids.device)
+        self.config.gap_token_ids = [int(value) for value in values.tolist()]
+
     @classmethod
     def from_qwen_pretrained(
         cls,
@@ -932,6 +1189,7 @@ class MimiQwenPlanner(PreTrainedModel):
         audio_cardinality: int = MIMI_CARDINALITY,
         audio_codebooks_stored: int = MIMI_STORED_CODEBOOKS,
         audio_codebooks_used: Optional[Sequence[int]] = None,
+        gap_token_ids: Optional[Sequence[int]] = None,
     ) -> "MimiQwenPlanner":
         language_model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -953,6 +1211,7 @@ class MimiQwenPlanner(PreTrainedModel):
             mimi_cardinality=audio_cardinality,
             mimi_codebooks_stored=audio_codebooks_stored,
             mimi_codebooks_used=mimi_codebooks_used or [0],
+            gap_token_ids=gap_token_ids,
         )
         return cls(config, language_model=language_model)
 
@@ -1026,6 +1285,9 @@ class MimiQwenPlanner(PreTrainedModel):
         motion_local_labels: torch.Tensor,
         expected_distortion_weight: float = 0.0,
         expected_distortion_example_mask: Optional[torch.Tensor] = None,
+        gap_target_probs: Optional[torch.Tensor] = None,
+        gap_target_mask: Optional[torch.Tensor] = None,
+        gap_loss_weights: Optional[torch.Tensor] = None,
         return_token_losses: bool = False,
         **kwargs: Any,
     ) -> MimiQwenPlannerOutput:
@@ -1143,7 +1405,51 @@ class MimiQwenPlanner(PreTrainedModel):
             if bool(distortion_count)
             else distortion_sum
         )
-        loss = ce_loss + expected_distortion_weight * expected_distortion_loss
+        gap_loss = hidden.new_zeros((), dtype=torch.float32)
+        gap_count = torch.zeros((), device=hidden.device, dtype=torch.long)
+        gap_correct = torch.zeros((), device=hidden.device, dtype=torch.long)
+        if gap_target_probs is not None or gap_target_mask is not None:
+            if gap_target_probs is None or gap_target_mask is None:
+                raise ValueError("gap_target_probs and gap_target_mask must be provided together")
+            if tuple(gap_target_probs.shape) != (*input_ids.shape, len(GAP_TOKENS)):
+                raise ValueError(
+                    f"gap_target_probs must be [B,L,{len(GAP_TOKENS)}]"
+                )
+            if tuple(gap_target_mask.shape) != tuple(input_ids.shape):
+                raise ValueError("gap_target_mask must have shape [B,L]")
+            if gap_target_mask[:, 0].any():
+                raise ValueError("The first sequence position cannot be a gap target")
+            shifted_gap_mask = gap_target_mask[:, 1:].bool()
+            gap_count = shifted_gap_mask.sum()
+            if bool(gap_count):
+                if self.gap_token_ids.numel() != len(GAP_TOKENS):
+                    raise RuntimeError("Gap supervision is present but gap_token_ids are unset")
+                targets = gap_target_probs[:, 1:][shifted_gap_mask].float()
+                if not torch.allclose(
+                    targets.sum(dim=-1),
+                    torch.ones(targets.shape[0], device=targets.device),
+                    atol=1e-4,
+                ):
+                    raise ValueError("Every supervised soft gap target must sum to one")
+                classifier_weight = output_weight.index_select(0, self.gap_token_ids)
+                gap_logits = F.linear(hidden[shifted_gap_mask], classifier_weight).float()
+                token_gap_losses = -(
+                    targets * F.log_softmax(gap_logits, dim=-1)
+                ).sum(dim=-1)
+                gap_correct = gap_logits.argmax(dim=-1).eq(targets.argmax(dim=-1)).sum()
+                if gap_loss_weights is None:
+                    weights = torch.ones_like(token_gap_losses)
+                else:
+                    if tuple(gap_loss_weights.shape) != (input_ids.shape[0],):
+                        raise ValueError("gap_loss_weights must have shape [B]")
+                    example_indices = shifted_gap_mask.nonzero(as_tuple=False)[:, 0]
+                    weights = gap_loss_weights.float().index_select(0, example_indices)
+                gap_loss = (token_gap_losses * weights).sum() / gap_count
+        loss = (
+            ce_loss
+            + expected_distortion_weight * expected_distortion_loss
+            + gap_loss
+        )
         return MimiQwenPlannerOutput(
             loss=loss,
             ce_loss=ce_loss,
@@ -1157,6 +1463,9 @@ class MimiQwenPlanner(PreTrainedModel):
             per_example_correct=per_example_correct,
             per_example_count=per_example_count,
             per_token_loss=per_token_loss,
+            gap_loss=gap_loss,
+            gap_count=gap_count,
+            gap_correct=gap_correct,
         )
 
     @torch.inference_mode()
@@ -1181,4 +1490,28 @@ class MimiQwenPlanner(PreTrainedModel):
         hidden = outputs.last_hidden_state[:, -1]
         allowed_ids = self.motion_token_ids[int(slot)]
         classifier_weight = self.language_model.get_output_embeddings().weight.index_select(0, allowed_ids)
+        return F.linear(hidden, classifier_weight).float()
+
+    @torch.inference_mode()
+    def next_gap_logits(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        audio_codes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the restricted 16-way logits for the next causal gap decision."""
+
+        if self.gap_token_ids.numel() != len(GAP_TOKENS):
+            raise RuntimeError("This checkpoint does not define the 16 gap-token ids")
+        inputs_embeds = self.prepare_input_embeddings(input_ids, audio_codes)
+        outputs = self._base_model_forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = outputs.last_hidden_state[:, -1]
+        classifier_weight = self.language_model.get_output_embeddings().weight.index_select(
+            0, self.gap_token_ids
+        )
         return F.linear(hidden, classifier_weight).float()

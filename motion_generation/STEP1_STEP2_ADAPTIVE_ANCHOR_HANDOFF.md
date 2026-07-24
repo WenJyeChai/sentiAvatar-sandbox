@@ -1,6 +1,6 @@
 # Adaptive Multipart Anchor Planning and Infilling Handoff
 
-**Status date:** 2026-07-20  
+**Status date:** 2026-07-24
 **Scope:** Step 1 planner design, Step 2 integration, losses, training curriculum, inference contract, implementation plan, and evaluation gates.  
 **Detailed Step 2 reference:** [`STEP2_MULTIPART_C2F_HANDOFF.md`](STEP2_MULTIPART_C2F_HANDOFF.md)  
 **Literature review:** [`../learned_sparse_anchor_planning_literature_review.md`](../learned_sparse_anchor_planning_literature_review.md)
@@ -1157,3 +1157,198 @@ The first implementation milestone is:
 > Extend the existing Qwen Step 1 tokenizer and training data to emit a fixed `[gap_3]` schedule with complete 16-slot body anchors, then run those predicted anchors through the frozen body-only Step 2 reference using the selected variable-gap C2F decoder.
 
 That milestone validates the new vocabulary, multipart anchor predictability, generated-prefix behavior, Step 2 interface, decoding, metrics, and timing. Only after it works should the project build DP oracles and learn variable gaps.
+
+---
+
+## 21. Implemented Frozen-Step-2 Curriculum (2026-07-24)
+
+The fixed `[gap_3]` multipart baseline, causal body codecs, MOSS Nano audio
+path, structured text, and body-only MOSS-Nano-all16 Step 2 now exist. The
+next experiment has therefore moved beyond Section 20.
+
+### 21.1 Exact experiment
+
+The implemented 50-epoch run uses:
+
+| Epochs | Schedule source | Allowed normal gaps | Mean-gap target | Gap-loss weight |
+|---:|---|---:|---:|---:|
+| 1-5 | deterministic random warm-up | 3-7 | none | 0 |
+| 6-12 | frozen-Step-2 DP oracle | 3-7 | 4.5 | linear 0 -> 1 |
+| 13-25 | frozen-Step-2 DP oracle | 3-11 | 6.0 | 1 |
+| 26-50 | frozen-Step-2 DP oracle | 3-15 | 7.0 | 1 |
+
+Gaps 0-2 are legal only when they land exactly on the final token frame.
+They are forced EOS arithmetic, have no learned gap target, and do not
+contribute to the reported mean normal gap.
+
+The trainable loss is:
+
+\[
+L = L_{\text{anchor CE}} + w(e)L_{\text{soft gap CE}}.
+\]
+
+For a frozen Step 2 interval `(i,j)`, the detached edge risk is:
+
+\[
+C(i,j)=g\left(
+  \operatorname{CE}_{\text{C2F rollout}}
+  +0.1\operatorname{L1}_{\text{hard RVQ latent}}
+\right),\qquad g=j-i-1.
+\]
+
+The DP minimizes:
+
+\[
+\sum_{(i,j)} C(i,j)+\lambda\,N_{\text{new anchors}}.
+\]
+
+`lambda` is calibrated independently for each DP phase by bisection on a
+fixed 512-clip training subset. It is not manually or linearly ramped. The
+soft gap target is a Boltzmann distribution over edge cost plus DP
+cost-to-go. Step 2 remains frozen and detached throughout; no adapter or
+gradient path is introduced.
+
+This first oracle uses **GT boundary-anchor content**. Predicted-content
+oracle costs and self-forcing remain later gates/fine-tuning stages.
+Text/audio alignment losses remain deliberately disabled.
+
+### 21.2 Code map
+
+| Responsibility | Path |
+|---|---|
+| DP, legal-tail rules, lambda calibration | `utils/step1_adaptive_schedule.py` |
+| Frozen Step 2 interval-cost export | `scripts/cache_step2_interval_costs.py` |
+| Lambda calibration and consolidated schedule materialization | `scripts/calibrate_step1_adaptive_gap.py` |
+| Adaptive dataset and soft gap CE | `models/step1_mimi_planner.py` |
+| Training loop, phase-local best reset, metrics | `scripts/train_step1_multipart_fixed_gap3.py` |
+| Four-phase/full-data configuration | `configs/step1_multipart_adaptive_gap_step2_curriculum50.yaml` |
+| All-phase data preflight | `scripts/validate_step1_fixed_gap_data.py` |
+
+### 21.3 One-time frozen-Step-2 cost export
+
+The example below selects the completed soft-recovery Step 2. If the selected
+production checkpoint is instead the fixed-target root, change both
+`--config` and `--checkpoint` consistently. Never combine shards from
+different Step 2 weights.
+
+Run these in four terminals:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/cache_step2_interval_costs.py \
+  --config motion_generation/configs/audio_c2f_body_causal_moss_nano_all16_soft_recovery_sf05_stage2.yaml \
+  --checkpoint checkpoints/mask_multipart_body_causal_moss_nano_all16_variable_c2f_soft_recovery_sf05_stage2_gap1_15 \
+  --split_file SuSuInterActs/SuSuInterActs/split/train_file_list.txt \
+  --split_file SuSuInterActs/SuSuInterActs/split/val_file_list.txt \
+  --output_dir checkpoints/step1_adaptive_gap_oracle/step2_interval_costs \
+  --num_shards 4 --shard_id 0 --device cuda:0 --batch_size 256
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=1 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/cache_step2_interval_costs.py \
+  --config motion_generation/configs/audio_c2f_body_causal_moss_nano_all16_soft_recovery_sf05_stage2.yaml \
+  --checkpoint checkpoints/mask_multipart_body_causal_moss_nano_all16_variable_c2f_soft_recovery_sf05_stage2_gap1_15 \
+  --split_file SuSuInterActs/SuSuInterActs/split/train_file_list.txt \
+  --split_file SuSuInterActs/SuSuInterActs/split/val_file_list.txt \
+  --output_dir checkpoints/step1_adaptive_gap_oracle/step2_interval_costs \
+  --num_shards 4 --shard_id 1 --device cuda:0 --batch_size 256
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=2 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/cache_step2_interval_costs.py \
+  --config motion_generation/configs/audio_c2f_body_causal_moss_nano_all16_soft_recovery_sf05_stage2.yaml \
+  --checkpoint checkpoints/mask_multipart_body_causal_moss_nano_all16_variable_c2f_soft_recovery_sf05_stage2_gap1_15 \
+  --split_file SuSuInterActs/SuSuInterActs/split/train_file_list.txt \
+  --split_file SuSuInterActs/SuSuInterActs/split/val_file_list.txt \
+  --output_dir checkpoints/step1_adaptive_gap_oracle/step2_interval_costs \
+  --num_shards 4 --shard_id 2 --device cuda:0 --batch_size 256
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/cache_step2_interval_costs.py \
+  --config motion_generation/configs/audio_c2f_body_causal_moss_nano_all16_soft_recovery_sf05_stage2.yaml \
+  --checkpoint checkpoints/mask_multipart_body_causal_moss_nano_all16_variable_c2f_soft_recovery_sf05_stage2_gap1_15 \
+  --split_file SuSuInterActs/SuSuInterActs/split/train_file_list.txt \
+  --split_file SuSuInterActs/SuSuInterActs/split/val_file_list.txt \
+  --output_dir checkpoints/step1_adaptive_gap_oracle/step2_interval_costs \
+  --num_shards 4 --shard_id 3 --device cuda:0 --batch_size 256
+```
+
+This is intentionally an offline operation: the full train+validation corpus
+contains millions of candidate intervals. Existing per-clip files are skipped,
+so an interrupted shard can be restarted with the same command. Do not use
+`--overwrite` when merely resuming.
+
+### 21.4 Calibrate lambda and materialize schedules
+
+Run only after all four manifests report full coverage:
+
+```bash
+python motion_generation/scripts/calibrate_step1_adaptive_gap.py \
+  --config motion_generation/configs/step1_multipart_adaptive_gap_step2_curriculum50.yaml \
+  --cost_dir checkpoints/step1_adaptive_gap_oracle/step2_interval_costs \
+  --split_file SuSuInterActs/SuSuInterActs/split/train_file_list.txt \
+  --split_file SuSuInterActs/SuSuInterActs/split/val_file_list.txt \
+  --output_json checkpoints/step1_adaptive_gap_oracle/calibration.json \
+  --calibration_max_clips 512 \
+  --ce_weight 1.0 \
+  --latent_weight 0.1
+```
+
+This command rejects missing shards, incomplete coverage, mixed Step 2
+weights, missing clips, and stale schedule contracts. It writes one
+consolidated schedule file for each DP phase; no manifest merge is needed.
+
+### 21.5 Preflight
+
+The validator serializes every selected train/eval clip once per curriculum
+phase and verifies schedule endpoints, legal gaps, audio consumption, target
+counts, and maximum sequence length:
+
+```bash
+python motion_generation/scripts/validate_step1_fixed_gap_data.py \
+  --config motion_generation/configs/step1_multipart_adaptive_gap_step2_curriculum50.yaml \
+  --output_json checkpoints/step1_adaptive_gap_oracle/data_preflight.json
+```
+
+Use `--max_train_clips 32 --max_eval_clips 32` first for a quick smoke test.
+
+### 21.6 Four-GPU 50-epoch training
+
+Initialize from the completed structured-text/Nano fixed-gap content model.
+This retains the learned 16-ID anchor predictor while starting a fresh
+optimizer and 50-epoch curriculum:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun \
+  --nproc_per_node=4 --master_port=29514 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_multipart_adaptive_gap_step2_curriculum50.yaml \
+  --init_from_checkpoint checkpoints/step1_gap3_6k_nano_q0q3_structured_text_ce/best
+```
+
+For a Qwen-only ablation, omit `--init_from_checkpoint`; that is a different
+experiment and should not overwrite the configured output directory.
+
+The trainer saves milestones at epochs 5, 12, 25, and 50. The `best` metric is
+reset at each curriculum boundary because composite losses from different
+gap ranges/weights are not directly comparable. Thus, after epoch 26, `best`
+means best within the final 3-15/mean-7 phase.
+
+### 21.7 Required monitoring
+
+At every epoch inspect:
+
+- `eval/anchor_ce` and 16-slot accuracy;
+- `eval/gap_loss` and `eval/gap_accuracy`;
+- `eval/mean_normal_gap` versus the active phase target;
+- `eval/tail_fraction`;
+- phase-boundary changes at epochs 6, 13, and 26.
+
+A calibrated oracle mean near seven does not prove the learned planner emits
+mean seven during free rollout. After training, the mandatory next evaluator
+must autoregressively sample `next_gap_logits()` plus 16 anchor IDs, report the
+generated gap histogram/oracle regret, then run frozen Step 2 and anchor FID.

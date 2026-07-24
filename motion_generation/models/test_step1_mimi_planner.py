@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ from models.step1_mimi_planner import (  # noqa: E402
     IGNORE_INDEX,
     MimiQwenPlanner,
     MimiQwenPlannerConfig,
+    Step1AdaptiveGapDataset,
     Step1FixedGapDataset,
     Step1PlannerCollator,
     parse_structured_text,
@@ -51,6 +53,7 @@ from utils.step1_condition_alignment import (  # noqa: E402
     corrupt_text_condition,
     counterfactual_likelihood_loss,
 )
+from utils.step1_adaptive_schedule import parse_curriculum  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -159,6 +162,77 @@ def test_dataset_serializes_causal_audio_before_each_anchor(tmp_path: Path, step
     assert sum(item["text_mask"]) > 0
     assert set(value for value in item["audio_anchor_ids"] if value >= 0) == set(range(9))
     assert item["target_anchor_ids"][first_target_position : first_target_position + 16] == [0] * 16
+
+
+def test_adaptive_dataset_loads_materialized_dp_schedule(
+    tmp_path: Path, step1_tokenizer
+):
+    name = "session/adaptive"
+    motion_dir, audio_dir, _, _ = _write_synthetic_clip(tmp_path, name)
+    anchors = np.asarray([0, 8, 16, 24, 32, 35], dtype=np.int32)
+    probabilities = np.zeros((len(anchors), len(GAP_TOKENS)), dtype=np.float32)
+    probabilities[:4, 7] = 1.0
+    target_mask = np.asarray([True, True, True, True, False, False])
+    schedule_path = tmp_path / "phase_00.npz"
+    np.savez_compressed(
+        schedule_path,
+        names=np.asarray([name]),
+        offsets=np.asarray([0, len(anchors)], dtype=np.int64),
+        anchors=anchors,
+        gap_target_probs=probabilities,
+        gap_target_mask=target_mask,
+    )
+    digest = hashlib.sha256(schedule_path.read_bytes()).hexdigest()
+    calibration_path = tmp_path / "calibration.json"
+    calibration_path.write_text(
+        json.dumps(
+            {
+                "phases": [
+                    {
+                        "phase_index": 0,
+                        "min_gap": 3,
+                        "max_gap": 15,
+                        "target_mean_gap": 7.0,
+                        "temperature": 0.35,
+                        "schedule_file": schedule_path.name,
+                        "schedule_file_sha256": digest,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    phases = parse_curriculum(
+        [
+            {
+                "start_epoch": 1,
+                "end_epoch": 1,
+                "mode": "step2_dp",
+                "min_gap": 3,
+                "max_gap": 15,
+                "target_mean_gap": 7.0,
+                "temperature": 0.35,
+                "schedule_loss_weight": 1.0,
+            }
+        ],
+        num_epochs=1,
+    )
+    dataset = Step1AdaptiveGapDataset(
+        [name],
+        tokenizer=step1_tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "测试。"},
+        seed_mode="observed",
+        curriculum_phases=phases,
+        calibration_json=calibration_path,
+    )
+    item = dataset[0]
+    assert item["anchor_times"] == tuple(anchors.tolist())
+    assert item["normal_gaps"] == (7, 7, 7, 7)
+    assert item["tail_gap"] == 2
+    assert sum(item["gap_target_mask"]) == 4
+    assert item["gap_loss_weight"] == 1.0
 
 
 def test_dataset_serializes_synchronous_q0_q3_frames(tmp_path: Path, step1_tokenizer):
@@ -510,6 +584,39 @@ def test_tiny_planner_slot_loss_backprop_and_save_load(tmp_path: Path):
             motion_local_labels=motion_labels,
         )
     assert torch.isfinite(reloaded_output.loss)
+
+
+def test_tiny_planner_soft_gap_loss_uses_next_token_alignment():
+    planner = _tiny_planner()
+    planner.set_gap_token_ids(list(range(len(GAP_TOKENS))))
+    labels = torch.tensor([(slot * 19 + 7) % 512 for slot in range(16)], dtype=torch.long)
+    input_ids = torch.zeros((1, 20), dtype=torch.long)
+    input_ids[0, 3] = 5
+    for slot in range(16):
+        input_ids[0, 4 + slot] = planner.motion_token_ids[slot, labels[slot]]
+    target_slots = torch.full_like(input_ids, -1)
+    target_slots[0, 4:] = torch.arange(16)
+    motion_labels = torch.full_like(input_ids, IGNORE_INDEX)
+    motion_labels[0, 4:] = labels
+    gap_probabilities = torch.zeros((1, 20, len(GAP_TOKENS)))
+    gap_probabilities[0, 3, 5] = 0.75
+    gap_probabilities[0, 3, 6] = 0.25
+    gap_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    gap_mask[0, 3] = True
+    output = planner(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        audio_codes=torch.full_like(input_ids, -1),
+        target_slots=target_slots,
+        motion_local_labels=motion_labels,
+        gap_target_probs=gap_probabilities,
+        gap_target_mask=gap_mask,
+        gap_loss_weights=torch.tensor([0.5]),
+    )
+    assert torch.isfinite(output.gap_loss)
+    assert int(output.gap_count) == 1
+    assert torch.allclose(output.loss, output.ce_loss + output.gap_loss)
+    output.loss.backward()
 
 
 def test_normalized_codebook_distances_are_symmetric_and_unit_scaled():

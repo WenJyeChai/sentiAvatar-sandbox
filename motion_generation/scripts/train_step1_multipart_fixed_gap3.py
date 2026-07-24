@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the causal audio-token -> fixed-gap multipart Step 1 planner."""
+"""Train the causal multipart Step 1 planner with fixed or adaptive gaps."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ if str(MODULE_DIR) not in sys.path:
 from models.step1_mimi_planner import (  # noqa: E402
     MimiQwenPlanner,
     MimiQwenPlannerConfig,
+    Step1AdaptiveGapDataset,
     Step1FixedGapDataset,
     Step1PlannerCollator,
     load_text_map,
@@ -43,10 +44,16 @@ from models.step1_mimi_planner import (  # noqa: E402
 )
 from utils.adaptive_anchor_tokens import (  # noqa: E402
     BODY_SLOTS,
+    GAP_TOKENS,
     MIMI_FRAME_TOKEN,
     ensure_step1_special_tokens,
     motion_token_id_table,
     validate_anchor,
+)
+from utils.step1_adaptive_schedule import (  # noqa: E402
+    GapCurriculumPhase,
+    parse_curriculum,
+    phase_for_epoch,
 )
 from utils.step1_self_forcing import (  # noqa: E402
     GeneratedHistoryBatchStats,
@@ -66,7 +73,9 @@ from utils.step1_condition_alignment import (  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train fixed [gap_3] multipart Step 1 planner")
+    parser = argparse.ArgumentParser(
+        description="Train fixed- or adaptive-gap multipart Step 1 planner"
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -186,6 +195,33 @@ def data_config_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     text = section(config, "text")
     data["text_serialization"] = str(text.get("serialization", "raw"))
     return data
+
+
+def validate_adaptive_gap_config(
+    config: Mapping[str, Any],
+    *,
+    num_epochs: int,
+) -> dict[str, Any]:
+    adaptive = section(config, "adaptive_gap")
+    adaptive.setdefault("enabled", False)
+    adaptive["enabled"] = bool(adaptive["enabled"])
+    if not adaptive["enabled"]:
+        adaptive["phases"] = ()
+        return adaptive
+    if "calibration_json" not in adaptive:
+        raise ValueError("adaptive_gap.calibration_json is required")
+    raw_phases = adaptive.get("phases")
+    if not isinstance(raw_phases, list):
+        raise ValueError("adaptive_gap.phases must be a list")
+    adaptive["phases"] = parse_curriculum(raw_phases, num_epochs=num_epochs)
+    calibration = project_path(str(adaptive["calibration_json"]))
+    if not calibration.is_file():
+        raise FileNotFoundError(
+            f"Adaptive-gap calibration is missing: {calibration}. "
+            "Run calibrate_step1_adaptive_gap.py after exporting Step 2 interval costs."
+        )
+    adaptive["calibration_json"] = calibration
+    return adaptive
 
 
 def project_path(value: str | Path) -> Path:
@@ -329,6 +365,9 @@ def build_model_and_tokenizer(
             raise RuntimeError(
                 f"Resume checkpoint audio contract {actual_audio} != requested {expected_audio}"
             )
+        model.set_gap_token_ids(
+            [int(tokenizer.convert_tokens_to_ids(token)) for token in GAP_TOKENS]
+        )
         return model, tokenizer, []
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, local_files_only=True, trust_remote_code=True)
@@ -360,6 +399,9 @@ def build_model_and_tokenizer(
         mimi_cardinality=int(audio_contract["cardinality"]),
         mimi_codebooks_stored=int(audio_contract["stored_codebooks"]),
         mimi_codebooks_used=list(audio_contract["codebooks_used"]),
+        gap_token_ids=[
+            int(tokenizer.convert_tokens_to_ids(token)) for token in GAP_TOKENS
+        ],
     )
     model = MimiQwenPlanner(planner_config, language_model=language_model)
     model.tie_weights()
@@ -375,6 +417,7 @@ def build_dataset(
     data_config: Mapping[str, Any],
     neutral_seed: Optional[tuple[int, ...]],
     training: bool,
+    adaptive_gap: Optional[Mapping[str, Any]] = None,
 ) -> Step1FixedGapDataset:
     generated_anchor_dir_value = data_config.get("generated_anchor_dir") if training else None
     generated_anchor_dir = project_path(generated_anchor_dir_value) if generated_anchor_dir_value else None
@@ -392,7 +435,18 @@ def build_dataset(
                 data_config.get("mimi_codebooks_used", [0]),
             ),
         }
-    return Step1FixedGapDataset(
+    dataset_class = (
+        Step1AdaptiveGapDataset
+        if adaptive_gap is not None and bool(adaptive_gap.get("enabled", False))
+        else Step1FixedGapDataset
+    )
+    adaptive_kwargs: dict[str, Any] = {}
+    if dataset_class is Step1AdaptiveGapDataset:
+        adaptive_kwargs = {
+            "curriculum_phases": adaptive_gap["phases"],
+            "calibration_json": adaptive_gap["calibration_json"],
+        }
+    return dataset_class(
         names,
         tokenizer=tokenizer,
         motion_token_dir=paths["motion_token_dir"],
@@ -420,11 +474,21 @@ def build_dataset(
         audio_codebooks_used=audio_contract["codebooks_used"],
         text_serialization=str(data_config.get("text_serialization", "raw")),
         drop_structured_tags=bool(data_config.get("drop_structured_tags", False)),
+        **adaptive_kwargs,
     )
 
 
 def move_batch(batch: Mapping[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
-    keys = ("input_ids", "attention_mask", "audio_codes", "target_slots", "motion_local_labels")
+    keys = (
+        "input_ids",
+        "attention_mask",
+        "audio_codes",
+        "target_slots",
+        "motion_local_labels",
+        "gap_target_probs",
+        "gap_target_mask",
+        "gap_loss_weights",
+    )
     return {key: batch[key].to(device=device, non_blocking=True) for key in keys}
 
 
@@ -468,8 +532,10 @@ def evaluate(
 ) -> dict[str, Any]:
     model.eval()
     base_count = 3 + 2 * len(BODY_SLOTS)
-    # Base metrics followed by audio gap/count and text gap/count.
-    totals = torch.zeros(base_count + 4, dtype=torch.float64, device=device)
+    gap_offset = base_count
+    condition_offset = gap_offset + 7
+    # Base metrics, schedule metrics, then audio gap/count and text gap/count.
+    totals = torch.zeros(condition_offset + 4, dtype=torch.float64, device=device)
     autocast_enabled = use_bf16 and device.type == "cuda"
     alignment_enabled = bool(
         condition_alignment is not None and condition_alignment.get("evaluate", False)
@@ -480,11 +546,25 @@ def evaluate(
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
             output = model(**inputs, return_token_losses=alignment_enabled)
         count = output.count.to(torch.float64)
-        totals[0] += output.loss.detach().to(torch.float64) * count
+        totals[0] += output.ce_loss.detach().to(torch.float64) * count
         totals[1] += output.correct.to(torch.float64)
         totals[2] += count
         totals[3 : 3 + len(BODY_SLOTS)] += output.per_slot_correct.to(torch.float64)
         totals[3 + len(BODY_SLOTS) : base_count] += output.per_slot_count.to(torch.float64)
+        gap_count = output.gap_count.detach().to(torch.float64)
+        totals[gap_offset] += output.gap_loss.detach().to(torch.float64) * gap_count
+        totals[gap_offset + 1] += output.gap_correct.detach().to(torch.float64)
+        totals[gap_offset + 2] += gap_count
+        totals[gap_offset + 3] += batch["normal_gap_sum"].sum().to(
+            device=device, dtype=torch.float64
+        )
+        totals[gap_offset + 4] += batch["normal_gap_count"].sum().to(
+            device=device, dtype=torch.float64
+        )
+        totals[gap_offset + 5] += batch["tail_gap"].ge(0).sum().to(
+            device=device, dtype=torch.float64
+        )
+        totals[gap_offset + 6] += len(batch["names"])
         if alignment_enabled:
             assert condition_alignment is not None and metadata is not None
             selected_indices = deterministic_condition_indices(
@@ -529,7 +609,7 @@ def evaluate(
                         target_mask=selected_mask,
                         margin_nats=float(condition_alignment["margin_nats"]),
                     )
-                offset = base_count + (0 if modality == "audio" else 2)
+                offset = condition_offset + (0 if modality == "audio" else 2)
                 totals[offset] += gap.to(torch.float64).sum()
                 totals[offset + 1] += gap.numel()
     totals = reduce_sums(totals, distributed)
@@ -543,11 +623,27 @@ def evaluate(
             float(slot_correct[slot]) / max(1.0, float(slot_count[slot]))
         )
     condition_gaps = {}
-    for modality, offset in (("audio", base_count), ("text", base_count + 2)):
+    for modality, offset in (
+        ("audio", condition_offset),
+        ("text", condition_offset + 2),
+    ):
         if float(totals[offset + 1]) > 0:
             condition_gaps[modality] = float(totals[offset]) / float(totals[offset + 1])
+    gap_denominator = max(1.0, float(totals[gap_offset + 2]))
+    gap_loss = float(totals[gap_offset]) / gap_denominator
+    anchor_ce = float(totals[0]) / denominator
     return {
-        "loss": float(totals[0]) / denominator,
+        "loss": anchor_ce + gap_loss,
+        "anchor_ce": anchor_ce,
+        "gap_loss": gap_loss,
+        "gap_accuracy": float(totals[gap_offset + 1]) / gap_denominator,
+        "gap_target_count": int(totals[gap_offset + 2].item()),
+        "mean_normal_gap": (
+            float(totals[gap_offset + 3]) / max(1.0, float(totals[gap_offset + 4]))
+        ),
+        "tail_fraction": (
+            float(totals[gap_offset + 5]) / max(1.0, float(totals[gap_offset + 6]))
+        ),
         "slot_accuracy": float(totals[1]) / denominator,
         "per_slot_accuracy": per_slot,
         "condition_gap_nats_per_token": condition_gaps,
@@ -913,8 +1009,20 @@ def main() -> None:
         if args.num_train_epochs <= 0:
             raise ValueError("--num_train_epochs must be positive")
         training["num_train_epochs"] = int(args.num_train_epochs)
+    requested_epochs = int(training.get("num_train_epochs", 10))
     data_config = data_config_from_config(config)
     audio_contract = audio_contract_from_config(config)
+    adaptive_gap = validate_adaptive_gap_config(
+        config,
+        num_epochs=requested_epochs,
+    )
+    if bool(adaptive_gap["enabled"]) and bool(
+        data_config.get("persistent_workers", False)
+    ):
+        raise ValueError(
+            "Adaptive curriculum changes schedules at epoch boundaries; set "
+            "data.persistent_workers=false so workers receive the new epoch."
+        )
     generated_history = validate_generated_history_config(config)
     auxiliary_loss = validate_auxiliary_loss_config(config)
     condition_alignment = validate_condition_alignment_config(config)
@@ -989,6 +1097,7 @@ def main() -> None:
         data_config=data_config,
         neutral_seed=neutral_seed,
         training=True,
+        adaptive_gap=adaptive_gap,
     )
     eval_dataset = build_dataset(
         eval_names,
@@ -998,6 +1107,7 @@ def main() -> None:
         data_config=data_config,
         neutral_seed=neutral_seed,
         training=False,
+        adaptive_gap=adaptive_gap,
     )
     # Fail before DDP training if the serialization contract is broken.
     if len(train_dataset):
@@ -1063,7 +1173,7 @@ def main() -> None:
             find_unused_parameters=False,
         )
     accumulation = int(training.get("gradient_accumulation_steps", 8))
-    epochs = int(training.get("num_train_epochs", 10))
+    epochs = requested_epochs
     updates_per_epoch = math.ceil(len(train_loader) / accumulation)
     total_steps = updates_per_epoch * epochs
     warmup_steps = round(total_steps * float(training.get("warmup_ratio", 0.03)))
@@ -1096,7 +1206,11 @@ def main() -> None:
         trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
         total = sum(parameter.numel() for parameter in model.parameters())
         print("=" * 76)
-        print("Phase 1 fixed-gap multipart planner")
+        print(
+            "Phase 1 adaptive-gap multipart planner"
+            if adaptive_gap["enabled"]
+            else "Phase 1 fixed-gap multipart planner"
+        )
         print(f"Base/init/resume:  {model_checkpoint or paths['base_model']}")
         print(f"Output:            {paths['output_dir']}")
         print(f"Motion tokens:     {paths['motion_token_dir']}")
@@ -1112,6 +1226,17 @@ def main() -> None:
         print(f"Added controls:    {added_tokens}")
         print(f"Parameters:        {trainable:,} trainable / {total:,} total")
         print(f"Updates:           {total_steps} ({updates_per_epoch}/epoch)")
+        if adaptive_gap["enabled"]:
+            print(f"Gap calibration:   {adaptive_gap['calibration_json']}")
+            for phase_index, phase in enumerate(adaptive_gap["phases"]):
+                print(
+                    f"Gap phase {phase_index}:     epochs {phase.start_epoch}-{phase.end_epoch}, "
+                    f"mode={phase.mode}, gaps={phase.min_gap}-{phase.max_gap}, "
+                    f"target_mean={phase.target_mean_gap}, "
+                    f"schedule_weight={phase.schedule_loss_weight_start}->"
+                    f"{phase.schedule_loss_weight_end}, "
+                    f"temperature={phase.temperature}"
+                )
         print(
             "Generated history: "
             f"enabled={bool(generated_history['enabled'])}, "
@@ -1165,7 +1290,34 @@ def main() -> None:
     completed_epochs = start_epoch
     stopped_early = False
     for epoch in range(start_epoch, epochs):
+        current_gap_phase_index = None
+        current_gap_phase = None
+        if adaptive_gap["enabled"]:
+            current_gap_phase_index, current_gap_phase = phase_for_epoch(
+                adaptive_gap["phases"], epoch
+            )
+            if epoch > 0:
+                previous_phase_index, _ = phase_for_epoch(
+                    adaptive_gap["phases"], epoch - 1
+                )
+                if previous_phase_index != current_gap_phase_index:
+                    best_eval_loss = math.inf
+                    epochs_without_improvement = 0
+                    if is_main(rank):
+                        print(
+                            f"[gap curriculum] entering phase {current_gap_phase_index} "
+                            f"at epoch {epoch + 1}; resetting phase-local best metric"
+                        )
+            if is_main(rank):
+                print(
+                    f"[gap curriculum] epoch={epoch + 1} "
+                    f"phase={current_gap_phase_index} "
+                    f"gaps={current_gap_phase.min_gap}-{current_gap_phase.max_gap} "
+                    f"target_mean={current_gap_phase.target_mean_gap} "
+                    f"loss_weight={current_gap_phase.loss_weight(epoch):.4f}"
+                )
         train_dataset.set_epoch(epoch)
+        eval_dataset.set_epoch(epoch)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         epoch_batch_start = resume_batch if epoch == start_epoch else 0
@@ -1454,7 +1606,11 @@ def main() -> None:
                 if is_main(rank):
                     print(
                         f"[eval] step={global_step} loss={eval_metrics['loss']:.5f} "
-                        f"slot_acc={eval_metrics['slot_accuracy']:.4%}"
+                        f"anchor_ce={eval_metrics['anchor_ce']:.5f} "
+                        f"gap_loss={eval_metrics['gap_loss']:.5f} "
+                        f"slot_acc={eval_metrics['slot_accuracy']:.4%} "
+                        f"gap_acc={eval_metrics['gap_accuracy']:.4%} "
+                        f"mean_gap={eval_metrics['mean_normal_gap']:.3f}"
                     )
                     print("[eval slots]", json.dumps(eval_metrics["per_slot_accuracy"], sort_keys=True))
                     if eval_metrics["condition_gap_nats_per_token"]:
@@ -1468,6 +1624,11 @@ def main() -> None:
                     if wandb_run is not None:
                         wandb_payload = {
                             "eval/loss": eval_metrics["loss"],
+                            "eval/anchor_ce": eval_metrics["anchor_ce"],
+                            "eval/gap_loss": eval_metrics["gap_loss"],
+                            "eval/gap_accuracy": eval_metrics["gap_accuracy"],
+                            "eval/mean_normal_gap": eval_metrics["mean_normal_gap"],
+                            "eval/tail_fraction": eval_metrics["tail_fraction"],
                             "eval/slot_accuracy": eval_metrics["slot_accuracy"],
                         }
                         wandb_payload.update(
@@ -1518,7 +1679,11 @@ def main() -> None:
         if is_main(rank):
             print(
                 f"[epoch eval] epoch={epoch + 1} loss={eval_metrics['loss']:.5f} "
-                f"slot_acc={eval_metrics['slot_accuracy']:.4%}"
+                f"anchor_ce={eval_metrics['anchor_ce']:.5f} "
+                f"gap_loss={eval_metrics['gap_loss']:.5f} "
+                f"slot_acc={eval_metrics['slot_accuracy']:.4%} "
+                f"gap_acc={eval_metrics['gap_accuracy']:.4%} "
+                f"mean_gap={eval_metrics['mean_normal_gap']:.3f}"
             )
             print("[epoch eval slots]", json.dumps(eval_metrics["per_slot_accuracy"], sort_keys=True))
             if eval_metrics["condition_gap_nats_per_token"]:
@@ -1531,9 +1696,29 @@ def main() -> None:
             if wandb_run is not None:
                 wandb_payload = {
                     "eval/loss": eval_metrics["loss"],
+                    "eval/anchor_ce": eval_metrics["anchor_ce"],
+                    "eval/gap_loss": eval_metrics["gap_loss"],
+                    "eval/gap_accuracy": eval_metrics["gap_accuracy"],
+                    "eval/mean_normal_gap": eval_metrics["mean_normal_gap"],
+                    "eval/tail_fraction": eval_metrics["tail_fraction"],
                     "eval/slot_accuracy": eval_metrics["slot_accuracy"],
                     "eval/completed_epoch": epoch + 1,
                 }
+                if current_gap_phase is not None:
+                    wandb_payload.update(
+                        {
+                            "curriculum/phase": current_gap_phase_index,
+                            "curriculum/max_gap": current_gap_phase.max_gap,
+                            "curriculum/target_mean_gap": (
+                                current_gap_phase.target_mean_gap
+                                if current_gap_phase.target_mean_gap is not None
+                                else float("nan")
+                            ),
+                            "curriculum/gap_loss_weight": current_gap_phase.loss_weight(
+                                epoch
+                            ),
+                        }
+                    )
                 wandb_payload.update(
                     {
                         f"eval_slot/{name}": value
@@ -1633,7 +1818,7 @@ def main() -> None:
             elif is_main(rank):
                 print(
                     "[generated-history gate] HOLD: "
-                    f"ce={eval_metrics['loss']:.5f}/"
+                    f"ce={eval_metrics['anchor_ce']:.5f}/"
                     f"{generated_history['teacher_forced_ce_max']:.5f}, "
                     f"rollout={rollout_metrics.accuracy:.4%}/"
                     f"{generated_history['rollout_accuracy_min']:.4%}, "
@@ -1695,9 +1880,15 @@ def main() -> None:
                     },
                     step=global_step,
                 )
+        training_milestones = {
+            int(value) for value in training.get("milestone_epochs", [])
+        }
         if (
-            bool(generated_history["enabled"])
-            and completed_epochs in generated_history["milestone_epochs"]
+            (
+                bool(generated_history["enabled"])
+                and completed_epochs in generated_history["milestone_epochs"]
+            )
+            or completed_epochs in training_milestones
         ):
             save_checkpoint(
                 model,

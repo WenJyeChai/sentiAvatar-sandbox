@@ -1,0 +1,125 @@
+paths:
+  base_model: checkpoints/llm
+  output_dir: checkpoints/step1_multipart_adaptive_gap_step2_curriculum50
+  data_dir: SuSuInterActs/SuSuInterActs
+  motion_token_dir: SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4
+  audio_token_dir: SuSuInterActs/SuSuInterActs/audio_tokens_moss_nano_48k_12p5hz_16cb
+  text_json: SuSuInterActs/SuSuInterActs/text_data/motion2text.json
+  train_split: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  eval_split: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+
+data:
+  # fixed_gap remains a backward-compatible fallback and is not used when
+  # adaptive_gap.enabled=true.
+  fixed_gap: 3
+  max_length: 2560
+  num_workers: 4
+  # Required: worker copies must observe the new curriculum epoch.
+  persistent_workers: false
+  require_causal_motion: true
+  max_duration_mismatch_seconds: 0.12
+  seed_mode: mixed_known
+  neutral_seed_json: null
+  neutral_seed_probability: 0.5
+  previous_seed_probability: 0.5
+  generated_anchor_dir: null
+  generated_prefix_probability: 0.0
+
+audio:
+  # Step 1 retains the tested planner input. Frozen Step 2 uses its separate
+  # all-16-codebook 768-D feature cache when interval costs are exported.
+  codec: moss_audio_tokenizer_nano
+  sample_rate: 48000
+  frame_rate: 12.5
+  frame_size: 3840
+  stored_codebooks: 16
+  cardinality: 1024
+  codebooks_used: [0, 1, 2, 3]
+  fusion: concat_linear
+  sparse_audio_embedding: true
+
+text:
+  serialization: structured_fields
+  fields: [expression, action, transcript]
+  missing_markers: true
+
+adaptive_gap:
+  enabled: true
+  calibration_json: checkpoints/step1_adaptive_gap_oracle/calibration.json
+  phases:
+    - start_epoch: 1
+      end_epoch: 5
+      mode: random
+      min_gap: 3
+      max_gap: 7
+      target_mean_gap: null
+      schedule_loss_weight: 0.0
+      temperature: 0.50
+    - start_epoch: 6
+      end_epoch: 12
+      mode: step2_dp
+      min_gap: 3
+      max_gap: 7
+      target_mean_gap: 4.5
+      schedule_loss_weight_start: 0.0
+      schedule_loss_weight_end: 1.0
+      temperature: 0.50
+    - start_epoch: 13
+      end_epoch: 25
+      mode: step2_dp
+      min_gap: 3
+      max_gap: 11
+      target_mean_gap: 6.0
+      schedule_loss_weight: 1.0
+      temperature: 0.40
+    - start_epoch: 26
+      end_epoch: 50
+      mode: step2_dp
+      min_gap: 3
+      max_gap: 15
+      target_mean_gap: 7.0
+      schedule_loss_weight: 1.0
+      temperature: 0.35
+
+# Self-forcing remains a later fine-tuning stage, as decided.
+generated_history:
+  enabled: false
+
+auxiliary_loss:
+  type: none
+
+condition_alignment:
+  enabled: false
+  evaluate: false
+  modalities: []
+  eval_modalities: []
+
+training:
+  seed: 42
+  num_train_epochs: 50
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 32
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  adam_betas: [0.9, 0.95]
+  adam_epsilon: 1.0e-8
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 10
+  eval_steps: 0
+  save_steps: 745
+  save_best: true
+  milestone_epochs: [5, 12, 25, 50]
+  early_stopping_patience: 0
+
+monitoring:
+  report_to: wandb
+  wandb_project: sentiavatar-step1-planner
+  wandb_run_name: step1_multipart_adaptive_gap_step2_curriculum50
+  wandb_tags:
+    [phase1, adaptive-gap, frozen-step2, curriculum50, full-data, nano, q0q3, structured-text]
+  wandb_mode: online
+  wandb_entity: null

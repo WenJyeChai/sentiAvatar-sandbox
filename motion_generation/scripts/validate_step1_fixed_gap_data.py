@@ -24,6 +24,8 @@ from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     load_config,
     load_neutral_seed,
     resolve_data_paths,
+    section,
+    validate_adaptive_gap_config,
     validate_paths,
 )
 from models.step1_mimi_planner import load_text_map, read_split_names  # noqa: E402
@@ -103,6 +105,11 @@ def main() -> None:
     paths = resolve_data_paths(config)
     validate_paths(paths, resume=None)
     data_config = data_config_from_config(config)
+    training = section(config, "training")
+    adaptive_gap = validate_adaptive_gap_config(
+        config,
+        num_epochs=int(training.get("num_train_epochs", 10)),
+    )
     tokenizer = AutoTokenizer.from_pretrained(paths["base_model"], local_files_only=True)
     added = ensure_step1_special_tokens(
         tokenizer,
@@ -126,6 +133,7 @@ def main() -> None:
         data_config=data_config,
         neutral_seed=neutral_seed,
         training=True,
+        adaptive_gap=adaptive_gap,
     )
     eval_dataset = build_dataset(
         eval_names,
@@ -135,19 +143,57 @@ def main() -> None:
         data_config=data_config,
         neutral_seed=neutral_seed,
         training=False,
+        adaptive_gap=adaptive_gap,
     )
-    report = {
-        "config": str(args.config.resolve()),
-        "train": validate_split(train_dataset, "train", args.max_reported_errors),
-        "eval": validate_split(eval_dataset, "eval", args.max_reported_errors),
-    }
+    report = {"config": str(args.config.resolve())}
+    if adaptive_gap["enabled"]:
+        report["adaptive_phases"] = []
+        for phase_index, phase in enumerate(adaptive_gap["phases"]):
+            epoch = phase.start_epoch - 1
+            train_dataset.set_epoch(epoch)
+            eval_dataset.set_epoch(epoch)
+            phase_report = {
+                "phase_index": phase_index,
+                "epoch": phase.start_epoch,
+                "mode": phase.mode,
+                "gap_range": [phase.min_gap, phase.max_gap],
+                "target_mean_gap": phase.target_mean_gap,
+                "train": validate_split(
+                    train_dataset,
+                    f"train_phase_{phase_index}",
+                    args.max_reported_errors,
+                ),
+                "eval": validate_split(
+                    eval_dataset,
+                    f"eval_phase_{phase_index}",
+                    args.max_reported_errors,
+                ),
+            }
+            report["adaptive_phases"].append(phase_report)
+    else:
+        report["train"] = validate_split(
+            train_dataset, "train", args.max_reported_errors
+        )
+        report["eval"] = validate_split(
+            eval_dataset, "eval", args.max_reported_errors
+        )
     print(json.dumps(report, indent=2, ensure_ascii=False))
     if args.output_json is not None:
         output = args.output_json.resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         print("Wrote:", output)
-    failures = report["train"]["error_count_at_least"] + report["eval"]["error_count_at_least"]
+    if adaptive_gap["enabled"]:
+        failures = sum(
+            phase["train"]["error_count_at_least"]
+            + phase["eval"]["error_count_at_least"]
+            for phase in report["adaptive_phases"]
+        )
+    else:
+        failures = (
+            report["train"]["error_count_at_least"]
+            + report["eval"]["error_count_at_least"]
+        )
     if failures:
         raise SystemExit(f"NO-GO: {failures} Phase 1 data records failed validation")
     print("GO: every selected Phase 1 record passed serialization and alignment checks")
