@@ -65,6 +65,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard_id", type=int, default=0)
     parser.add_argument("--max_clips", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--repair_length_mismatch",
+        action="store_true",
+        help=(
+            "Preserve existing costs and score only missing edges when a legacy "
+            "cache was shortened by conservative audio coverage."
+        ),
+    )
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log_every", type=int, default=25)
     return parser.parse_args()
@@ -105,12 +113,23 @@ def section(config: Mapping[str, Any], key: str) -> dict[str, Any]:
     return dict(value)
 
 
-def all_examples(item: Mapping[str, Any]) -> list[VariableGapMaskExample]:
-    usable = VariableGapMaskDataset._usable_motion_frames(dict(item))
+def all_examples(
+    item: Mapping[str, Any],
+    *,
+    num_frames: int,
+    minimum_right_idx: int = 0,
+) -> list[VariableGapMaskExample]:
+    if not 1 <= int(num_frames) <= len(item["motion_tokens"]):
+        raise ValueError(
+            f"{item['name']}: invalid requested frame count {num_frames}/"
+            f"{len(item['motion_tokens'])}"
+        )
     result = []
-    for gap in range(1, min(MAX_GAP, usable - 2) + 1):
-        for left in range(usable - gap - 1):
+    for gap in range(1, min(MAX_GAP, num_frames - 2) + 1):
+        for left in range(num_frames - gap - 1):
             right = left + gap + 1
+            if right < int(minimum_right_idx):
+                continue
             frames = range(left, right + 1)
             result.append(
                 VariableGapMaskExample(
@@ -247,11 +266,33 @@ def save_clip(
     examples: Sequence[VariableGapMaskExample],
     ce_values: np.ndarray,
     latent_values: np.ndarray,
+    existing_ce: np.ndarray | None = None,
+    existing_latent: np.ndarray | None = None,
 ) -> None:
     ce = np.full((num_frames, MAX_GAP + 1), np.inf, dtype=np.float32)
     latent = np.full_like(ce, np.inf)
     ce[:, 0] = 0.0
     latent[:, 0] = 0.0
+    if existing_ce is not None or existing_latent is not None:
+        if existing_ce is None or existing_latent is None:
+            raise ValueError("Both existing cache arrays must be provided together")
+        existing_ce = np.asarray(existing_ce, dtype=np.float32)
+        existing_latent = np.asarray(existing_latent, dtype=np.float32)
+        if existing_ce.shape != existing_latent.shape:
+            raise ValueError("Existing CE/latent cache shapes differ")
+        if (
+            existing_ce.ndim != 2
+            or existing_ce.shape[1] != MAX_GAP + 1
+            or existing_ce.shape[0] > num_frames
+        ):
+            raise ValueError(
+                f"Cannot merge existing cache {existing_ce.shape} into "
+                f"[{num_frames}, {MAX_GAP + 1}]"
+            )
+        ce[: existing_ce.shape[0]] = existing_ce
+        latent[: existing_latent.shape[0]] = existing_latent
+        ce[:, 0] = 0.0
+        latent[:, 0] = 0.0
     for example, ce_value, latent_value in zip(examples, ce_values, latent_values):
         ce[example.left_idx, example.gap_frames] = float(ce_value)
         latent[example.left_idx, example.gap_frames] = float(latent_value)
@@ -267,8 +308,19 @@ def save_clip(
     temporary.replace(path)
 
 
+def load_existing_clip(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with np.load(path, allow_pickle=False) as payload:
+        ce = np.asarray(payload["ce"], dtype=np.float32)
+        latent = np.asarray(payload["hard_latent_l1"], dtype=np.float32)
+    if ce.shape != latent.shape or ce.ndim != 2 or ce.shape[1] != MAX_GAP + 1:
+        raise ValueError(f"Malformed existing interval cache: {path}")
+    return ce, latent
+
+
 def main() -> None:
     args = parse_args()
+    if args.overwrite and args.repair_length_mismatch:
+        raise ValueError("Choose either --overwrite or --repair_length_mismatch")
     if args.num_shards < 1 or not 0 <= args.shard_id < args.num_shards:
         raise ValueError("Require 0 <= shard_id < num_shards")
     if args.batch_size < 1:
@@ -314,12 +366,16 @@ def main() -> None:
     audio_dir = project_path(data["audio_feat_dir"])
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    completed = skipped = missing = 0
+    completed = repaired = skipped = missing = 0
     start = time.perf_counter()
 
     for clip_index, name in enumerate(assigned):
         destination = cache_path(output_dir, name)
-        if destination.is_file() and not args.overwrite:
+        if (
+            destination.is_file()
+            and not args.overwrite
+            and not args.repair_length_mismatch
+        ):
             skipped += 1
             continue
         sequences, stats = load_sequences(
@@ -338,8 +394,32 @@ def main() -> None:
             missing += 1
             continue
         item = sequences[0]
-        usable = VariableGapMaskDataset._usable_motion_frames(item)
-        examples = all_examples(item)
+        # Step 1 serializes the full causal motion-token sequence and clamps
+        # nearest-time audio lookup at the final available feature. The old
+        # exporter used _usable_motion_frames(), which conservatively removed
+        # the final frame for many otherwise valid clips. The oracle must use
+        # the exact same T as Step 1.
+        num_frames = len(item["motion_tokens"])
+        existing_ce = existing_latent = None
+        minimum_right_idx = 0
+        repair_this_clip = False
+        if destination.is_file() and not args.overwrite:
+            existing_ce, existing_latent = load_existing_clip(destination)
+            cached_frames = int(existing_ce.shape[0])
+            if cached_frames == num_frames:
+                skipped += 1
+                continue
+            if cached_frames > num_frames:
+                raise ValueError(
+                    f"{name}: cache has {cached_frames} frames but motion has {num_frames}"
+                )
+            minimum_right_idx = cached_frames
+            repair_this_clip = True
+        examples = all_examples(
+            item,
+            num_frames=num_frames,
+            minimum_right_idx=minimum_right_idx,
+        )
         ce_parts: list[np.ndarray] = []
         latent_parts: list[np.ndarray] = []
         for start_index in range(0, len(examples), args.batch_size):
@@ -355,21 +435,28 @@ def main() -> None:
             latent_parts.append(latent)
         save_clip(
             destination,
-            num_frames=usable,
+            num_frames=num_frames,
             examples=examples,
             ce_values=np.concatenate(ce_parts) if ce_parts else np.empty(0),
             latent_values=np.concatenate(latent_parts) if latent_parts else np.empty(0),
+            existing_ce=existing_ce,
+            existing_latent=existing_latent,
         )
-        completed += 1
-        if completed % args.log_every == 0:
+        if repair_this_clip:
+            repaired += 1
+        else:
+            completed += 1
+        processed = completed + repaired
+        if processed % args.log_every == 0:
             elapsed = time.perf_counter() - start
             print(
-                f"shard={args.shard_id} completed={completed}/{len(assigned)} "
+                f"shard={args.shard_id} completed={completed} repaired={repaired} "
+                f"covered={processed + skipped}/{len(assigned)} "
                 f"windows={len(examples)} elapsed={elapsed:.1f}s"
             )
 
     manifest = {
-        "schema": "sentiavatar.step2_interval_costs.v1",
+        "schema": "sentiavatar.step2_interval_costs.v2",
         "config": str(config_path),
         "checkpoint": str(checkpoint),
         "checkpoint_config_sha256": sha256_file(checkpoint / "config.json"),
@@ -379,6 +466,7 @@ def main() -> None:
         "shard_id": args.shard_id,
         "assigned": len(assigned),
         "completed": completed,
+        "length_mismatch_repaired": repaired,
         "existing_skipped": skipped,
         "missing_or_bad": missing,
         "max_gap": MAX_GAP,
@@ -387,6 +475,10 @@ def main() -> None:
             "hard_latent_l1": "hard decoded RVQ latent L1 per missing frame/part",
         },
         "boundary_content": "ground_truth",
+        "frame_contract": (
+            "full causal motion-token length; nearest audio feature is clamped "
+            "at the available boundary"
+        ),
         "audio_representation": audio.get("audio_representation"),
     }
     manifest_path = output_dir / f"manifest_shard_{args.shard_id:02d}.json"

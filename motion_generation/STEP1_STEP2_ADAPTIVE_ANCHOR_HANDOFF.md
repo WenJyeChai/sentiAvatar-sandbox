@@ -1352,3 +1352,57 @@ A calibrated oracle mean near seven does not prove the learned planner emits
 mean seven during free rollout. After training, the mandatory next evaluator
 must autoregressively sample `next_gap_logits()` plus 16 anchor IDs, report the
 generated gap histogram/oracle regret, then run frozen Step 2 and anchor FID.
+
+### 21.8 Repairing legacy shortened interval caches
+
+The first interval exporter used Step 2's conservative
+`_usable_motion_frames()` rule. On clips whose final motion time was slightly
+later than the final 12.5 Hz audio-feature timestamp, this shortened the cache
+by one or a few frames even though both Step 1 and nearest-time Step 2
+conditioning validly clamp to the last audio feature. The symptom is:
+
+```text
+cached schedule endpoints do not match T=...
+```
+
+Do not discard the existing cache. Rerun the four commands from Section 21.3
+with the same GPU/shard assignment and add:
+
+```text
+--repair_length_mismatch
+```
+
+For example, shard 0 becomes:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/cache_step2_interval_costs.py \
+  --config motion_generation/configs/audio_c2f_body_causal_moss_nano_all16_soft_recovery_sf05_stage2.yaml \
+  --checkpoint checkpoints/mask_multipart_body_causal_moss_nano_all16_variable_c2f_soft_recovery_sf05_stage2_gap1_15 \
+  --split_file SuSuInterActs/SuSuInterActs/split/train_file_list.txt \
+  --split_file SuSuInterActs/SuSuInterActs/split/val_file_list.txt \
+  --output_dir checkpoints/step1_adaptive_gap_oracle/step2_interval_costs \
+  --num_shards 4 --shard_id 0 --device cuda:0 --batch_size 256 \
+  --repair_length_mismatch
+```
+
+Repeat with `CUDA_VISIBLE_DEVICES=1/2/3` and `--shard_id 1/2/3`. The repair
+preserves every existing score and evaluates only edges whose right endpoint
+reaches the missing suffix. It is therefore much cheaper than `--overwrite`.
+
+After all repair manifests finish, regenerate the DP schedules:
+
+```bash
+python motion_generation/scripts/calibrate_step1_adaptive_gap.py \
+  --config motion_generation/configs/step1_multipart_adaptive_gap_step2_curriculum50.yaml \
+  --cost_dir checkpoints/step1_adaptive_gap_oracle/step2_interval_costs \
+  --split_file SuSuInterActs/SuSuInterActs/split/train_file_list.txt \
+  --split_file SuSuInterActs/SuSuInterActs/split/val_file_list.txt \
+  --output_json checkpoints/step1_adaptive_gap_oracle/calibration.json \
+  --calibration_max_clips 512 --ce_weight 1.0 --latent_weight 0.1 \
+  --overwrite
+```
+
+Then rerun the all-phase preflight. Training remains a NO-GO until every
+phase reports 19,019/19,019 valid training clips and 635/635 valid validation
+clips.

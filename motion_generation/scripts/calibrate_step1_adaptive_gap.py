@@ -143,7 +143,7 @@ def validate_manifests(cost_dir: Path, *, allow_incomplete: bool) -> list[dict[s
             )
         covered = int(value.get("completed", 0)) + int(
             value.get("existing_skipped", 0)
-        )
+        ) + int(value.get("length_mismatch_repaired", 0))
         if covered != int(value.get("assigned", -1)):
             errors.append(
                 f"shard {value['shard_id']} covered {covered}/"
