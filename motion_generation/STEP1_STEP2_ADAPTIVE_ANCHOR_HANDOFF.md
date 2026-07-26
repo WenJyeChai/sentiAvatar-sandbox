@@ -1614,3 +1614,127 @@ Step-2-infilled FID and decoded RMSE, then lower Step 2 CE/higher missing-token
 accuracy. The GT-anchor condition is headroom, not a competitor. The
 anchor-substitution protocol isolates anchor damage and must not be merged
 with the end-to-end Step-2-infilled result.
+
+### 22.5 Experiment A result
+
+The 635-clip final test showed a real but very small downstream movement:
+
+| Metric | GT anchors | CE control | Step-2 guided |
+|---|---:|---:|---:|
+| Frozen Step 2 C2F CE | 4.1280 | 9.5516 | 9.5282 |
+| Frozen Step 2 missing-token accuracy | 17.884% | 3.436% | 3.459% |
+| Step-2-infilled FID, raw-motion reference | 4.826 | 64.838 | 64.507 |
+| Anchor-substitution FID, raw-motion reference | 0.772 | 3.132 | 3.156 |
+
+The guidance improved end-to-end FID by only 0.51% while slightly worsening
+anchor-substitution FID. This is directional evidence that a frozen completer
+can shape Step 1 endpoints, but it is not a practical solution. Generated
+boundary content remains the dominant bottleneck.
+
+Experiment A already selected one deterministic guidance interval per clip and
+resampled that interval each training epoch. Therefore merely adding rotating
+interval selection is not a distinct next experiment.
+
+## 23. Experiment B: visited-state boundary training
+
+Experiment B targets the remaining training/deployment mismatch while keeping
+placement fixed at gap 7. It is a fine-tuning stage initialized from the
+Experiment A guided checkpoint:
+
+1. for 50% of training rows, start from GT history before a selected local
+   region and roll out only the one or two anchors immediately preceding the
+   selected Step 2 interval;
+2. the predicted previous anchor defines the actual visited left-boundary
+   state;
+3. from that state, Step 1 supplies the right anchor using the hard-forward,
+   straight-through-backward estimator as Experiment A;
+4. Step 2 fills the canonical seven-frame interior and contributes its C2F
+   loss only to Step 1;
+5. the other 50% of rows replay exact GT history to prevent collapse;
+6. GT anchor CE remains active and Step 2 remains frozen.
+
+This is DAgger-like endpoint training: the learner visits a nearby state under
+its current policy, while GT targets and frozen Step 2 provide supervision at
+that state. It is deliberately not the generic full-utterance
+`generated_history` curriculum. The first fixed-gap interval is excluded
+because it has no predicted previous anchor.
+
+The objective remains:
+
+\[
+L=L_{\mathrm{anchor\,CE}}+
+0.05L_{\mathrm{frozen\,Step2\,C2F}}.
+\]
+
+The matched Experiment B control uses the identical local visited-state
+rollout, 50% GT replay, and initialization but sets the Step 2 weight to zero.
+
+### 23.1 Preflight and one-GPU smoke
+
+```bash
+python motion_generation/scripts/validate_step1_fixed_gap_data.py \
+  --config motion_generation/configs/step1_experiment_b_fixed_gap7_visited_state_step2.yaml \
+  --max_train_clips 32 \
+  --max_eval_clips 32 \
+  --output_json checkpoints/step1_experiment_b_fixed_gap7_visited_state_step2_smoke/preflight.json
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_experiment_b_fixed_gap7_visited_state_step2.yaml \
+  --init_from_checkpoint checkpoints/step1_experiment_a_fixed_gap7_online_step2_6k/final \
+  --max_train_clips 64 \
+  --max_eval_clips 32 \
+  --num_train_epochs 1 \
+  --output_dir checkpoints/step1_experiment_b_fixed_gap7_visited_state_step2_smoke
+```
+
+The training header must report
+`left_boundary=planner_history`, `Visited state: enabled=True`,
+`probability=0.5`, `depths=[1, 2]`, and `GT_replay=0.500`. Training logs must
+show `p_gen=0`, `p_visit=0.500`, a finite `step2` value, and `w_s2=0.050`.
+
+### 23.2 Matched 6K runs
+
+Visited-state CE control:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun \
+  --nproc_per_node=4 --master_port=29516 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_experiment_b_fixed_gap7_visited_state_step2.yaml \
+  --init_from_checkpoint checkpoints/step1_experiment_a_fixed_gap7_online_step2_6k/final \
+  --step2_guidance_weight 0 \
+  --output_dir checkpoints/step1_experiment_b_fixed_gap7_visited_state_step2_6k_control
+```
+
+Visited-state Step 2 guided:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun \
+  --nproc_per_node=4 --master_port=29517 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_experiment_b_fixed_gap7_visited_state_step2.yaml \
+  --init_from_checkpoint checkpoints/step1_experiment_a_fixed_gap7_online_step2_6k/final
+```
+
+Both runs start from the same Experiment A guided `final` checkpoint. Do not
+initialize the control from the old CE-only Experiment A checkpoint, because
+that would confound initialization with the Experiment B loss.
+
+### 23.3 Evaluation
+
+Use the Section 22.4 pipeline with these substitutions:
+
+```bash
+--checkpoint b_control_final=checkpoints/step1_experiment_b_fixed_gap7_visited_state_step2_6k_control/final
+--checkpoint b_guided_final=checkpoints/step1_experiment_b_fixed_gap7_visited_state_step2_6k/final
+```
+
+Use distinct output directories beginning with
+`step1_experiment_b_final_comparison`. Export rollout caches, adapt them with
+`prepare_step1_fixed_gap_motion_evaluation.py`, and run the same frozen Step 2
+and FID evaluator. Experiment B succeeds only if its guided checkpoint
+materially beats its matched B control—not merely the Experiment A models—on
+hard-rollout Step-2-infilled FID and decoded RMSE.

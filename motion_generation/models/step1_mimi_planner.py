@@ -284,6 +284,7 @@ class Step1FixedGapDataset(Dataset):
         step2_guidance_audio_fps: float = 12.5,
         step2_guidance_audio_feat_dim: int = 768,
         step2_guidance_resample: bool = False,
+        step2_guidance_min_anchor_group: int = 0,
     ) -> None:
         if seed_mode not in {"observed", "previous", "neutral", "mixed_known", "mixed_all"}:
             raise ValueError(
@@ -351,6 +352,13 @@ class Step1FixedGapDataset(Dataset):
         self.step2_guidance_audio_fps = float(step2_guidance_audio_fps)
         self.step2_guidance_audio_feat_dim = int(step2_guidance_audio_feat_dim)
         self.step2_guidance_resample = bool(step2_guidance_resample)
+        self.step2_guidance_min_anchor_group = int(
+            step2_guidance_min_anchor_group
+        )
+        if self.step2_guidance_min_anchor_group < 0:
+            raise ValueError(
+                "step2_guidance_min_anchor_group must be non-negative"
+            )
         if self.step2_guidance_audio_feature_dir is not None:
             if self.step2_guidance_audio_fps <= 0:
                 raise ValueError("Step 2 guidance audio FPS must be positive")
@@ -461,9 +469,13 @@ class Step1FixedGapDataset(Dataset):
             start=1,
         ):
             gap = gap_from_anchor_times(left_time, right_time)
-            if gap >= 3:
+            anchor_group = anchor_index - 1
+            if (
+                gap >= 3
+                and anchor_group >= self.step2_guidance_min_anchor_group
+            ):
                 candidates.append(
-                    (anchor_index - 1, int(left_time), int(right_time), int(gap))
+                    (anchor_group, int(left_time), int(right_time), int(gap))
                 )
         if not candidates:
             raise ValueError(f"{name}: no normal interval is available for Step 2 guidance")

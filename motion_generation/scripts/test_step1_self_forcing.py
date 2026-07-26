@@ -27,6 +27,11 @@ from utils.step1_self_forcing import (  # noqa: E402
     generate_history_batch,
     generated_history_probability,
 )
+from utils.step1_visited_state import (  # noqa: E402
+    apply_visited_state_history,
+    deterministic_visited_indices,
+    local_rollout_target_slots,
+)
 
 
 def tiny_q0q3_planner() -> MimiQwenPlanner:
@@ -87,6 +92,46 @@ def synthetic_batch(planner: MimiQwenPlanner) -> dict[str, torch.Tensor]:
         "audio_codes": audio_codes,
         "target_slots": target_slots,
         "motion_local_labels": labels,
+    }
+
+
+def synthetic_visited_batch(
+    planner: MimiQwenPlanner,
+) -> dict[str, torch.Tensor]:
+    length = 60
+    input_ids = torch.ones((2, length), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    audio_codes = torch.full((2, length, 4), -1, dtype=torch.long)
+    target_slots = torch.full_like(input_ids, -1)
+    target_anchor_ids = torch.full_like(input_ids, -1)
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    starts = (4, 24, 44)
+    for row in range(2):
+        for group, start in enumerate(starts):
+            target_slots[row, start : start + BODY_SLOT_COUNT] = torch.arange(
+                BODY_SLOT_COUNT
+            )
+            target_anchor_ids[row, start : start + BODY_SLOT_COUNT] = group
+            local_ids = torch.tensor(
+                [
+                    (row * 71 + group * 43 + slot * 13 + 5)
+                    % BODY_CODEBOOK_SIZE
+                    for slot in range(BODY_SLOT_COUNT)
+                ]
+            )
+            labels[row, start : start + BODY_SLOT_COUNT] = local_ids
+            for slot, local_id in enumerate(local_ids.tolist()):
+                input_ids[row, start + slot] = planner.motion_token_ids[
+                    slot, local_id
+                ]
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "audio_codes": audio_codes,
+        "target_slots": target_slots,
+        "target_anchor_ids": target_anchor_ids,
+        "motion_local_labels": labels,
+        "selected_anchor_groups": torch.tensor([1, 2]),
     }
 
 
@@ -203,3 +248,69 @@ def test_generated_history_can_feed_gradient_enabled_training_forward() -> None:
     assert output.loss is not None
     output.loss.backward()
     assert any(parameter.grad is not None for parameter in planner.parameters())
+
+
+def test_local_visited_state_rolls_only_preceding_anchor_groups() -> None:
+    planner = tiny_q0q3_planner()
+    batch = synthetic_visited_batch(planner)
+    rollout_slots, depths = local_rollout_target_slots(
+        target_slots=batch["target_slots"],
+        target_anchor_ids=batch["target_anchor_ids"],
+        selected_anchor_groups=batch["selected_anchor_groups"],
+        names=["clip-0", "clip-1"],
+        rollout_depths=[1, 2],
+        seed=42,
+        epoch=0,
+        batch_index=0,
+    )
+    # Group 1 can only roll one predecessor; group 2 may roll one or two.
+    assert depths[0] == 1
+    assert depths[1] in {1, 2}
+    assert int(rollout_slots[0].ge(0).sum()) == BODY_SLOT_COUNT
+    assert int(rollout_slots[1].ge(0).sum()) == depths[1] * BODY_SLOT_COUNT
+    assert not bool(
+        (
+            rollout_slots.ge(0)
+            & batch["target_anchor_ids"].ge(
+                batch["selected_anchor_groups"].view(-1, 1)
+            )
+        ).any()
+    )
+
+
+def test_visited_state_keeps_gt_replay_rows_and_does_not_roll_the_right_anchor() -> None:
+    planner = tiny_q0q3_planner()
+    batch = synthetic_visited_batch(planner)
+    original = batch["input_ids"].clone()
+    generated, stats = apply_visited_state_history(
+        planner,
+        batch,
+        ["clip-0", "clip-1"],
+        [1],
+        rollout_depths=[2],
+        seed=42,
+        epoch=0,
+        batch_index=0,
+        microbatch_size=1,
+        use_bf16=False,
+    )
+
+    assert torch.equal(generated[0], original[0])
+    selected_groups = batch["target_anchor_ids"][1]
+    rolled = torch.isin(selected_groups, torch.tensor([0, 1]))
+    right = selected_groups.eq(2)
+    assert torch.equal(generated[1, ~rolled], original[1, ~rolled])
+    assert torch.equal(generated[1, right], original[1, right])
+    assert stats.clips == 1
+    assert stats.anchors == 2
+    assert stats.tokens == 2 * BODY_SLOT_COUNT
+    assert stats.depth2_clips == 1
+
+    selected = deterministic_visited_indices(
+        [f"clip-{index}" for index in range(32)],
+        0.5,
+        seed=42,
+        epoch=0,
+        batch_index=0,
+    )
+    assert len(selected) == 16

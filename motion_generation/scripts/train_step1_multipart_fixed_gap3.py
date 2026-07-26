@@ -73,6 +73,13 @@ from utils.step1_condition_alignment import (  # noqa: E402
 from utils.step1_frozen_step2_guidance import (  # noqa: E402
     FrozenStep2AnchorGuidance,
     FrozenStep2GuidanceOutput,
+    LEFT_BOUNDARY_MODES,
+    planner_history_left_boundaries,
+)
+from utils.step1_visited_state import (  # noqa: E402
+    VisitedStateBatchStats,
+    apply_visited_state_history,
+    deterministic_visited_indices,
 )
 
 
@@ -289,6 +296,12 @@ def validate_frozen_step2_guidance_config(
             "weight": float(guidance.get("weight", 0.05)),
             "warmup_epochs": float(guidance.get("warmup_epochs", 1.0)),
             "temperature": float(guidance.get("temperature", 1.0)),
+            "left_boundary_mode": str(
+                guidance.get("left_boundary_mode", "ground_truth")
+            ),
+            "min_anchor_group": int(
+                guidance.get("min_anchor_group", 0)
+            ),
         }
     )
     if guidance["weight"] < 0:
@@ -297,6 +310,15 @@ def validate_frozen_step2_guidance_config(
         raise ValueError("Frozen Step 2 guidance warmup_epochs must be non-negative")
     if guidance["temperature"] <= 0:
         raise ValueError("Frozen Step 2 guidance temperature must be positive")
+    if guidance["left_boundary_mode"] not in LEFT_BOUNDARY_MODES:
+        raise ValueError(
+            "frozen_step2_guidance.left_boundary_mode must be one of "
+            f"{LEFT_BOUNDARY_MODES}"
+        )
+    if guidance["min_anchor_group"] < 0:
+        raise ValueError(
+            "frozen_step2_guidance.min_anchor_group must be non-negative"
+        )
     return guidance
 
 
@@ -584,6 +606,11 @@ def build_dataset(
             else 768
         ),
         step2_guidance_resample=bool(training and guidance_enabled),
+        step2_guidance_min_anchor_group=(
+            int(frozen_step2_guidance.get("min_anchor_group", 0))
+            if guidance_enabled
+            else 0
+        ),
         **adaptive_kwargs,
     )
 
@@ -613,6 +640,29 @@ def move_step2_guidance_batch(
         key: value.to(device=device, non_blocking=True)
         for key, value in guidance.items()
     }
+
+
+def attach_planner_history_left_boundaries(
+    *,
+    model: torch.nn.Module,
+    planner_inputs: Mapping[str, torch.Tensor],
+    guidance_inputs: dict[str, torch.Tensor],
+) -> None:
+    """Use the actual detached Step 1 history as each Step 2 left endpoint."""
+
+    unwrapped = (
+        model.module if isinstance(model, DistributedDataParallel) else model
+    )
+    guidance_inputs["left_boundary_local_ids"] = (
+        planner_history_left_boundaries(
+            input_ids=planner_inputs["input_ids"],
+            target_slots=planner_inputs["target_slots"],
+            target_anchor_ids=planner_inputs["target_anchor_ids"],
+            selected_anchor_groups=planner_inputs["selected_anchor_groups"],
+            motion_token_ids=unwrapped.motion_token_ids,
+            fallback_left_local_ids=guidance_inputs["motion_tokens"][:, 0],
+        )
+    )
 
 
 def move_condition_metadata(
@@ -675,6 +725,12 @@ def evaluate(
                 device=device, non_blocking=True
             )
             inputs["selected_anchor_groups"] = guidance_inputs["anchor_groups"]
+            if step2_guidance_model.left_boundary_mode == "planner_history":
+                attach_planner_history_left_boundaries(
+                    model=model,
+                    planner_inputs=inputs,
+                    guidance_inputs=guidance_inputs,
+                )
         metadata = move_condition_metadata(batch, device) if alignment_enabled else None
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
             output = model(**inputs, return_token_losses=alignment_enabled)
@@ -989,6 +1045,42 @@ def validate_generated_history_config(config: Mapping[str, Any]) -> dict[str, An
     return generated
 
 
+def validate_visited_state_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    visited = section(config, "visited_state_guidance")
+    visited.setdefault("enabled", False)
+    visited.setdefault("probability", 0.5)
+    visited.setdefault("rollout_depths", [1, 2])
+    visited.setdefault("rollout_microbatch_size", 8)
+    visited["enabled"] = bool(visited["enabled"])
+    visited["probability"] = float(visited["probability"])
+    visited["rollout_microbatch_size"] = int(
+        visited["rollout_microbatch_size"]
+    )
+    visited["rollout_depths"] = sorted(
+        {int(value) for value in visited["rollout_depths"]}
+    )
+    if not 0 <= visited["probability"] <= 1:
+        raise ValueError(
+            "visited_state_guidance.probability must be in [0,1]"
+        )
+    if visited["enabled"] and visited["probability"] <= 0:
+        raise ValueError(
+            "Enabled visited-state guidance requires positive probability"
+        )
+    if visited["rollout_microbatch_size"] <= 0:
+        raise ValueError(
+            "visited_state_guidance.rollout_microbatch_size must be positive"
+        )
+    if not visited["rollout_depths"] or any(
+        value not in {1, 2} for value in visited["rollout_depths"]
+    ):
+        raise ValueError(
+            "visited_state_guidance.rollout_depths must contain one or both "
+            "of [1,2]"
+        )
+    return visited
+
+
 def validate_auxiliary_loss_config(config: Mapping[str, Any]) -> dict[str, Any]:
     auxiliary = section(config, "auxiliary_loss")
     auxiliary.setdefault("type", "none")
@@ -1215,6 +1307,7 @@ def main() -> None:
             "data.persistent_workers=false so workers receive the new epoch."
         )
     generated_history = validate_generated_history_config(config)
+    visited_state = validate_visited_state_config(config)
     auxiliary_loss = validate_auxiliary_loss_config(config)
     condition_alignment = validate_condition_alignment_config(config)
     if bool(frozen_step2_guidance["enabled"]):
@@ -1227,9 +1320,49 @@ def main() -> None:
             raise ValueError(
                 "Experiment A isolates anchor content; disable adaptive_gap"
             )
-        if bool(generated_history["enabled"]):
+        left_boundary_mode = str(
+            frozen_step2_guidance["left_boundary_mode"]
+        )
+        if left_boundary_mode == "ground_truth" and (
+            bool(generated_history["enabled"])
+            or bool(visited_state["enabled"])
+        ):
             raise ValueError(
-                "Experiment A uses GT history; disable generated_history"
+                "GT-boundary Experiment A requires generated_history and "
+                "visited_state_guidance to be disabled"
+            )
+        if (
+            left_boundary_mode == "planner_history"
+            and not bool(visited_state["enabled"])
+        ):
+            raise ValueError(
+                "planner_history Step 2 guidance requires "
+                "visited_state_guidance"
+            )
+        if (
+            left_boundary_mode == "planner_history"
+            and bool(generated_history["enabled"])
+        ):
+            raise ValueError(
+                "Experiment B uses local visited-state rollouts, not generic "
+                "full-history generated_history"
+            )
+        if bool(visited_state["enabled"]) and int(
+            frozen_step2_guidance.get("min_anchor_group", 0)
+        ) < 1:
+            raise ValueError(
+                "Visited-state guidance requires "
+                "frozen_step2_guidance.min_anchor_group>=1"
+            )
+        if (
+            left_boundary_mode == "planner_history"
+            and str(data_config.get("seed_mode", "observed"))
+            in {"neutral", "mixed_all"}
+        ):
+            raise ValueError(
+                "planner_history Step 2 guidance currently requires an "
+                "observed/previous seed; neutral seed tokens are not represented "
+                "in the guidance window"
             )
         if data_config.get("generated_anchor_dir") is not None or float(
             data_config.get("generated_prefix_probability", 0.0)
@@ -1257,6 +1390,11 @@ def main() -> None:
     ):
         raise ValueError(
             "On-policy generated_history cannot be mixed with the legacy disk-cache curriculum"
+        )
+    if bool(generated_history["enabled"]) and bool(visited_state["enabled"]):
+        raise ValueError(
+            "Generic generated_history and local visited_state_guidance are "
+            "mutually exclusive"
         )
     seed = int(training.get("seed", 42))
     seed_everything(seed, rank)
@@ -1315,6 +1453,9 @@ def main() -> None:
             frozen_step2_guidance["checkpoint"],
             stage_weights=frozen_step2_guidance["stage_weights"],
             temperature=float(frozen_step2_guidance["temperature"]),
+            left_boundary_mode=str(
+                frozen_step2_guidance["left_boundary_mode"]
+            ),
             dtype=dtype,
             device=device,
         )
@@ -1486,6 +1627,13 @@ def main() -> None:
             f"p_max={generated_history['max_probability']}"
         )
         print(
+            "Visited state:     "
+            f"enabled={bool(visited_state['enabled'])}, "
+            f"probability={visited_state['probability']}, "
+            f"depths={visited_state['rollout_depths']}, "
+            f"GT_replay={1.0 - visited_state['probability']:.3f}"
+        )
+        print(
             "Auxiliary loss:    "
             f"type={auxiliary_loss['type']}, weight={auxiliary_loss['weight']}, "
             f"warmup={auxiliary_loss['warmup_epochs']} epochs, "
@@ -1506,7 +1654,9 @@ def main() -> None:
             f"enabled={bool(frozen_step2_guidance['enabled'])}, "
             f"weight={frozen_step2_guidance.get('weight', 0.0)}, "
             f"warmup={frozen_step2_guidance.get('warmup_epochs', 0.0)}, "
-            f"temperature={frozen_step2_guidance.get('temperature', 1.0)}"
+            f"temperature={frozen_step2_guidance.get('temperature', 1.0)}, "
+            "left_boundary="
+            f"{frozen_step2_guidance.get('left_boundary_mode', 'ground_truth')}"
         )
         if bool(frozen_step2_guidance["enabled"]):
             print(f"Step 2 checkpoint: {frozen_step2_guidance['checkpoint']}")
@@ -1538,6 +1688,10 @@ def main() -> None:
     alignment_running = torch.zeros(5, dtype=torch.float64, device=device)
     # Weighted guidance loss/examples, hard CE sum, correct/count, q0 correct/count.
     step2_guidance_running = torch.zeros(7, dtype=torch.float64, device=device)
+    # Visited clips, rolled anchors/tokens/correct, depth-1/depth-2 clips.
+    visited_state_running = torch.zeros(
+        6, dtype=torch.float64, device=device
+    )
     run_start = time.perf_counter()
 
     completed_epochs = start_epoch
@@ -1638,6 +1792,7 @@ def main() -> None:
                 inputs["input_ids"].shape[0], dtype=torch.bool, device=device
             )
             rollout_stats = GeneratedHistoryBatchStats()
+            visited_stats = VisitedStateBatchStats()
             if generated_indices:
                 generated_mask[generated_indices] = True
                 unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
@@ -1652,6 +1807,52 @@ def main() -> None:
                 )
                 unwrapped.train(was_training)
                 inputs["input_ids"] = generated_input_ids
+            if bool(visited_state["enabled"]):
+                visited_indices = deterministic_visited_indices(
+                    batch["names"],
+                    float(visited_state["probability"]),
+                    seed=seed,
+                    epoch=epoch,
+                    batch_index=batch_index,
+                )
+                if visited_indices:
+                    generated_mask[visited_indices] = True
+                    unwrapped = (
+                        model.module
+                        if isinstance(model, DistributedDataParallel)
+                        else model
+                    )
+                    was_training = unwrapped.training
+                    unwrapped.eval()
+                    visited_input_ids, visited_stats = (
+                        apply_visited_state_history(
+                            unwrapped,
+                            inputs,
+                            batch["names"],
+                            visited_indices,
+                            rollout_depths=visited_state["rollout_depths"],
+                            seed=seed,
+                            epoch=epoch,
+                            batch_index=batch_index,
+                            microbatch_size=int(
+                                visited_state["rollout_microbatch_size"]
+                            ),
+                            use_bf16=use_bf16,
+                        )
+                    )
+                    unwrapped.train(was_training)
+                    inputs["input_ids"] = visited_input_ids
+            if (
+                step2_guidance_model is not None
+                and step2_guidance_model.left_boundary_mode
+                == "planner_history"
+            ):
+                assert step2_guidance_inputs is not None
+                attach_planner_history_left_boundaries(
+                    model=model,
+                    planner_inputs=inputs,
+                    guidance_inputs=step2_guidance_inputs,
+                )
             with sync_context:
                 with torch.autocast(
                     device_type=device.type,
@@ -1780,6 +1981,18 @@ def main() -> None:
                 output.expected_distortion_loss.detach().to(torch.float64) * auxiliary_count
             )
             running[split_offset + 16] += auxiliary_count
+            visited_state_running += torch.tensor(
+                (
+                    visited_stats.clips,
+                    visited_stats.anchors,
+                    visited_stats.tokens,
+                    visited_stats.correct,
+                    visited_stats.depth1_clips,
+                    visited_stats.depth2_clips,
+                ),
+                dtype=torch.float64,
+                device=device,
+            )
             if counterfactual_loss is not None and condition_gap is not None:
                 alignment_running[0] += (
                     counterfactual_loss.detach().to(torch.float64) * condition_examples
@@ -1828,6 +2041,10 @@ def main() -> None:
                     step2_guidance_running.clone(),
                     distributed,
                 )
+                visited_state_totals = reduce_sums(
+                    visited_state_running.clone(),
+                    distributed,
+                )
                 denominator = max(1.0, float(totals[2]))
                 if is_main(rank):
                     split_offset = base_metric_count
@@ -1846,6 +2063,21 @@ def main() -> None:
                         "curriculum/generated_history_probability": generated_probability,
                         "curriculum/generated_clips": float(totals[split_offset + 6]),
                         "curriculum/generated_anchors": float(totals[split_offset + 7]),
+                        "visited_state/probability": float(
+                            visited_state["probability"]
+                        ),
+                        "visited_state/clips": float(
+                            visited_state_totals[0]
+                        ),
+                        "visited_state/anchors": float(
+                            visited_state_totals[1]
+                        ),
+                        "visited_state/depth1_clips": float(
+                            visited_state_totals[4]
+                        ),
+                        "visited_state/depth2_clips": float(
+                            visited_state_totals[5]
+                        ),
                         "auxiliary/weight": current_auxiliary_weight,
                         "condition/weight": current_condition_weight,
                         "step2_guidance/weight": current_step2_guidance_weight,
@@ -1916,11 +2148,21 @@ def main() -> None:
                             {
                                 "train_generated/loss": float(totals[split_offset + 3]) / generated_count,
                                 "train_generated/slot_accuracy": float(totals[split_offset + 4]) / generated_count,
+                            }
+                        )
+                    if float(totals[split_offset + 8]) > 0:
+                        train_metrics.update(
+                            {
                                 "rollout/accuracy": float(totals[split_offset + 9]) / rollout_tokens,
                                 "rollout/q0_accuracy": float(totals[split_offset + 10]) / rollout_q0_tokens,
                                 "rollout/mean_confidence": float(totals[split_offset + 12]) / rollout_tokens,
                                 "rollout/mean_entropy": float(totals[split_offset + 13]) / rollout_tokens,
                             }
+                        )
+                    if float(visited_state_totals[2]) > 0:
+                        train_metrics["visited_state/rollout_accuracy"] = (
+                            float(visited_state_totals[3])
+                            / float(visited_state_totals[2])
                         )
                     print(
                         f"step={global_step}/{total_steps} epoch={epoch + 1}/{epochs} "
@@ -1929,6 +2171,7 @@ def main() -> None:
                         f"step2={train_metrics.get('step2_guidance/loss', 0.0):.5f} "
                         f"w_s2={current_step2_guidance_weight:.3f} "
                         f"p_gen={generated_probability:.3f} "
+                        f"p_visit={float(visited_state['probability']):.3f} "
                         f"lr={scheduler.get_last_lr()[0]:.3e} "
                         f"elapsed={time.perf_counter() - run_start:.1f}s"
                     )
@@ -1937,6 +2180,7 @@ def main() -> None:
                 running.zero_()
                 alignment_running.zero_()
                 step2_guidance_running.zero_()
+                visited_state_running.zero_()
 
             if eval_steps > 0 and global_step % eval_steps == 0:
                 eval_metrics = evaluate(

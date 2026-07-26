@@ -4,6 +4,11 @@ Experiment A keeps the temporal schedule fixed.  Step 1 supplies one predicted
 right boundary per clip, while the left boundary and missing-token targets stay
 canonical.  The right boundary is hard in the forward pass and differentiable
 in the backward pass through a straight-through categorical embedding.
+
+Experiment B keeps the same fixed schedule but may replace the left boundary
+with the detached token IDs actually present in Step 1's on-policy history.
+This exposes the frozen completer to the generated boundary pair used at
+deployment without pretending that gradients flow through the older anchor.
 """
 
 from __future__ import annotations
@@ -17,6 +22,79 @@ import torch.nn.functional as F
 from torch import nn
 
 from models.audio_motion_model import AudioMotionTransformer
+
+
+LEFT_BOUNDARY_MODES = ("ground_truth", "planner_history")
+
+
+def planner_history_left_boundaries(
+    *,
+    input_ids: torch.Tensor,
+    target_slots: torch.Tensor,
+    target_anchor_ids: torch.Tensor,
+    selected_anchor_groups: torch.Tensor,
+    motion_token_ids: torch.Tensor,
+    fallback_left_local_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Extract each selected interval's actual left endpoint from Step 1 input.
+
+    Group zero begins at the externally supplied seed and therefore retains
+    ``fallback_left_local_ids``.  Later groups read the previous anchor from
+    ``input_ids``.  Those inputs may be GT or detached on-policy generations,
+    depending on the generated-history curriculum for the row.
+    """
+
+    if not (
+        input_ids.shape == target_slots.shape == target_anchor_ids.shape
+    ):
+        raise ValueError(
+            "input_ids, target_slots, and target_anchor_ids must share [B,L]"
+        )
+    batch = input_ids.shape[0]
+    if tuple(selected_anchor_groups.shape) != (batch,):
+        raise ValueError("selected_anchor_groups must have shape [B]")
+    if tuple(motion_token_ids.shape) != (16, 512):
+        raise ValueError("motion_token_ids must have shape [16,512]")
+    if tuple(fallback_left_local_ids.shape) != (batch, 16):
+        raise ValueError("fallback_left_local_ids must have shape [B,16]")
+    if bool(selected_anchor_groups.lt(0).any()):
+        raise ValueError("selected_anchor_groups must be non-negative")
+
+    result = fallback_left_local_ids.to(
+        device=input_ids.device,
+        dtype=torch.long,
+    ).clone()
+    previous_rows = selected_anchor_groups.gt(0)
+    if not bool(previous_rows.any()):
+        return result
+
+    row_indices = previous_rows.nonzero(as_tuple=False).squeeze(-1)
+    previous_groups = selected_anchor_groups.index_select(0, row_indices) - 1
+    for slot in range(16):
+        rows_target_slots = target_slots.index_select(0, row_indices)
+        rows_anchor_ids = target_anchor_ids.index_select(0, row_indices)
+        selected = rows_target_slots.eq(slot) & rows_anchor_ids.eq(
+            previous_groups.view(-1, 1)
+        )
+        counts = selected.sum(dim=-1)
+        if not torch.equal(counts, torch.ones_like(counts)):
+            raise ValueError(
+                "Every non-seed interval must expose exactly one previous "
+                f"anchor input for slot {slot}; counts={counts.tolist()}"
+            )
+        positions = selected.to(torch.long).argmax(dim=-1)
+        planner_ids = input_ids[row_indices, positions]
+        allowed = motion_token_ids[slot].to(input_ids.device)
+        matches = planner_ids.view(-1, 1).eq(allowed.view(1, -1))
+        match_counts = matches.sum(dim=-1)
+        if not torch.equal(match_counts, torch.ones_like(match_counts)):
+            raise ValueError(
+                "A planner-history boundary contains an ID outside the "
+                f"slot-{slot} motion vocabulary"
+            )
+        local_ids = matches.to(torch.long).argmax(dim=-1)
+        result[row_indices, slot] = local_ids
+    return result
 
 
 @dataclass
@@ -40,12 +118,18 @@ class FrozenStep2AnchorGuidance(nn.Module):
         *,
         stage_weights: Sequence[float],
         temperature: float = 1.0,
+        left_boundary_mode: str = "ground_truth",
     ) -> None:
         super().__init__()
         if temperature <= 0:
             raise ValueError("Straight-through temperature must be positive")
+        if left_boundary_mode not in LEFT_BOUNDARY_MODES:
+            raise ValueError(
+                f"left_boundary_mode must be one of {LEFT_BOUNDARY_MODES}"
+            )
         self.model = model
         self.temperature = float(temperature)
+        self.left_boundary_mode = str(left_boundary_mode)
         self.codebook_size = int(model.config.codebook_size)
         self.tokens_per_frame = int(model.config.num_tokens_per_frame)
         self.num_quantizers = int(model.config.num_quantizers_per_part)
@@ -78,6 +162,7 @@ class FrozenStep2AnchorGuidance(nn.Module):
         *,
         stage_weights: Sequence[float],
         temperature: float,
+        left_boundary_mode: str,
         dtype: torch.dtype,
         device: torch.device,
     ) -> "FrozenStep2AnchorGuidance":
@@ -90,6 +175,7 @@ class FrozenStep2AnchorGuidance(nn.Module):
             model,
             stage_weights=stage_weights,
             temperature=temperature,
+            left_boundary_mode=left_boundary_mode,
         ).to(device)
 
     def train(self, mode: bool = True) -> "FrozenStep2AnchorGuidance":
@@ -140,6 +226,7 @@ class FrozenStep2AnchorGuidance(nn.Module):
         audio_features: torch.Tensor,
         frame_mask: torch.Tensor,
         gap_lengths: torch.Tensor,
+        left_boundary_local_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if motion_tokens.ndim != 3 or motion_tokens.shape[-1] != self.tokens_per_frame:
             raise ValueError("motion_tokens must be [B,F,16]")
@@ -150,6 +237,29 @@ class FrozenStep2AnchorGuidance(nn.Module):
             raise ValueError("frame_mask must have shape [B,F]")
         if tuple(gap_lengths.shape) != (batch,):
             raise ValueError("gap_lengths must have shape [B]")
+        if self.left_boundary_mode == "planner_history":
+            if left_boundary_local_ids is None:
+                raise ValueError(
+                    "planner_history guidance requires left_boundary_local_ids"
+                )
+        elif left_boundary_local_ids is not None:
+            raise ValueError(
+                "left_boundary_local_ids are valid only in planner_history mode"
+            )
+        if left_boundary_local_ids is not None:
+            if tuple(left_boundary_local_ids.shape) != (
+                batch,
+                self.tokens_per_frame,
+            ):
+                raise ValueError(
+                    "left_boundary_local_ids must have shape [B,16]"
+                )
+            if bool(left_boundary_local_ids.lt(0).any()) or bool(
+                left_boundary_local_ids.ge(self.codebook_size).any()
+            ):
+                raise ValueError(
+                    "left_boundary_local_ids leave the Step 2 codebooks"
+                )
         if int(audio_features.shape[-1]) != int(self.model.config.audio_feat_dim):
             raise ValueError(
                 f"Expected {self.model.config.audio_feat_dim}-D Step 2 audio features, "
@@ -185,6 +295,9 @@ class FrozenStep2AnchorGuidance(nn.Module):
 
         current_ids = gt_ids.clone()
         current_ids[middle_frames] = mask_token_id
+        if left_boundary_local_ids is not None:
+            left_global = left_boundary_local_ids + offsets.view(1, -1)
+            current_ids[:, 0] = left_global
         right_global = hard_local_ids + offsets.view(1, -1)
         current_ids[right_frame_mask] = right_global
 
@@ -256,6 +369,9 @@ class FrozenStep2AnchorGuidance(nn.Module):
             audio_features=guidance_batch["audio_features"],
             frame_mask=guidance_batch["frame_mask"],
             gap_lengths=guidance_batch["gap_lengths"],
+            left_boundary_local_ids=guidance_batch.get(
+                "left_boundary_local_ids"
+            ),
         )
         current = tensors["input_ids"].clone()
         gt_ids = tensors["gt_ids"]

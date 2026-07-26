@@ -11,7 +11,10 @@ if str(MOTION_GENERATION_DIR) not in sys.path:
     sys.path.insert(0, str(MOTION_GENERATION_DIR))
 
 from models.audio_motion_model import AudioMotionConfig, AudioMotionTransformer
-from utils.step1_frozen_step2_guidance import FrozenStep2AnchorGuidance
+from utils.step1_frozen_step2_guidance import (
+    FrozenStep2AnchorGuidance,
+    planner_history_left_boundaries,
+)
 
 
 def tiny_step2() -> AudioMotionTransformer:
@@ -104,3 +107,73 @@ def test_st_boundary_forward_value_is_exact_hard_embedding() -> None:
     embeddings.float().square().mean().backward()
     assert logits.grad is not None
     assert float(logits.grad.abs().sum()) > 0
+
+
+def test_planner_history_extracts_the_previous_anchor_or_seed_fallback() -> None:
+    motion_token_ids = torch.arange(16 * 512).reshape(16, 512)
+    target_slots = torch.arange(16).repeat(2).unsqueeze(0).repeat(3, 1)
+    target_anchor_ids = torch.cat(
+        [torch.zeros(16, dtype=torch.long), torch.ones(16, dtype=torch.long)]
+    ).unsqueeze(0).repeat(3, 1)
+    input_ids = torch.empty(3, 32, dtype=torch.long)
+    local_by_row_group = torch.empty(3, 2, 16, dtype=torch.long)
+    for row in range(3):
+        for group in range(2):
+            for slot in range(16):
+                local = (row * 101 + group * 37 + slot * 3) % 512
+                local_by_row_group[row, group, slot] = local
+                input_ids[row, group * 16 + slot] = motion_token_ids[slot, local]
+    fallback = torch.full((3, 16), 499, dtype=torch.long)
+
+    result = planner_history_left_boundaries(
+        input_ids=input_ids,
+        target_slots=target_slots,
+        target_anchor_ids=target_anchor_ids,
+        selected_anchor_groups=torch.tensor([0, 1, 2]),
+        motion_token_ids=motion_token_ids,
+        fallback_left_local_ids=fallback,
+    )
+
+    assert torch.equal(result[0], fallback[0])
+    assert torch.equal(result[1], local_by_row_group[1, 0])
+    assert torch.equal(result[2], local_by_row_group[2, 1])
+
+
+def test_planner_history_guidance_uses_detached_left_boundary() -> None:
+    guidance = FrozenStep2AnchorGuidance(
+        tiny_step2(),
+        stage_weights=[0.35, 0.25, 0.20, 0.20],
+        temperature=1.0,
+        left_boundary_mode="planner_history",
+    )
+    logits = torch.randn(2, 16, 512, requires_grad=True)
+    batch = guidance_batch()
+    batch["left_boundary_local_ids"] = torch.stack(
+        [
+            torch.arange(16) + 100,
+            torch.arange(16) + 200,
+        ]
+    )
+    hard_ids, boundary_embeddings = guidance._straight_through_boundary(
+        logits
+    )
+    prepared = guidance._prepare_step2_inputs(
+        hard_local_ids=hard_ids,
+        boundary_embeddings=boundary_embeddings,
+        motion_tokens=batch["motion_tokens"],
+        audio_features=batch["audio_features"],
+        frame_mask=batch["frame_mask"],
+        gap_lengths=batch["gap_lengths"],
+        left_boundary_local_ids=batch["left_boundary_local_ids"],
+    )
+    offsets = torch.arange(16) * 512
+    prepared_left = prepared["input_ids"].reshape(2, 5, 16)[:, 0] - offsets
+    assert torch.equal(prepared_left, batch["left_boundary_local_ids"])
+
+    output = guidance(logits, batch)
+
+    assert torch.isfinite(output.loss)
+    output.loss.backward()
+    assert logits.grad is not None
+    assert float(logits.grad.abs().sum()) > 0
+    assert batch["left_boundary_local_ids"].grad is None
