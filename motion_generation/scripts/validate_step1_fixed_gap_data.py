@@ -26,6 +26,7 @@ from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     resolve_data_paths,
     section,
     validate_adaptive_gap_config,
+    validate_frozen_step2_guidance_config,
     validate_paths,
 )
 from models.step1_mimi_planner import load_text_map, read_split_names  # noqa: E402
@@ -67,17 +68,36 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
     target_counts: list[int] = []
     gap_counts = Counter()
     annotation_patterns = Counter()
+    step2_guidance_gaps = Counter()
     errors = []
     for index, name in enumerate(dataset.names):
         try:
             item = dataset[index]
+            item_gaps = [
+                gap_from_anchor_times(left, right)
+                for left, right in zip(
+                    item["anchor_times"],
+                    item["anchor_times"][1:],
+                )
+            ]
+            guidance_gap = None
+            if "step2_guidance_gap" in item:
+                guidance_gap = int(item["step2_guidance_gap"])
+                expected_frames = guidance_gap + 2
+                if len(item["step2_guidance_motion_tokens"]) != expected_frames:
+                    raise ValueError("Step 2 guidance motion window is not gap+2")
+                if item["step2_guidance_audio_features"].shape[0] != expected_frames:
+                    raise ValueError("Step 2 guidance audio window is not gap+2")
+            # Commit statistics only after every field, including the optional
+            # online Step 2 window, has passed validation.
             sequence_lengths.append(len(item["input_ids"]))
             anchor_counts.append(len(item["anchor_times"]))
             audio_counts.append(item["audio_boundaries"][-1])
             target_counts.append(sum(slot >= 0 for slot in item["target_slots"]))
             annotation_patterns[item.get("annotation_pattern", "unknown")] += 1
-            for left, right in zip(item["anchor_times"], item["anchor_times"][1:]):
-                gap_counts[gap_from_anchor_times(left, right)] += 1
+            gap_counts.update(item_gaps)
+            if guidance_gap is not None:
+                step2_guidance_gaps[guidance_gap] += 1
         except Exception as exc:  # collect multiple data failures in one audit
             if len(errors) < max_reported_errors:
                 errors.append({"name": name, "error": f"{type(exc).__name__}: {exc}"})
@@ -96,6 +116,9 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
         "annotation_patterns": dict(sorted(annotation_patterns.items())),
         "supervised_token_counts": percentile_summary(target_counts),
         "gap_counts": {str(key): value for key, value in sorted(gap_counts.items())},
+        "step2_guidance_gap_counts": {
+            str(key): value for key, value in sorted(step2_guidance_gaps.items())
+        },
     }
 
 
@@ -110,6 +133,7 @@ def main() -> None:
         config,
         num_epochs=int(training.get("num_train_epochs", 10)),
     )
+    frozen_step2_guidance = validate_frozen_step2_guidance_config(config)
     tokenizer = AutoTokenizer.from_pretrained(paths["base_model"], local_files_only=True)
     added = ensure_step1_special_tokens(
         tokenizer,
@@ -134,6 +158,7 @@ def main() -> None:
         neutral_seed=neutral_seed,
         training=True,
         adaptive_gap=adaptive_gap,
+        frozen_step2_guidance=frozen_step2_guidance,
     )
     eval_dataset = build_dataset(
         eval_names,
@@ -144,6 +169,7 @@ def main() -> None:
         neutral_seed=neutral_seed,
         training=False,
         adaptive_gap=adaptive_gap,
+        frozen_step2_guidance=frozen_step2_guidance,
     )
     report = {"config": str(args.config.resolve())}
     if adaptive_gap["enabled"]:

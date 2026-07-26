@@ -237,6 +237,10 @@ class Step1Sequence:
     gap_loss_weight: float
     normal_gaps: tuple[int, ...]
     tail_gap: Optional[int]
+    step2_guidance_anchor_group: Optional[int]
+    step2_guidance_gap: Optional[int]
+    step2_guidance_motion_tokens: Optional[list[list[int]]]
+    step2_guidance_audio_features: Optional[np.ndarray]
 
 
 class Step1FixedGapDataset(Dataset):
@@ -276,6 +280,10 @@ class Step1FixedGapDataset(Dataset):
         audio_codebooks_used: Optional[Sequence[int]] = None,
         text_serialization: str = "raw",
         drop_structured_tags: bool = False,
+        step2_guidance_audio_feature_dir: Optional[Path] = None,
+        step2_guidance_audio_fps: float = 12.5,
+        step2_guidance_audio_feat_dim: int = 768,
+        step2_guidance_resample: bool = False,
     ) -> None:
         if seed_mode not in {"observed", "previous", "neutral", "mixed_known", "mixed_all"}:
             raise ValueError(
@@ -335,6 +343,19 @@ class Step1FixedGapDataset(Dataset):
             raise ValueError("text_serialization must be raw or structured_fields")
         self.text_serialization = str(text_serialization)
         self.drop_structured_tags = bool(drop_structured_tags)
+        self.step2_guidance_audio_feature_dir = (
+            Path(step2_guidance_audio_feature_dir)
+            if step2_guidance_audio_feature_dir is not None
+            else None
+        )
+        self.step2_guidance_audio_fps = float(step2_guidance_audio_fps)
+        self.step2_guidance_audio_feat_dim = int(step2_guidance_audio_feat_dim)
+        self.step2_guidance_resample = bool(step2_guidance_resample)
+        if self.step2_guidance_audio_feature_dir is not None:
+            if self.step2_guidance_audio_fps <= 0:
+                raise ValueError("Step 2 guidance audio FPS must be positive")
+            if self.step2_guidance_audio_feat_dim <= 0:
+                raise ValueError("Step 2 guidance audio feature dimension must be positive")
         self.epoch = 0
         self._single_token_ids = self._build_single_token_ids()
 
@@ -426,6 +447,82 @@ class Step1FixedGapDataset(Dataset):
             )
         return load_generated_anchors(path)
 
+    def _step2_guidance_window(
+        self,
+        name: str,
+        motion_tokens: Sequence[Sequence[int]],
+        anchor_times: Sequence[int],
+    ) -> tuple[int, int, list[list[int]], np.ndarray] | None:
+        if self.step2_guidance_audio_feature_dir is None:
+            return None
+        candidates = []
+        for anchor_index, (left_time, right_time) in enumerate(
+            zip(anchor_times[:-1], anchor_times[1:]),
+            start=1,
+        ):
+            gap = gap_from_anchor_times(left_time, right_time)
+            if gap >= 3:
+                candidates.append(
+                    (anchor_index - 1, int(left_time), int(right_time), int(gap))
+                )
+        if not candidates:
+            raise ValueError(f"{name}: no normal interval is available for Step 2 guidance")
+        selection_epoch = self.epoch if self.step2_guidance_resample else 0
+        key = (
+            f"step2-guidance|{self.random_seed}|{selection_epoch}|{name}"
+        ).encode("utf-8")
+        selected_index = int.from_bytes(
+            hashlib.sha256(key).digest()[:8], "big"
+        ) % len(candidates)
+        anchor_group, left_time, right_time, gap = candidates[selected_index]
+
+        audio_path = canonical_data_path(
+            self.step2_guidance_audio_feature_dir,
+            name,
+            ".npy",
+        )
+        if not audio_path.is_file():
+            raise FileNotFoundError(
+                f"Missing all-codebook Step 2 audio features: {audio_path}"
+            )
+        audio_features = np.load(audio_path, mmap_mode="r")
+        if (
+            audio_features.ndim != 2
+            or audio_features.shape[0] <= 0
+            or audio_features.shape[1] != self.step2_guidance_audio_feat_dim
+        ):
+            raise ValueError(
+                f"{name}: expected non-empty [T,{self.step2_guidance_audio_feat_dim}] "
+                f"Step 2 audio features, got {audio_features.shape}"
+            )
+        frame_indices = list(range(left_time, right_time + 1))
+        audio_indices = [
+            max(
+                0,
+                min(
+                    int(
+                        round(
+                            frame
+                            * self.step2_guidance_audio_fps
+                            / MOTION_TOKEN_FPS
+                        )
+                    ),
+                    len(audio_features) - 1,
+                ),
+            )
+            for frame in frame_indices
+        ]
+        window_motion = [
+            [int(value) for value in motion_tokens[frame]]
+            for frame in frame_indices
+        ]
+        window_audio = np.asarray(audio_features[audio_indices], dtype=np.float32)
+        if len(window_motion) != gap + 2 or window_audio.shape[0] != gap + 2:
+            raise AssertionError(
+                f"{name}: Step 2 guidance interval does not contain gap+2 frames"
+            )
+        return anchor_group, gap, window_motion, window_audio
+
     def _build_text_prefix(
         self,
         raw_text: str,
@@ -511,7 +608,7 @@ class Step1FixedGapDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sequence = self.build_sequence(self.names[index])
-        return {
+        result = {
             "name": sequence.name,
             "input_ids": sequence.input_ids,
             "audio_codes": sequence.audio_codes,
@@ -533,6 +630,16 @@ class Step1FixedGapDataset(Dataset):
             "normal_gaps": sequence.normal_gaps,
             "tail_gap": sequence.tail_gap,
         }
+        if sequence.step2_guidance_anchor_group is not None:
+            result.update(
+                {
+                    "step2_guidance_anchor_group": sequence.step2_guidance_anchor_group,
+                    "step2_guidance_gap": sequence.step2_guidance_gap,
+                    "step2_guidance_motion_tokens": sequence.step2_guidance_motion_tokens,
+                    "step2_guidance_audio_features": sequence.step2_guidance_audio_features,
+                }
+            )
+        return result
 
     def build_sequence(self, name: str) -> Step1Sequence:
         motion_path = canonical_data_path(self.motion_token_dir, name, ".json")
@@ -727,6 +834,11 @@ class Step1FixedGapDataset(Dataset):
         actual_targets = sum(slot >= 0 for slot in target_slots)
         if actual_targets != expected_targets:
             raise AssertionError(f"Expected {expected_targets} anchor targets, got {actual_targets}")
+        guidance = self._step2_guidance_window(
+            name,
+            motion_tokens,
+            anchor_times,
+        )
         return Step1Sequence(
             name=name,
             input_ids=input_ids,
@@ -748,6 +860,18 @@ class Step1FixedGapDataset(Dataset):
             gap_loss_weight=float(getattr(schedule, "schedule_loss_weight", 0.0)),
             normal_gaps=schedule.normal_gaps,
             tail_gap=schedule.tail_gap,
+            step2_guidance_anchor_group=(
+                None if guidance is None else int(guidance[0])
+            ),
+            step2_guidance_gap=(
+                None if guidance is None else int(guidance[1])
+            ),
+            step2_guidance_motion_tokens=(
+                None if guidance is None else guidance[2]
+            ),
+            step2_guidance_audio_features=(
+                None if guidance is None else guidance[3]
+            ),
         )
 
 
@@ -944,7 +1068,7 @@ class Step1PlannerCollator:
             values = [list(map(int, frame_codes)) for frame_codes in example["audio_codes"]]
             values.extend([[-1] * codebook_count for _ in range(longest - len(values))])
             padded_audio.append(values)
-        return {
+        result = {
             "input_ids": input_ids,
             "attention_mask": input_ids.ne(self.pad_token_id).long(),
             "audio_codes": torch.tensor(padded_audio, dtype=torch.long),
@@ -992,6 +1116,83 @@ class Step1PlannerCollator:
                 dtype=torch.long,
             ),
         }
+        guidance_flags = [
+            "step2_guidance_anchor_group" in example for example in examples
+        ]
+        if any(guidance_flags):
+            if not all(guidance_flags):
+                raise ValueError(
+                    "A batch cannot mix examples with and without Step 2 guidance"
+                )
+            max_frames = max(
+                len(example["step2_guidance_motion_tokens"])
+                for example in examples
+            )
+            audio_dims = {
+                int(np.asarray(example["step2_guidance_audio_features"]).shape[-1])
+                for example in examples
+            }
+            if len(audio_dims) != 1:
+                raise ValueError(
+                    f"Step 2 guidance audio dimensions differ: {audio_dims}"
+                )
+            audio_dim = audio_dims.pop()
+            guidance_motion = []
+            guidance_audio = []
+            guidance_frame_mask = []
+            for example in examples:
+                motion = [
+                    [int(value) for value in frame]
+                    for frame in example["step2_guidance_motion_tokens"]
+                ]
+                audio = torch.as_tensor(
+                    np.asarray(example["step2_guidance_audio_features"]),
+                    dtype=torch.float32,
+                )
+                if len(motion) != audio.shape[0]:
+                    raise ValueError(
+                        f"{example['name']}: Step 2 motion/audio window length mismatch"
+                    )
+                if any(len(frame) != BODY_SLOT_COUNT for frame in motion):
+                    raise ValueError(
+                        f"{example['name']}: Step 2 guidance frames must have "
+                        f"{BODY_SLOT_COUNT} IDs"
+                    )
+                pad_frames = max_frames - len(motion)
+                guidance_motion.append(
+                    motion + [[-1] * BODY_SLOT_COUNT for _ in range(pad_frames)]
+                )
+                guidance_audio.append(
+                    F.pad(audio, (0, 0, 0, pad_frames))
+                )
+                guidance_frame_mask.append(
+                    [True] * len(motion) + [False] * pad_frames
+                )
+            result["step2_guidance"] = {
+                "anchor_groups": torch.tensor(
+                    [
+                        int(example["step2_guidance_anchor_group"])
+                        for example in examples
+                    ],
+                    dtype=torch.long,
+                ),
+                "gap_lengths": torch.tensor(
+                    [int(example["step2_guidance_gap"]) for example in examples],
+                    dtype=torch.long,
+                ),
+                "motion_tokens": torch.tensor(
+                    guidance_motion,
+                    dtype=torch.long,
+                ),
+                "audio_features": torch.stack(guidance_audio).reshape(
+                    len(examples), max_frames, audio_dim
+                ),
+                "frame_mask": torch.tensor(
+                    guidance_frame_mask,
+                    dtype=torch.bool,
+                ),
+            }
+        return result
 
 
 class MimiQwenPlannerConfig(PretrainedConfig):
@@ -1060,6 +1261,7 @@ class MimiQwenPlannerOutput(ModelOutput):
     gap_loss: Optional[torch.Tensor] = None
     gap_count: Optional[torch.Tensor] = None
     gap_correct: Optional[torch.Tensor] = None
+    selected_anchor_logits: Optional[torch.Tensor] = None
 
 
 class MimiQwenPlanner(PreTrainedModel):
@@ -1288,6 +1490,8 @@ class MimiQwenPlanner(PreTrainedModel):
         gap_target_probs: Optional[torch.Tensor] = None,
         gap_target_mask: Optional[torch.Tensor] = None,
         gap_loss_weights: Optional[torch.Tensor] = None,
+        target_anchor_ids: Optional[torch.Tensor] = None,
+        selected_anchor_groups: Optional[torch.Tensor] = None,
         return_token_losses: bool = False,
         **kwargs: Any,
     ) -> MimiQwenPlannerOutput:
@@ -1316,6 +1520,17 @@ class MimiQwenPlanner(PreTrainedModel):
             expected_distortion_example_mask = expected_distortion_example_mask.to(
                 device=input_ids.device, dtype=torch.bool
             )
+        if selected_anchor_groups is not None:
+            if target_anchor_ids is None:
+                raise ValueError(
+                    "target_anchor_ids are required when selected_anchor_groups are provided"
+                )
+            if tuple(target_anchor_ids.shape) != tuple(input_ids.shape):
+                raise ValueError("target_anchor_ids must have shape [B,L]")
+            if tuple(selected_anchor_groups.shape) != (input_ids.shape[0],):
+                raise ValueError("selected_anchor_groups must have shape [B]")
+            if bool(selected_anchor_groups.lt(0).any()):
+                raise ValueError("selected_anchor_groups must be non-negative")
         if expected_distortion_weight > 0 and not self.motion_codebook_distances.numel():
             raise RuntimeError(
                 "Expected-distortion loss is enabled but codec distance tables were not loaded"
@@ -1346,6 +1561,12 @@ class MimiQwenPlanner(PreTrainedModel):
         per_token_loss = (
             torch.zeros_like(input_ids, dtype=torch.float32)
             if bool(return_token_losses)
+            else None
+        )
+        selected_logits_by_slot: list[torch.Tensor] = []
+        shifted_anchor_ids = (
+            target_anchor_ids[:, 1:]
+            if target_anchor_ids is not None
             else None
         )
         for slot in range(BODY_SLOT_COUNT):
@@ -1395,6 +1616,28 @@ class MimiQwenPlanner(PreTrainedModel):
                 per_token_loss = per_token_loss.reshape(-1).scatter(
                     0, flat_indices, token_losses
                 ).view_as(input_ids)
+            if selected_anchor_groups is not None:
+                assert shifted_anchor_ids is not None
+                selected_mask = mask & shifted_anchor_ids.eq(
+                    selected_anchor_groups.view(-1, 1)
+                )
+                selected_positions = selected_mask.nonzero(as_tuple=False)
+                selected_counts = torch.bincount(
+                    selected_positions[:, 0],
+                    minlength=input_ids.shape[0],
+                )
+                if not torch.equal(
+                    selected_counts,
+                    torch.ones_like(selected_counts),
+                ):
+                    raise ValueError(
+                        "Every example must have exactly one selected target "
+                        f"for slot {slot}; counts={selected_counts.tolist()}"
+                    )
+                selected_hidden = hidden[selected_mask]
+                selected_logits_by_slot.append(
+                    F.linear(selected_hidden, classifier_weight).float()
+                )
         if not bool(count):
             raise ValueError("Batch contains no supervised anchor tokens")
         ce_loss = loss_sum / count
@@ -1450,6 +1693,11 @@ class MimiQwenPlanner(PreTrainedModel):
             + expected_distortion_weight * expected_distortion_loss
             + gap_loss
         )
+        selected_anchor_logits = (
+            torch.stack(selected_logits_by_slot, dim=1)
+            if selected_anchor_groups is not None
+            else None
+        )
         return MimiQwenPlannerOutput(
             loss=loss,
             ce_loss=ce_loss,
@@ -1466,6 +1714,7 @@ class MimiQwenPlanner(PreTrainedModel):
             gap_loss=gap_loss,
             gap_count=gap_count,
             gap_correct=gap_correct,
+            selected_anchor_logits=selected_anchor_logits,
         )
 
     @torch.inference_mode()

@@ -1443,3 +1443,103 @@ reported and it must not be described as strict unknown-duration inference.
 Before motion evaluation, the runner fingerprints the selected frozen Step 2
 weights and compares them with the interval-cache manifests. Evaluation stops
 if they are not the exact weights that produced the curriculum costs.
+
+## 22. Experiment A: online frozen-Step-2 endpoint guidance
+
+The adaptive evaluation showed that predicted boundary content, amplified by
+Step 2, is a larger deployment bottleneck than rate-matched placement. The
+first online experiment therefore freezes placement at gap 7 and fine-tunes
+anchor content only:
+
+\[
+L=L_{\mathrm{anchor\,CE}}+
+  \lambda_{\mathrm{S2}}L_{\mathrm{frozen\,Step2\,C2F}}.
+\]
+
+For one deterministic normal interval per clip:
+
+- the left boundary and missing targets are canonical;
+- Step 1 supplies one hard predicted 16-ID right boundary;
+- the forward boundary is an exact Step 2 code embedding;
+- the backward path uses a straight-through categorical estimator;
+- Step 2 parameters remain frozen and in evaluation mode;
+- Step 2 q0-to-q3 interiors are rolled out with hard detached prefixes;
+- the canonical missing-token CE is combined with the source Step 2 stage
+  weights `[0.35, 0.25, 0.20, 0.20]`.
+
+The current controlled implementation obtains the selected right-boundary
+logits from Step 1's teacher-forced sequence forward. Thus it isolates whether
+the downstream gradient improves one endpoint before adding within-anchor or
+cross-anchor generated-prefix exposure. Hard free-running evaluation remains
+mandatory; a lower training surrogate alone is not success.
+
+The implementation is optional and does not change previous runs:
+
+| Responsibility | Path |
+|---|---|
+| Fixed-gap 7, 6K, five-epoch experiment | `configs/step1_experiment_a_fixed_gap7_online_step2.yaml` |
+| Hard-ST boundary and frozen C2F rollout | `utils/step1_frozen_step2_guidance.py` |
+| Step 2 boundary-embedding override | `models/audio_motion_model.py` |
+| Selected Step 1 anchor logits and guidance data | `models/step1_mimi_planner.py` |
+
+### 22.1 Preflight
+
+```bash
+python motion_generation/scripts/validate_step1_fixed_gap_data.py \
+  --config motion_generation/configs/step1_experiment_a_fixed_gap7_online_step2.yaml \
+  --max_train_clips 32 --max_eval_clips 32 \
+  --output_json checkpoints/step1_experiment_a_fixed_gap7_online_step2_6k/preflight_smoke.json
+```
+
+Then remove both clip limits for the full 6,000/635 audit.
+
+### 22.2 One-GPU smoke training
+
+Use at least 64 training clips: with a one-epoch warm-up and batch size 32, the
+first batch has zero Step 2 weight and the second verifies a nonzero
+downstream gradient.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_experiment_a_fixed_gap7_online_step2.yaml \
+  --init_from_checkpoint checkpoints/step1_multipart_adaptive_gap_step2_curriculum50/best \
+  --max_train_clips 64 --max_eval_clips 32 \
+  --num_train_epochs 1 \
+  --output_dir checkpoints/step1_experiment_a_fixed_gap7_online_step2_smoke
+```
+
+The epoch-eval log must show finite `step2`, finite `step2_acc`, and
+`w_s2=0.050`. With 64 clips, the unseen second training batch has a nonzero
+warm-up weight; the automated gradient test separately verifies that Step 1
+receives gradients while Step 2 parameters do not.
+
+### 22.3 Matched control and guided runs
+
+Run a CE-only control through the exact same data and frozen-Step-2 evaluation
+path:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun \
+  --nproc_per_node=4 --master_port=29514 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_experiment_a_fixed_gap7_online_step2.yaml \
+  --init_from_checkpoint checkpoints/step1_multipart_adaptive_gap_step2_curriculum50/best \
+  --step2_guidance_weight 0 \
+  --output_dir checkpoints/step1_experiment_a_fixed_gap7_online_step2_6k_control
+```
+
+The guided run is:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun \
+  --nproc_per_node=4 --master_port=29515 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_experiment_a_fixed_gap7_online_step2.yaml \
+  --init_from_checkpoint checkpoints/step1_multipart_adaptive_gap_step2_curriculum50/best
+```
+
+Checkpoint selection uses the configured combined validation objective.
+Compare the control and guided checkpoint using hard generated anchors, actual
+Step 2 missing-token CE/accuracy, decoded RMSE, and Step-2-infilled FID. Do not
+select the experiment from the straight-through training loss alone.

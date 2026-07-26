@@ -164,6 +164,48 @@ def test_dataset_serializes_causal_audio_before_each_anchor(tmp_path: Path, step
     assert item["target_anchor_ids"][first_target_position : first_target_position + 16] == [0] * 16
 
 
+def test_dataset_and_collator_build_one_step2_guidance_window(
+    tmp_path: Path,
+    step1_tokenizer,
+):
+    name = "session/guidance"
+    motion_dir, audio_dir, tokens, _ = _write_synthetic_clip(tmp_path, name)
+    feature_dir = tmp_path / "step2_audio"
+    feature_path = feature_dir / f"{name}.npy"
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    features = np.arange(45 * 8, dtype=np.float32).reshape(45, 8)
+    np.save(feature_path, features)
+    dataset = Step1FixedGapDataset(
+        [name],
+        tokenizer=step1_tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "guidance"},
+        fixed_gap=7,
+        seed_mode="observed",
+        step2_guidance_audio_feature_dir=feature_dir,
+        step2_guidance_audio_fps=12.5,
+        step2_guidance_audio_feat_dim=8,
+        step2_guidance_resample=True,
+    )
+    item = dataset[0]
+    assert item["step2_guidance_gap"] == 7
+    assert len(item["step2_guidance_motion_tokens"]) == 9
+    assert item["step2_guidance_audio_features"].shape == (9, 8)
+    group = item["step2_guidance_anchor_group"]
+    left_time = item["anchor_times"][group]
+    right_time = item["anchor_times"][group + 1]
+    assert item["step2_guidance_motion_tokens"] == tokens[left_time : right_time + 1]
+
+    batch = Step1PlannerCollator(step1_tokenizer.pad_token_id)([item, item])
+    guidance = batch["step2_guidance"]
+    assert tuple(guidance["motion_tokens"].shape) == (2, 9, 16)
+    assert tuple(guidance["audio_features"].shape) == (2, 9, 8)
+    assert guidance["frame_mask"].all()
+    assert torch.equal(guidance["gap_lengths"], torch.tensor([7, 7]))
+    assert torch.equal(guidance["anchor_groups"], torch.tensor([group, group]))
+
+
 def test_adaptive_dataset_loads_materialized_dp_schedule(
     tmp_path: Path, step1_tokenizer
 ):
@@ -617,6 +659,34 @@ def test_tiny_planner_soft_gap_loss_uses_next_token_alignment():
     assert int(output.gap_count) == 1
     assert torch.allclose(output.loss, output.ce_loss + output.gap_loss)
     output.loss.backward()
+
+
+def test_tiny_planner_returns_one_selected_logit_table_per_slot():
+    planner = _tiny_planner()
+    labels = torch.tensor([(slot * 23 + 3) % 512 for slot in range(16)])
+    input_ids = torch.zeros((2, 20), dtype=torch.long)
+    target_slots = torch.full_like(input_ids, -1)
+    motion_labels = torch.full_like(input_ids, IGNORE_INDEX)
+    target_anchor_ids = torch.full_like(input_ids, -1)
+    for row in range(2):
+        for slot in range(16):
+            input_ids[row, 4 + slot] = planner.motion_token_ids[slot, labels[slot]]
+        target_slots[row, 4:] = torch.arange(16)
+        motion_labels[row, 4:] = labels
+        target_anchor_ids[row, 4:] = row
+
+    output = planner(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        audio_codes=torch.full_like(input_ids, -1),
+        target_slots=target_slots,
+        motion_local_labels=motion_labels,
+        target_anchor_ids=target_anchor_ids,
+        selected_anchor_groups=torch.tensor([0, 1]),
+    )
+    assert tuple(output.selected_anchor_logits.shape) == (2, 16, 512)
+    output.selected_anchor_logits.square().mean().backward()
+    assert planner.language_model.get_output_embeddings().weight.grad is not None
 
 
 def test_normalized_codebook_distances_are_symmetric_and_unit_scaled():

@@ -516,6 +516,8 @@ class AudioMotionTransformer(PreTrainedModel):
         c2f_stage=None,
         audio_uncertainty=None,
         encoded_audio=None,
+        token_embedding_overrides=None,
+        token_embedding_override_mask=None,
     ):
         """
         Args:
@@ -536,6 +538,30 @@ class AudioMotionTransformer(PreTrainedModel):
 
         self.last_audio_conditioning_stats = {}
         x = self.embed_tokens(input_ids)
+        if token_embedding_overrides is not None or token_embedding_override_mask is not None:
+            if token_embedding_overrides is None or token_embedding_override_mask is None:
+                raise ValueError(
+                    "token_embedding_overrides and token_embedding_override_mask "
+                    "must be provided together"
+                )
+            if tuple(token_embedding_overrides.shape) != tuple(x.shape):
+                raise ValueError(
+                    "token_embedding_overrides must match embedded input shape "
+                    f"{tuple(x.shape)}, got {tuple(token_embedding_overrides.shape)}"
+                )
+            if tuple(token_embedding_override_mask.shape) != tuple(input_ids.shape):
+                raise ValueError(
+                    "token_embedding_override_mask must have shape "
+                    f"{tuple(input_ids.shape)}"
+                )
+            override_mask = token_embedding_override_mask.to(
+                device=x.device, dtype=torch.bool
+            )
+            x = torch.where(
+                override_mask.unsqueeze(-1),
+                token_embedding_overrides.to(device=x.device, dtype=x.dtype),
+                x,
+            )
         x = x + self.position_emb(x.size(1), x.device)
 
         audio_memory = encoded_audio

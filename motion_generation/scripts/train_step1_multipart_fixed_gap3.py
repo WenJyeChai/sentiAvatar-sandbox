@@ -70,6 +70,10 @@ from utils.step1_condition_alignment import (  # noqa: E402
     counterfactual_likelihood_loss,
     deterministic_condition_indices,
 )
+from utils.step1_frozen_step2_guidance import (  # noqa: E402
+    FrozenStep2AnchorGuidance,
+    FrozenStep2GuidanceOutput,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +96,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_eval_clips", type=int, default=None)
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--num_train_epochs", type=int, default=None)
+    parser.add_argument(
+        "--step2_guidance_weight",
+        type=float,
+        default=None,
+        help="Override frozen_step2_guidance.weight (use 0 for the matched CE control).",
+    )
     return parser.parse_args()
 
 
@@ -222,6 +232,85 @@ def validate_adaptive_gap_config(
         )
     adaptive["calibration_json"] = calibration
     return adaptive
+
+
+def validate_frozen_step2_guidance_config(
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    guidance = section(config, "frozen_step2_guidance")
+    guidance.setdefault("enabled", False)
+    guidance["enabled"] = bool(guidance["enabled"])
+    if not guidance["enabled"]:
+        return guidance
+    if "source_config" not in guidance or "checkpoint" not in guidance:
+        raise ValueError(
+            "frozen_step2_guidance requires source_config and checkpoint"
+        )
+    source_config_path = project_path(guidance["source_config"])
+    checkpoint = project_path(guidance["checkpoint"])
+    if not source_config_path.is_file():
+        raise FileNotFoundError(
+            f"Frozen Step 2 source config not found: {source_config_path}"
+        )
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(
+            f"Frozen Step 2 checkpoint not found: {checkpoint}"
+        )
+    source = load_config(source_config_path)
+    experiment = section(source, "experiment")
+    configured_output = project_path(experiment.get("output_dir", checkpoint))
+    if configured_output != checkpoint:
+        raise ValueError(
+            "Frozen Step 2 checkpoint does not match its source config: "
+            f"config={configured_output}, requested={checkpoint}"
+        )
+    audio = section(source, "audio_conditioning")
+    data = section(source, "data")
+    masking = section(source, "masking")
+    audio_feature_dir = project_path(data["audio_feat_dir"])
+    if not audio_feature_dir.is_dir():
+        raise FileNotFoundError(
+            f"Frozen Step 2 audio features not found: {audio_feature_dir}"
+        )
+    stage_weights = masking.get("stage_weights", [0.35, 0.25, 0.20, 0.20])
+    if not isinstance(stage_weights, list) or len(stage_weights) != 4:
+        raise ValueError("Frozen Step 2 stage_weights must contain four values")
+    stage_weights = [float(value) for value in stage_weights]
+    if any(value < 0 for value in stage_weights) or sum(stage_weights) <= 0:
+        raise ValueError("Frozen Step 2 stage_weights must have positive total")
+    guidance.update(
+        {
+            "source_config": source_config_path,
+            "checkpoint": checkpoint,
+            "audio_feature_dir": audio_feature_dir,
+            "audio_fps": float(audio.get("audio_fps", 12.5)),
+            "audio_feat_dim": int(audio.get("audio_feat_dim", 768)),
+            "stage_weights": stage_weights,
+            "weight": float(guidance.get("weight", 0.05)),
+            "warmup_epochs": float(guidance.get("warmup_epochs", 1.0)),
+            "temperature": float(guidance.get("temperature", 1.0)),
+        }
+    )
+    if guidance["weight"] < 0:
+        raise ValueError("Frozen Step 2 guidance weight must be non-negative")
+    if guidance["warmup_epochs"] < 0:
+        raise ValueError("Frozen Step 2 guidance warmup_epochs must be non-negative")
+    if guidance["temperature"] <= 0:
+        raise ValueError("Frozen Step 2 guidance temperature must be positive")
+    return guidance
+
+
+def frozen_step2_guidance_weight(
+    epoch_progress: float,
+    guidance: Mapping[str, Any],
+) -> float:
+    if not bool(guidance.get("enabled", False)):
+        return 0.0
+    maximum = float(guidance["weight"])
+    warmup = float(guidance["warmup_epochs"])
+    if warmup <= 0:
+        return maximum
+    return maximum * min(1.0, max(0.0, float(epoch_progress) / warmup))
 
 
 def project_path(value: str | Path) -> Path:
@@ -418,6 +507,7 @@ def build_dataset(
     neutral_seed: Optional[tuple[int, ...]],
     training: bool,
     adaptive_gap: Optional[Mapping[str, Any]] = None,
+    frozen_step2_guidance: Optional[Mapping[str, Any]] = None,
 ) -> Step1FixedGapDataset:
     generated_anchor_dir_value = data_config.get("generated_anchor_dir") if training else None
     generated_anchor_dir = project_path(generated_anchor_dir_value) if generated_anchor_dir_value else None
@@ -446,6 +536,10 @@ def build_dataset(
             "curriculum_phases": adaptive_gap["phases"],
             "calibration_json": adaptive_gap["calibration_json"],
         }
+    guidance_enabled = bool(
+        frozen_step2_guidance is not None
+        and frozen_step2_guidance.get("enabled", False)
+    )
     return dataset_class(
         names,
         tokenizer=tokenizer,
@@ -474,6 +568,22 @@ def build_dataset(
         audio_codebooks_used=audio_contract["codebooks_used"],
         text_serialization=str(data_config.get("text_serialization", "raw")),
         drop_structured_tags=bool(data_config.get("drop_structured_tags", False)),
+        step2_guidance_audio_feature_dir=(
+            frozen_step2_guidance["audio_feature_dir"]
+            if guidance_enabled
+            else None
+        ),
+        step2_guidance_audio_fps=(
+            float(frozen_step2_guidance["audio_fps"])
+            if guidance_enabled
+            else 12.5
+        ),
+        step2_guidance_audio_feat_dim=(
+            int(frozen_step2_guidance["audio_feat_dim"])
+            if guidance_enabled
+            else 768
+        ),
+        step2_guidance_resample=bool(training and guidance_enabled),
         **adaptive_kwargs,
     )
 
@@ -490,6 +600,19 @@ def move_batch(batch: Mapping[str, Any], device: torch.device) -> dict[str, torc
         "gap_loss_weights",
     )
     return {key: batch[key].to(device=device, non_blocking=True) for key in keys}
+
+
+def move_step2_guidance_batch(
+    batch: Mapping[str, Any],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    if "step2_guidance" not in batch:
+        raise KeyError("Batch does not contain Step 2 guidance inputs")
+    guidance = batch["step2_guidance"]
+    return {
+        key: value.to(device=device, non_blocking=True)
+        for key, value in guidance.items()
+    }
 
 
 def move_condition_metadata(
@@ -529,22 +652,40 @@ def evaluate(
     use_bf16: bool,
     condition_alignment: Optional[Mapping[str, Any]] = None,
     alignment_seed: int = 42,
+    step2_guidance_model: Optional[FrozenStep2AnchorGuidance] = None,
+    step2_guidance_weight: float = 0.0,
 ) -> dict[str, Any]:
     model.eval()
     base_count = 3 + 2 * len(BODY_SLOTS)
     gap_offset = base_count
     condition_offset = gap_offset + 7
+    guidance_offset = condition_offset + 4
     # Base metrics, schedule metrics, then audio gap/count and text gap/count.
-    totals = torch.zeros(condition_offset + 4, dtype=torch.float64, device=device)
+    totals = torch.zeros(guidance_offset + 7, dtype=torch.float64, device=device)
     autocast_enabled = use_bf16 and device.type == "cuda"
     alignment_enabled = bool(
         condition_alignment is not None and condition_alignment.get("evaluate", False)
     )
     for batch_index, batch in enumerate(loader):
         inputs = move_batch(batch, device)
+        guidance_inputs = None
+        if step2_guidance_model is not None:
+            guidance_inputs = move_step2_guidance_batch(batch, device)
+            inputs["target_anchor_ids"] = batch["target_anchor_ids"].to(
+                device=device, non_blocking=True
+            )
+            inputs["selected_anchor_groups"] = guidance_inputs["anchor_groups"]
         metadata = move_condition_metadata(batch, device) if alignment_enabled else None
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
             output = model(**inputs, return_token_losses=alignment_enabled)
+            guidance_output = (
+                step2_guidance_model(
+                    output.selected_anchor_logits,
+                    guidance_inputs,
+                )
+                if step2_guidance_model is not None
+                else None
+            )
         count = output.count.to(torch.float64)
         totals[0] += output.ce_loss.detach().to(torch.float64) * count
         totals[1] += output.correct.to(torch.float64)
@@ -612,6 +753,20 @@ def evaluate(
                 offset = condition_offset + (0 if modality == "audio" else 2)
                 totals[offset] += gap.to(torch.float64).sum()
                 totals[offset + 1] += gap.numel()
+        if guidance_output is not None:
+            examples = inputs["input_ids"].shape[0]
+            totals[guidance_offset] += (
+                guidance_output.loss.detach().to(torch.float64) * examples
+            )
+            totals[guidance_offset + 1] += examples
+            totals[guidance_offset + 2] += (
+                guidance_output.hard_ce.detach().to(torch.float64)
+                * guidance_output.count.detach().to(torch.float64)
+            )
+            totals[guidance_offset + 3] += guidance_output.correct.to(torch.float64)
+            totals[guidance_offset + 4] += guidance_output.count.to(torch.float64)
+            totals[guidance_offset + 5] += guidance_output.q0_correct.to(torch.float64)
+            totals[guidance_offset + 6] += guidance_output.q0_count.to(torch.float64)
     totals = reduce_sums(totals, distributed)
     model.train()
     denominator = max(1.0, float(totals[2]))
@@ -632,8 +787,16 @@ def evaluate(
     gap_denominator = max(1.0, float(totals[gap_offset + 2]))
     gap_loss = float(totals[gap_offset]) / gap_denominator
     anchor_ce = float(totals[0]) / denominator
+    guidance_examples = max(1.0, float(totals[guidance_offset + 1]))
+    guidance_count = max(1.0, float(totals[guidance_offset + 4]))
+    guidance_q0_count = max(1.0, float(totals[guidance_offset + 6]))
+    guidance_loss = (
+        float(totals[guidance_offset]) / guidance_examples
+        if float(totals[guidance_offset + 1]) > 0
+        else 0.0
+    )
     return {
-        "loss": anchor_ce + gap_loss,
+        "loss": anchor_ce + gap_loss + float(step2_guidance_weight) * guidance_loss,
         "anchor_ce": anchor_ce,
         "gap_loss": gap_loss,
         "gap_accuracy": float(totals[gap_offset + 1]) / gap_denominator,
@@ -647,6 +810,22 @@ def evaluate(
         "slot_accuracy": float(totals[1]) / denominator,
         "per_slot_accuracy": per_slot,
         "condition_gap_nats_per_token": condition_gaps,
+        "step2_guidance_loss": guidance_loss,
+        "step2_guidance_hard_ce": (
+            float(totals[guidance_offset + 2]) / guidance_count
+            if float(totals[guidance_offset + 4]) > 0
+            else 0.0
+        ),
+        "step2_guidance_accuracy": (
+            float(totals[guidance_offset + 3]) / guidance_count
+            if float(totals[guidance_offset + 4]) > 0
+            else 0.0
+        ),
+        "step2_guidance_q0_accuracy": (
+            float(totals[guidance_offset + 5]) / guidance_q0_count
+            if float(totals[guidance_offset + 6]) > 0
+            else 0.0
+        ),
     }
 
 
@@ -1016,6 +1195,18 @@ def main() -> None:
         config,
         num_epochs=requested_epochs,
     )
+    frozen_step2_guidance = validate_frozen_step2_guidance_config(config)
+    if args.step2_guidance_weight is not None:
+        if args.step2_guidance_weight < 0:
+            raise ValueError("--step2_guidance_weight must be non-negative")
+        if not bool(frozen_step2_guidance["enabled"]):
+            raise ValueError(
+                "--step2_guidance_weight requires frozen_step2_guidance.enabled=true"
+            )
+        frozen_step2_guidance["weight"] = float(args.step2_guidance_weight)
+        config.setdefault("frozen_step2_guidance", {})["weight"] = float(
+            args.step2_guidance_weight
+        )
     if bool(adaptive_gap["enabled"]) and bool(
         data_config.get("persistent_workers", False)
     ):
@@ -1026,6 +1217,40 @@ def main() -> None:
     generated_history = validate_generated_history_config(config)
     auxiliary_loss = validate_auxiliary_loss_config(config)
     condition_alignment = validate_condition_alignment_config(config)
+    if bool(frozen_step2_guidance["enabled"]):
+        if int(data_config.get("fixed_gap", -1)) != 7:
+            raise ValueError(
+                "Experiment A is a rate-controlled fixed-gap-7 comparison; "
+                "set data.fixed_gap=7"
+            )
+        if bool(adaptive_gap["enabled"]):
+            raise ValueError(
+                "Experiment A isolates anchor content; disable adaptive_gap"
+            )
+        if bool(generated_history["enabled"]):
+            raise ValueError(
+                "Experiment A uses GT history; disable generated_history"
+            )
+        if data_config.get("generated_anchor_dir") is not None or float(
+            data_config.get("generated_prefix_probability", 0.0)
+        ) != 0.0:
+            raise ValueError(
+                "Experiment A uses GT anchor history; disable the legacy "
+                "generated-prefix cache and probability"
+            )
+        if auxiliary_loss["type"] != "none":
+            raise ValueError(
+                "Experiment A cannot be mixed with another auxiliary loss"
+            )
+        if bool(condition_alignment["enabled"]):
+            raise ValueError(
+                "Experiment A cannot be mixed with condition-alignment training"
+            )
+        if bool(data_config.get("persistent_workers", False)):
+            raise ValueError(
+                "Experiment A resamples one interval per clip each epoch; set "
+                "data.persistent_workers=false"
+            )
     if bool(generated_history["enabled"]) and (
         data_config.get("generated_anchor_dir")
         or float(data_config.get("generated_prefix_probability", 0.0)) > 0
@@ -1079,6 +1304,20 @@ def main() -> None:
         model.set_motion_codebook_distances(distances)
         del distances
     model.to(device)
+    step2_guidance_model = None
+    if bool(frozen_step2_guidance["enabled"]):
+        if is_main(rank):
+            print(
+                "Loading frozen online Step 2 guidance model:",
+                frozen_step2_guidance["checkpoint"],
+            )
+        step2_guidance_model = FrozenStep2AnchorGuidance.from_pretrained(
+            frozen_step2_guidance["checkpoint"],
+            stage_weights=frozen_step2_guidance["stage_weights"],
+            temperature=float(frozen_step2_guidance["temperature"]),
+            dtype=dtype,
+            device=device,
+        )
 
     text_map = load_text_map(paths["text_json"])
     train_names = read_split_names(paths["train_split"])
@@ -1098,6 +1337,7 @@ def main() -> None:
         neutral_seed=neutral_seed,
         training=True,
         adaptive_gap=adaptive_gap,
+        frozen_step2_guidance=frozen_step2_guidance,
     )
     eval_dataset = build_dataset(
         eval_names,
@@ -1108,6 +1348,7 @@ def main() -> None:
         neutral_seed=neutral_seed,
         training=False,
         adaptive_gap=adaptive_gap,
+        frozen_step2_guidance=frozen_step2_guidance,
     )
     # Fail before DDP training if the serialization contract is broken.
     if len(train_dataset):
@@ -1260,6 +1501,16 @@ def main() -> None:
             f"warmup={condition_alignment['warmup_start_epoch']}+"
             f"{condition_alignment['ramp_epochs']} epochs"
         )
+        print(
+            "Frozen Step 2:     "
+            f"enabled={bool(frozen_step2_guidance['enabled'])}, "
+            f"weight={frozen_step2_guidance.get('weight', 0.0)}, "
+            f"warmup={frozen_step2_guidance.get('warmup_epochs', 0.0)}, "
+            f"temperature={frozen_step2_guidance.get('temperature', 1.0)}"
+        )
+        if bool(frozen_step2_guidance["enabled"]):
+            print(f"Step 2 checkpoint: {frozen_step2_guidance['checkpoint']}")
+            print(f"Step 2 audio:      {frozen_step2_guidance['audio_feature_dir']}")
         print("=" * 76)
 
     paths["output_dir"].mkdir(parents=True, exist_ok=True)
@@ -1285,6 +1536,8 @@ def main() -> None:
     # Counterfactual loss sum, correct-minus-corrupt log-likelihood gap sum,
     # example count, audio examples, text examples.
     alignment_running = torch.zeros(5, dtype=torch.float64, device=device)
+    # Weighted guidance loss/examples, hard CE sum, correct/count, q0 correct/count.
+    step2_guidance_running = torch.zeros(7, dtype=torch.float64, device=device)
     run_start = time.perf_counter()
 
     completed_epochs = start_epoch
@@ -1334,6 +1587,15 @@ def main() -> None:
                 else contextlib.nullcontext()
             )
             inputs = move_batch(batch, device)
+            step2_guidance_inputs = None
+            if step2_guidance_model is not None:
+                step2_guidance_inputs = move_step2_guidance_batch(batch, device)
+                inputs["target_anchor_ids"] = batch["target_anchor_ids"].to(
+                    device=device, non_blocking=True
+                )
+                inputs["selected_anchor_groups"] = step2_guidance_inputs[
+                    "anchor_groups"
+                ]
             condition_metadata = move_condition_metadata(batch, device)
             validate_generated_labels(inputs)
             epoch_progress = epoch + batch_index / max(1, len(train_loader))
@@ -1344,6 +1606,10 @@ def main() -> None:
             )
             current_condition_weight = condition_alignment_weight(
                 epoch_progress, condition_alignment
+            )
+            current_step2_guidance_weight = frozen_step2_guidance_weight(
+                epoch_progress,
+                frozen_step2_guidance,
             )
             condition_modality = None
             if current_condition_weight > 0:
@@ -1403,7 +1669,21 @@ def main() -> None:
                         expected_distortion_example_mask=auxiliary_example_mask,
                         return_token_losses=current_condition_weight > 0,
                     )
-                    scaled_loss = output.loss / group_size
+                    step2_guidance_output = (
+                        step2_guidance_model(
+                            output.selected_anchor_logits,
+                            step2_guidance_inputs,
+                        )
+                        if step2_guidance_model is not None
+                        else None
+                    )
+                    objective = output.loss + (
+                        current_step2_guidance_weight
+                        * step2_guidance_output.loss
+                        if step2_guidance_output is not None
+                        else 0.0
+                    )
+                    scaled_loss = objective / group_size
                 scaled_loss.backward()
             counterfactual_loss = None
             condition_gap = None
@@ -1509,6 +1789,29 @@ def main() -> None:
                 alignment_running[3 if condition_modality == "audio" else 4] += (
                     condition_examples
                 )
+            if step2_guidance_output is not None:
+                guidance_examples = inputs["input_ids"].shape[0]
+                step2_guidance_running[0] += (
+                    step2_guidance_output.loss.detach().to(torch.float64)
+                    * guidance_examples
+                )
+                step2_guidance_running[1] += guidance_examples
+                step2_guidance_running[2] += (
+                    step2_guidance_output.hard_ce.detach().to(torch.float64)
+                    * step2_guidance_output.count.detach().to(torch.float64)
+                )
+                step2_guidance_running[3] += (
+                    step2_guidance_output.correct.detach().to(torch.float64)
+                )
+                step2_guidance_running[4] += (
+                    step2_guidance_output.count.detach().to(torch.float64)
+                )
+                step2_guidance_running[5] += (
+                    step2_guidance_output.q0_correct.detach().to(torch.float64)
+                )
+                step2_guidance_running[6] += (
+                    step2_guidance_output.q0_count.detach().to(torch.float64)
+                )
 
             if not should_step:
                 continue
@@ -1521,6 +1824,10 @@ def main() -> None:
             if global_step % log_steps == 0:
                 totals = reduce_sums(running.clone(), distributed)
                 alignment_totals = reduce_sums(alignment_running.clone(), distributed)
+                step2_guidance_totals = reduce_sums(
+                    step2_guidance_running.clone(),
+                    distributed,
+                )
                 denominator = max(1.0, float(totals[2]))
                 if is_main(rank):
                     split_offset = base_metric_count
@@ -1541,7 +1848,42 @@ def main() -> None:
                         "curriculum/generated_anchors": float(totals[split_offset + 7]),
                         "auxiliary/weight": current_auxiliary_weight,
                         "condition/weight": current_condition_weight,
+                        "step2_guidance/weight": current_step2_guidance_weight,
                     }
+                    if float(step2_guidance_totals[1]) > 0:
+                        guidance_examples = max(
+                            1.0, float(step2_guidance_totals[1])
+                        )
+                        guidance_tokens = max(
+                            1.0, float(step2_guidance_totals[4])
+                        )
+                        guidance_q0_tokens = max(
+                            1.0, float(step2_guidance_totals[6])
+                        )
+                        guidance_loss = (
+                            float(step2_guidance_totals[0]) / guidance_examples
+                        )
+                        train_metrics.update(
+                            {
+                                "step2_guidance/loss": guidance_loss,
+                                "step2_guidance/hard_ce": float(
+                                    step2_guidance_totals[2]
+                                )
+                                / guidance_tokens,
+                                "step2_guidance/accuracy": float(
+                                    step2_guidance_totals[3]
+                                )
+                                / guidance_tokens,
+                                "step2_guidance/q0_accuracy": float(
+                                    step2_guidance_totals[5]
+                                )
+                                / guidance_q0_tokens,
+                                "train/objective": (
+                                    float(totals[0]) / denominator
+                                    + current_step2_guidance_weight * guidance_loss
+                                ),
+                            }
+                        )
                     if float(alignment_totals[2]) > 0:
                         train_metrics.update(
                             {
@@ -1584,6 +1926,8 @@ def main() -> None:
                         f"step={global_step}/{total_steps} epoch={epoch + 1}/{epochs} "
                         f"loss={train_metrics['train/loss']:.5f} "
                         f"slot_acc={train_metrics['train/slot_accuracy']:.4%} "
+                        f"step2={train_metrics.get('step2_guidance/loss', 0.0):.5f} "
+                        f"w_s2={current_step2_guidance_weight:.3f} "
                         f"p_gen={generated_probability:.3f} "
                         f"lr={scheduler.get_last_lr()[0]:.3e} "
                         f"elapsed={time.perf_counter() - run_start:.1f}s"
@@ -1592,6 +1936,7 @@ def main() -> None:
                         wandb_run.log(train_metrics, step=global_step)
                 running.zero_()
                 alignment_running.zero_()
+                step2_guidance_running.zero_()
 
             if eval_steps > 0 and global_step % eval_steps == 0:
                 eval_metrics = evaluate(
@@ -1602,6 +1947,8 @@ def main() -> None:
                     use_bf16=use_bf16,
                     condition_alignment=condition_alignment,
                     alignment_seed=seed,
+                    step2_guidance_model=step2_guidance_model,
+                    step2_guidance_weight=current_step2_guidance_weight,
                 )
                 if is_main(rank):
                     print(
@@ -1610,7 +1957,10 @@ def main() -> None:
                         f"gap_loss={eval_metrics['gap_loss']:.5f} "
                         f"slot_acc={eval_metrics['slot_accuracy']:.4%} "
                         f"gap_acc={eval_metrics['gap_accuracy']:.4%} "
-                        f"mean_gap={eval_metrics['mean_normal_gap']:.3f}"
+                        f"mean_gap={eval_metrics['mean_normal_gap']:.3f} "
+                        f"step2={eval_metrics['step2_guidance_loss']:.5f} "
+                        f"step2_acc={eval_metrics['step2_guidance_accuracy']:.4%} "
+                        f"w_s2={current_step2_guidance_weight:.3f}"
                     )
                     print("[eval slots]", json.dumps(eval_metrics["per_slot_accuracy"], sort_keys=True))
                     if eval_metrics["condition_gap_nats_per_token"]:
@@ -1630,6 +1980,18 @@ def main() -> None:
                             "eval/mean_normal_gap": eval_metrics["mean_normal_gap"],
                             "eval/tail_fraction": eval_metrics["tail_fraction"],
                             "eval/slot_accuracy": eval_metrics["slot_accuracy"],
+                            "eval_step2_guidance/loss": eval_metrics[
+                                "step2_guidance_loss"
+                            ],
+                            "eval_step2_guidance/hard_ce": eval_metrics[
+                                "step2_guidance_hard_ce"
+                            ],
+                            "eval_step2_guidance/accuracy": eval_metrics[
+                                "step2_guidance_accuracy"
+                            ],
+                            "eval_step2_guidance/q0_accuracy": eval_metrics[
+                                "step2_guidance_q0_accuracy"
+                            ],
                         }
                         wandb_payload.update(
                             {
@@ -1675,6 +2037,11 @@ def main() -> None:
             use_bf16=use_bf16,
             condition_alignment=condition_alignment,
             alignment_seed=seed,
+            step2_guidance_model=step2_guidance_model,
+            step2_guidance_weight=frozen_step2_guidance_weight(
+                epoch + 1,
+                frozen_step2_guidance,
+            ),
         )
         if is_main(rank):
             print(
@@ -1683,7 +2050,10 @@ def main() -> None:
                 f"gap_loss={eval_metrics['gap_loss']:.5f} "
                 f"slot_acc={eval_metrics['slot_accuracy']:.4%} "
                 f"gap_acc={eval_metrics['gap_accuracy']:.4%} "
-                f"mean_gap={eval_metrics['mean_normal_gap']:.3f}"
+                f"mean_gap={eval_metrics['mean_normal_gap']:.3f} "
+                f"step2={eval_metrics['step2_guidance_loss']:.5f} "
+                f"step2_acc={eval_metrics['step2_guidance_accuracy']:.4%} "
+                f"w_s2={frozen_step2_guidance_weight(epoch + 1, frozen_step2_guidance):.3f}"
             )
             print("[epoch eval slots]", json.dumps(eval_metrics["per_slot_accuracy"], sort_keys=True))
             if eval_metrics["condition_gap_nats_per_token"]:
@@ -1703,6 +2073,18 @@ def main() -> None:
                     "eval/tail_fraction": eval_metrics["tail_fraction"],
                     "eval/slot_accuracy": eval_metrics["slot_accuracy"],
                     "eval/completed_epoch": epoch + 1,
+                    "eval_step2_guidance/loss": eval_metrics[
+                        "step2_guidance_loss"
+                    ],
+                    "eval_step2_guidance/hard_ce": eval_metrics[
+                        "step2_guidance_hard_ce"
+                    ],
+                    "eval_step2_guidance/accuracy": eval_metrics[
+                        "step2_guidance_accuracy"
+                    ],
+                    "eval_step2_guidance/q0_accuracy": eval_metrics[
+                        "step2_guidance_q0_accuracy"
+                    ],
                 }
                 if current_gap_phase is not None:
                     wandb_payload.update(
