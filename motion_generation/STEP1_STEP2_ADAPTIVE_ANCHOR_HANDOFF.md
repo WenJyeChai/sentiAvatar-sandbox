@@ -1406,3 +1406,40 @@ python motion_generation/scripts/calibrate_step1_adaptive_gap.py \
 Then rerun the all-phase preflight. Training remains a NO-GO until every
 phase reports 19,019/19,019 valid training clips and 635/635 valid validation
 clips.
+
+### 21.9 Post-training adaptive evaluation
+
+The completed curriculum must not be evaluated with the fixed-gap rollout
+helper. Use:
+
+```text
+motion_generation/notebooks/evaluate_step1_adaptive_gap_planner.ipynb
+```
+
+Its two backing runners are:
+
+| Layer | Runner |
+|---|---|
+| Teacher-forced oracle, closed-loop learned gaps, fixed/DP controls, rollout caches | `scripts/evaluate_step1_adaptive_gap.py` |
+| Anchor-substitution and actual frozen-Step-2 infilling motion/FID | `scripts/evaluate_step1_adaptive_motion.py` |
+
+The mandatory decomposition is:
+
+1. learned gaps with GT anchor history, to isolate placement;
+2. learned gaps with generated anchor history, for deployable Step 1;
+3. rate-matched fixed gap 7 under both endpoint regimes;
+4. the final frozen-Step-2 DP schedule with GT endpoints as placement
+   headroom;
+5. anchor-substitution FID and frozen-Step-2-infilled FID reported
+   separately.
+
+The rollout controller batches variable text/audio spans through one
+append-only KV cache and records predicted versus executed gaps. Validation
+motion-token length is used only to terminate on the exact final frame and to
+clip an overshooting last decision. Therefore this protocol is explicitly
+`offline_known_motion_token_length`; its EOS-clipping fraction must be
+reported and it must not be described as strict unknown-duration inference.
+
+Before motion evaluation, the runner fingerprints the selected frozen Step 2
+weights and compares them with the interval-cache manifests. Evaluation stops
+if they are not the exact weights that produced the curriculum costs.
