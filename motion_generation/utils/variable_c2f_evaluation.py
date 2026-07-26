@@ -447,6 +447,174 @@ def infer_window_records(
 
 
 @torch.no_grad()
+def infer_c2f_window_records_with_metrics(
+    model: AudioMotionTransformer,
+    spec: InfillModelSpec,
+    records: Sequence[EvalWindowRecord],
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[list[np.ndarray], list[Dict[str, Any]]]:
+    """Run hard C2F inference and retain canonical per-interval likelihood.
+
+    The returned predictions are identical to unconstrained
+    :func:`infer_window_records` C2F predictions.  Metrics use the GT missing
+    IDs at each stage while earlier quantizer prefixes are the model's own hard
+    predictions, matching deployed coarse-to-fine inference.
+    """
+
+    if spec.decoder != "c2f":
+        raise ValueError("C2F likelihood metrics require spec.decoder='c2f'")
+    if not records:
+        return [], []
+    collator = VariableGapC2FCollator(model.config)
+    ntpf = int(model.config.num_tokens_per_frame)
+    codebook_size = int(model.config.codebook_size)
+    num_quantizers = int(
+        getattr(model.config, "num_quantizers_per_part", 1)
+    )
+    if ntpf % num_quantizers:
+        raise ValueError(
+            f"num_tokens_per_frame={ntpf} is not divisible by "
+            f"num_quantizers_per_part={num_quantizers}"
+        )
+    offsets = np.arange(ntpf, dtype=np.int64) * codebook_size
+    predictions: list[np.ndarray] = []
+    metric_rows: list[Dict[str, Any]] = []
+    model.eval()
+
+    for start_idx in tqdm(
+        range(0, len(records), batch_size),
+        desc=f"infer+CE {spec.name}",
+        leave=False,
+    ):
+        chunk = records[start_idx : start_idx + batch_size]
+        batch = collator([record.example for record in chunk])
+        batch = {key: value.to(device) for key, value in batch.items()}
+        batch["audio_features"] = apply_audio_input_mode(
+            batch["audio_features"],
+            chunk,
+            records,
+            start_index=start_idx,
+            mode=spec.audio_input_mode,
+            seed=spec.audio_ablation_seed,
+        )
+        current = batch["input_ids"].clone()
+        gt_ids = batch["gt_ids"]
+        middle = batch["middle_mask"].bool()
+        attention = batch["attention_mask"].bool()
+        gaps = batch["gap_lengths"]
+        encoded_audio = model.audio_encoder(batch["audio_features"])
+        slots = torch.arange(current.shape[1], device=device).remainder(ntpf)
+        quantizer_slots = slots.remainder(num_quantizers).view(1, -1)
+
+        row_ce_sum = torch.zeros(len(chunk), device=device, dtype=torch.float64)
+        row_correct = torch.zeros(len(chunk), device=device, dtype=torch.long)
+        row_count = torch.zeros_like(row_correct)
+        stage_ce_sum = torch.zeros(
+            len(chunk), num_quantizers, device=device, dtype=torch.float64
+        )
+        stage_correct = torch.zeros(
+            len(chunk), num_quantizers, device=device, dtype=torch.long
+        )
+        stage_count = torch.zeros_like(stage_correct)
+
+        for stage in range(num_quantizers):
+            logits = model(
+                current,
+                attention_mask=attention,
+                middle_mask=middle,
+                gap_lengths=gaps,
+                c2f_stage=stage,
+                encoded_audio=encoded_audio,
+            )
+            valid = middle & quantizer_slots.eq(stage)
+            selected_losses = F.cross_entropy(
+                logits[valid].float(),
+                gt_ids[valid],
+                reduction="none",
+            ).to(torch.float64)
+            selected_rows = valid.nonzero(as_tuple=False)[:, 0]
+            predictions_global = logits.argmax(dim=-1)
+            selected_correct = predictions_global[valid].eq(gt_ids[valid])
+            counts = torch.bincount(
+                selected_rows,
+                minlength=len(chunk),
+            )
+            losses = torch.zeros_like(row_ce_sum).scatter_add(
+                0,
+                selected_rows,
+                selected_losses,
+            )
+            correct = torch.zeros_like(row_correct).scatter_add(
+                0,
+                selected_rows,
+                selected_correct.to(torch.long),
+            )
+            row_ce_sum += losses
+            row_correct += correct
+            row_count += counts
+            stage_ce_sum[:, stage] = losses
+            stage_correct[:, stage] = correct
+            stage_count[:, stage] = counts
+            current[valid] = predictions_global[valid]
+
+        global_frames = current.reshape(len(chunk), -1, ntpf).cpu().numpy()
+        row_ce_sum = row_ce_sum.cpu().numpy()
+        row_correct = row_correct.cpu().numpy()
+        row_count = row_count.cpu().numpy()
+        stage_ce_sum = stage_ce_sum.cpu().numpy()
+        stage_correct = stage_correct.cpu().numpy()
+        stage_count = stage_count.cpu().numpy()
+        for row_index, (frames, record) in enumerate(zip(global_frames, chunk)):
+            frame_count = record.gap_frames + 2
+            predictions.append(
+                (frames[1 : frame_count - 1] - offsets).astype(np.int64)
+            )
+            count = int(row_count[row_index])
+            metric: Dict[str, Any] = {
+                "name": record.name,
+                "sequence_idx": int(record.sequence_idx),
+                "left_idx": int(record.left_idx),
+                "gap": int(record.gap_frames),
+                "ce_sum": float(row_ce_sum[row_index]),
+                "correct": int(row_correct[row_index]),
+                "token_count": count,
+                "cross_entropy": (
+                    float(row_ce_sum[row_index]) / count
+                    if count
+                    else float("nan")
+                ),
+                "accuracy": (
+                    float(row_correct[row_index]) / count
+                    if count
+                    else float("nan")
+                ),
+            }
+            for stage in range(num_quantizers):
+                stage_tokens = int(stage_count[row_index, stage])
+                metric[f"q{stage}_ce_sum"] = float(
+                    stage_ce_sum[row_index, stage]
+                )
+                metric[f"q{stage}_correct"] = int(
+                    stage_correct[row_index, stage]
+                )
+                metric[f"q{stage}_token_count"] = stage_tokens
+                metric[f"q{stage}_cross_entropy"] = (
+                    float(stage_ce_sum[row_index, stage]) / stage_tokens
+                    if stage_tokens
+                    else float("nan")
+                )
+                metric[f"q{stage}_accuracy"] = (
+                    float(stage_correct[row_index, stage]) / stage_tokens
+                    if stage_tokens
+                    else float("nan")
+                )
+            metric_rows.append(metric)
+    return predictions, metric_rows
+
+
+@torch.no_grad()
 def decode_multipart_part_batch(
     frame_batch: Sequence[Sequence[Sequence[int]]] | np.ndarray,
     codecs: Mapping[str, LoadedPartCodec],

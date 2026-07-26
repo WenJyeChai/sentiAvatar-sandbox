@@ -1543,3 +1543,74 @@ Checkpoint selection uses the configured combined validation objective.
 Compare the control and guided checkpoint using hard generated anchors, actual
 Step 2 missing-token CE/accuracy, decoded RMSE, and Step-2-infilled FID. Do not
 select the experiment from the straight-through training loss alone.
+
+### 22.4 Final fixed-gap test
+
+First run the common hard-rollout comparison with cache export. The adapter
+below consumes these exact generated anchors; it does not run Step 1 again.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/evaluate_step1_multipart_comparison.py \
+  --output_dir motion_generation/outputs/step1_experiment_a_final_comparison \
+  --device cuda:0 \
+  --teacher_max_clips 0 \
+  --rollout_max_clips 0 \
+  --teacher_batch_size 32 \
+  --rollout_batch_size 8 \
+  --num_workers 0 \
+  --subset_seed 42 \
+  --write_rollout_cache \
+  --checkpoint control_final=checkpoints/step1_experiment_a_fixed_gap7_online_step2_6k_control/final \
+  --checkpoint guided_final=checkpoints/step1_experiment_a_fixed_gap7_online_step2_6k/final
+```
+
+Convert the two legacy fixed-gap caches into the strict sparse-plan evaluation
+contract and create the matched gap-7 GT-anchor condition:
+
+```bash
+python motion_generation/scripts/prepare_step1_fixed_gap_motion_evaluation.py \
+  --comparison_output_dir motion_generation/outputs/step1_experiment_a_final_comparison \
+  --output_dir motion_generation/outputs/step1_experiment_a_fixed_motion_input \
+  --checkpoint_label control_final \
+  --checkpoint_label guided_final
+```
+
+The adapter must end with `PASS`. It rejects missing caches, stale anchor
+times, mismatched validation sets, different motion-token exports, or a
+different frozen Step 2 checkpoint.
+
+Run the actual frozen Step 2 decoder, causal-codec reconstruction metrics, and
+both motion-FID protocols:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/evaluate_step1_adaptive_motion.py \
+  --rollout_output_dir motion_generation/outputs/step1_experiment_a_fixed_motion_input \
+  --condition fixed_gap7_gt_anchors \
+  --condition control_final__fixed_gap7_generated_history \
+  --condition guided_final__fixed_gap7_generated_history \
+  --output_dir motion_generation/outputs/step1_experiment_a_fixed_step2_motion \
+  --step2_config motion_generation/configs/audio_c2f_body_causal_moss_nano_all16_soft_recovery_sf05_stage2.yaml \
+  --step2_checkpoint checkpoints/mask_multipart_body_causal_moss_nano_all16_variable_c2f_soft_recovery_sf05_stage2_gap1_15 \
+  --device cuda:0 \
+  --step2_batch_size 256 \
+  --fid_batch_size 64 \
+  --diversity_times 300 \
+  --metric_seed 42
+```
+
+The primary outputs are:
+
+- `step2_c2f_summary.csv`: actual hard-prefix Step 2 missing-token CE,
+  perplexity, and q0-q3 accuracy;
+- `decoded_metrics_summary.csv`: codec-relative and raw-GT motion errors;
+- `adaptive_motion_fid.csv`: anchor-substitution and Step-2-infilled FID;
+- `adaptive_motion_report.json`: machine-readable combined report.
+
+Experiment A passes only if the guided generated-history condition improves
+the control at the same fixed anchor schedule. Give most weight to lower
+Step-2-infilled FID and decoded RMSE, then lower Step 2 CE/higher missing-token
+accuracy. The GT-anchor condition is headroom, not a competitor. The
+anchor-substitution protocol isolates anchor damage and must not be merged
+with the end-to-end Step-2-infilled result.

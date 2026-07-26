@@ -14,13 +14,17 @@ if str(MOTION_GENERATION_DIR) not in sys.path:
 
 from utils.variable_c2f_evaluation import (
     EvalWindowRecord,
+    InfillModelSpec,
     VariableGapMaskExample,
     apply_audio_input_mode,
     decoded_face_group_metrics,
     generated_gap_dynamics_metrics,
+    infer_c2f_window_records_with_metrics,
+    infer_window_records,
     paired_bootstrap_window_differences,
     seam_discontinuity_metrics,
 )
+from models.audio_motion_model import AudioMotionConfig, AudioMotionTransformer
 
 
 def make_record(sequence_idx: int, offset: float, gap: int = 4) -> EvalWindowRecord:
@@ -153,3 +157,91 @@ def test_paired_bootstrap_uses_clip_level_differences():
     assert len(result) == 1
     assert result.iloc[0]["mean_difference"] == 1.5
     assert result.iloc[0]["ci_low"] <= 1.5 <= result.iloc[0]["ci_high"]
+
+
+def test_c2f_metrics_preserve_hard_rollout_and_count_each_stage(tmp_path):
+    torch.manual_seed(7)
+    config = AudioMotionConfig(
+        hidden_size=16,
+        num_layers=1,
+        num_heads=4,
+        intermediate_size=32,
+        max_position_embeddings=128,
+        vocab_size=512 * 16 + 1,
+        codebook_size=512,
+        audio_feat_dim=2,
+        num_tokens_per_frame=16,
+        num_parts=4,
+        num_quantizers_per_part=4,
+        dropout=0.0,
+        cond_drop_prob=0.0,
+    )
+    model = AudioMotionTransformer(config).eval()
+    records = []
+    for sequence_idx, gap in enumerate((2, 3)):
+        frames = gap + 2
+        motion_tokens = [
+            [int((frame * 17 + slot * 11) % 512) for slot in range(16)]
+            for frame in range(frames)
+        ]
+        example = VariableGapMaskExample(
+            name=f"metric-{sequence_idx}",
+            left_idx=sequence_idx * 10,
+            right_idx=sequence_idx * 10 + gap + 1,
+            gap_frames=gap,
+            motion_tokens=motion_tokens,
+            audio_features=torch.arange(
+                frames * 2, dtype=torch.float32
+            ).reshape(frames, 2),
+        )
+        records.append(
+            EvalWindowRecord(
+                sequence_idx=sequence_idx,
+                name=example.name,
+                left_idx=example.left_idx,
+                gap_frames=gap,
+                example=example,
+            )
+        )
+    spec = InfillModelSpec(
+        name="tiny",
+        checkpoint=tmp_path,
+        decoder="c2f",
+        allowed_gaps=(1, 2, 3),
+    )
+
+    expected = infer_window_records(
+        model,
+        spec,
+        records,
+        batch_size=2,
+        device=torch.device("cpu"),
+    )
+    actual, metrics = infer_c2f_window_records_with_metrics(
+        model,
+        spec,
+        records,
+        batch_size=2,
+        device=torch.device("cpu"),
+    )
+
+    assert len(actual) == len(expected) == len(metrics) == 2
+    for prediction, reference, record, metric in zip(
+        actual, expected, records, metrics
+    ):
+        assert np.array_equal(prediction, reference)
+        gt = np.asarray(record.example.motion_tokens[1:-1], dtype=np.int64)
+        assert metric["token_count"] == record.gap_frames * 16
+        assert metric["correct"] == int(np.equal(prediction, gt).sum())
+        assert np.isclose(
+            metric["accuracy"],
+            np.equal(prediction, gt).mean(),
+        )
+        assert np.isfinite(metric["cross_entropy"])
+        for stage in range(4):
+            stage_prediction = prediction[:, stage::4]
+            stage_gt = gt[:, stage::4]
+            assert metric[f"q{stage}_token_count"] == record.gap_frames * 4
+            assert metric[f"q{stage}_correct"] == int(
+                np.equal(stage_prediction, stage_gt).sum()
+            )
