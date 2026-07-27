@@ -138,3 +138,57 @@ Do not pass `--init_from_checkpoint`; the configuration initializes from
 
 If memory is insufficient, change the configuration to per-device batch 4 and
 gradient accumulation 8 to preserve the global batch of 128.
+
+## Matched causal-student ablation
+
+The causal comparison uses:
+
+`motion_generation/configs/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab_causal.yaml`
+
+Everything matches the full-audio run except:
+
+```yaml
+planner_context:
+  attention_mode: causal
+  sequence_layout: causal_interleaved
+```
+
+The complete text remains available at the start. Audio frames are inserted
+chronologically after each supplied gap and before its target anchor, so anchor
+\(k\) sees audio only through its own boundary.
+
+Small preflight:
+
+```bash
+python motion_generation/scripts/validate_step1_fixed_gap_data.py \
+  --config motion_generation/configs/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab_causal.yaml \
+  --max_train_clips 32 \
+  --max_eval_clips 32 \
+  --output_json checkpoints/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab_causal/data_preflight_smoke.json
+```
+
+One-GPU smoke training:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab_causal.yaml \
+  --max_train_clips 64 \
+  --max_eval_clips 32 \
+  --max_train_steps 2 \
+  --output_dir checkpoints/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab_causal_smoke
+```
+
+Full four-GPU training:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=4 --master_port=29515 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab_causal.yaml
+```
+
+Use the same validation clips and deterministic validation schedule when
+comparing the two runs. Primary comparisons are validation anchor CE,
+per-gap-bin CE, generated-anchor FID, and frozen-Step-2 performance under the
+same externally supplied schedules.
