@@ -283,7 +283,7 @@ def solve_step2_schedule(
     )
 
 
-def random_curriculum_schedule(
+def random_uniform_schedule(
     num_frames: int,
     *,
     min_gap: int,
@@ -292,7 +292,12 @@ def random_curriculum_schedule(
     epoch: int,
     name: str,
 ) -> GapSchedule:
-    """Deterministic content warm-up path with legal normal gaps and EOS tail."""
+    """Deterministic uniform path with legal normal gaps and an EOS-only tail.
+
+    At each boundary, the next gap is sampled uniformly from the configured
+    values that still permit the sequence to terminate legally. This is a
+    supplied schedule, not a target distribution for learning gap placement.
+    """
 
     if num_frames < 1:
         raise ValueError("num_frames must be positive")
@@ -325,6 +330,27 @@ def random_curriculum_schedule(
         normal.append(gap)
         anchors.append(left + gap + 1)
     return GapSchedule(tuple(anchors), {}, tuple(normal), tail, 0.0)
+
+
+def random_curriculum_schedule(
+    num_frames: int,
+    *,
+    min_gap: int,
+    max_gap: int,
+    seed: int,
+    epoch: int,
+    name: str,
+) -> GapSchedule:
+    """Backward-compatible name for random curriculum phases."""
+
+    return random_uniform_schedule(
+        num_frames,
+        min_gap=min_gap,
+        max_gap=max_gap,
+        seed=seed,
+        epoch=epoch,
+        name=name,
+    )
 
 
 def schedule_mean_gap(schedules: Iterable[GapSchedule]) -> float:

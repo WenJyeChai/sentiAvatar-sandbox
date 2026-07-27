@@ -29,6 +29,7 @@ from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     validate_adaptive_gap_config,
     validate_frozen_step2_guidance_config,
     validate_paths,
+    validate_provided_gap_config,
 )
 from models.step1_mimi_planner import load_text_map, read_split_names  # noqa: E402
 from utils.adaptive_anchor_tokens import (  # noqa: E402
@@ -197,6 +198,11 @@ def main() -> None:
         config,
         num_epochs=int(training.get("num_train_epochs", 10)),
     )
+    provided_gap = validate_provided_gap_config(config)
+    if adaptive_gap["enabled"] and provided_gap["enabled"]:
+        raise ValueError(
+            "adaptive_gap and provided_gap_training are mutually exclusive"
+        )
     frozen_step2_guidance = validate_frozen_step2_guidance_config(config)
     tokenizer = AutoTokenizer.from_pretrained(paths["base_model"], local_files_only=True)
     added = ensure_step1_special_tokens(
@@ -226,6 +232,7 @@ def main() -> None:
         neutral_seed=neutral_seed,
         training=True,
         adaptive_gap=adaptive_gap,
+        provided_gap=provided_gap,
         frozen_step2_guidance=frozen_step2_guidance,
     )
     eval_dataset = build_dataset(
@@ -237,6 +244,7 @@ def main() -> None:
         neutral_seed=neutral_seed,
         training=False,
         adaptive_gap=adaptive_gap,
+        provided_gap=provided_gap,
         frozen_step2_guidance=frozen_step2_guidance,
     )
     report = {
@@ -249,6 +257,7 @@ def main() -> None:
             else 0
         ),
         "audio_vocabulary_tokens_added_in_memory": len(added_audio),
+        "provided_gap_training": provided_gap,
     }
     if adaptive_gap["enabled"]:
         report["adaptive_phases"] = []

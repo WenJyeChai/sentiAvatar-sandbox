@@ -23,6 +23,7 @@ from models.step1_mimi_planner import (  # noqa: E402
     Step1AdaptiveGapDataset,
     Step1FixedGapDataset,
     Step1PlannerCollator,
+    Step1ProvidedGapDataset,
     build_prefix_lm_attention_mask,
     parse_structured_text,
 )
@@ -343,6 +344,59 @@ def test_adaptive_dataset_loads_materialized_dp_schedule(
     assert item["tail_gap"] == 2
     assert sum(item["gap_target_mask"]) == 4
     assert item["gap_loss_weight"] == 1.0
+
+
+def test_provided_gap_dataset_resamples_uniform_inputs_without_gap_targets(
+    tmp_path: Path,
+    step1_tokenizer,
+):
+    name = "session/provided_gap"
+    motion_dir, audio_dir, _, _ = _write_synthetic_clip(
+        tmp_path,
+        name,
+        token_frames=180,
+        audio_frames=225,
+    )
+    dataset = Step1ProvidedGapDataset(
+        [name],
+        tokenizer=step1_tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "provided gap"},
+        seed_mode="observed",
+        min_gap=3,
+        max_gap=15,
+        resample_each_epoch=True,
+    )
+    dataset.set_epoch(0)
+    first = dataset[0]
+    repeated = dataset[0]
+    assert first["anchor_times"] == repeated["anchor_times"]
+    assert all(3 <= gap <= 15 for gap in first["normal_gaps"])
+    assert first["tail_gap"] is None or 0 <= first["tail_gap"] <= 2
+    assert not any(first["gap_target_mask"])
+    assert first["gap_loss_weight"] == 0.0
+
+    dataset.set_epoch(1)
+    second = dataset[0]
+    assert first["anchor_times"] != second["anchor_times"]
+    assert not any(second["gap_target_mask"])
+
+    fixed_eval = Step1ProvidedGapDataset(
+        [name],
+        tokenizer=step1_tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "provided gap"},
+        seed_mode="observed",
+        min_gap=3,
+        max_gap=15,
+        resample_each_epoch=False,
+    )
+    fixed_eval.set_epoch(0)
+    eval_times = fixed_eval[0]["anchor_times"]
+    fixed_eval.set_epoch(99)
+    assert fixed_eval[0]["anchor_times"] == eval_times
 
 
 def test_dataset_serializes_synchronous_q0_q3_frames(tmp_path: Path, step1_tokenizer):
@@ -715,6 +769,8 @@ def test_tiny_prefix_lm_planner_backpropagates_without_plan_leakage():
         bidirectional_prefix_mask=prefix,
     )
     assert torch.isfinite(output.loss)
+    assert int(output.gap_count) == 0
+    assert torch.allclose(output.loss, output.ce_loss)
     output.loss.backward()
     assert (
         planner.language_model.model.layers[0].self_attn.q_proj.weight.grad

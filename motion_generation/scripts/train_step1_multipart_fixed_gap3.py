@@ -39,6 +39,7 @@ from models.step1_mimi_planner import (  # noqa: E402
     Step1AdaptiveGapDataset,
     Step1FixedGapDataset,
     Step1PlannerCollator,
+    Step1ProvidedGapDataset,
     load_text_map,
     read_split_names,
 )
@@ -245,6 +246,7 @@ def mimi_codebooks_from_config(config: Mapping[str, Any]) -> list[int]:
 def data_config_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     data = section(config, "data")
     data["_audio_contract"] = audio_contract_from_config(config)
+    data["_provided_gap_training"] = validate_provided_gap_config(config)
     data["audio_input_representation"] = data["_audio_contract"][
         "input_representation"
     ]
@@ -270,6 +272,32 @@ def planner_context_from_config(config: Mapping[str, Any]) -> dict[str, str]:
             f"attention_mode={mode!r}, sequence_layout={layout!r}"
         )
     return {"attention_mode": mode, "sequence_layout": layout}
+
+
+def validate_provided_gap_config(
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    supplied = section(config, "provided_gap_training")
+    supplied.setdefault("enabled", False)
+    supplied["enabled"] = bool(supplied["enabled"])
+    supplied.setdefault("distribution", "uniform")
+    supplied.setdefault("min_gap", 3)
+    supplied.setdefault("max_gap", 15)
+    supplied.setdefault("resample_each_epoch", True)
+    supplied["distribution"] = str(supplied["distribution"])
+    supplied["min_gap"] = int(supplied["min_gap"])
+    supplied["max_gap"] = int(supplied["max_gap"])
+    supplied["resample_each_epoch"] = bool(supplied["resample_each_epoch"])
+    if supplied["distribution"] != "uniform":
+        raise ValueError(
+            "provided_gap_training currently supports only distribution=uniform"
+        )
+    if not 3 <= supplied["min_gap"] <= supplied["max_gap"] <= 15:
+        raise ValueError(
+            "provided_gap_training normal gaps must satisfy 3 <= min_gap "
+            "<= max_gap <= 15"
+        )
+    return supplied
 
 
 def validate_adaptive_gap_config(
@@ -659,6 +687,7 @@ def build_dataset(
     neutral_seed: Optional[tuple[int, ...]],
     training: bool,
     adaptive_gap: Optional[Mapping[str, Any]] = None,
+    provided_gap: Optional[Mapping[str, Any]] = None,
     frozen_step2_guidance: Optional[Mapping[str, Any]] = None,
 ) -> Step1FixedGapDataset:
     generated_anchor_dir_value = data_config.get("generated_anchor_dir") if training else None
@@ -680,16 +709,38 @@ def build_dataset(
                 data_config.get("audio_input_representation", "fused_frame")
             ),
         }
-    dataset_class = (
-        Step1AdaptiveGapDataset
-        if adaptive_gap is not None and bool(adaptive_gap.get("enabled", False))
-        else Step1FixedGapDataset
+    if provided_gap is None:
+        raw_provided = data_config.get("_provided_gap_training", {})
+        provided_gap = (
+            raw_provided if isinstance(raw_provided, Mapping) else {}
+        )
+    adaptive_enabled = bool(
+        adaptive_gap is not None and adaptive_gap.get("enabled", False)
     )
-    adaptive_kwargs: dict[str, Any] = {}
+    provided_enabled = bool(provided_gap.get("enabled", False))
+    if adaptive_enabled and provided_enabled:
+        raise ValueError(
+            "adaptive_gap and provided_gap_training are mutually exclusive"
+        )
+    if adaptive_enabled:
+        dataset_class = Step1AdaptiveGapDataset
+    elif provided_enabled:
+        dataset_class = Step1ProvidedGapDataset
+    else:
+        dataset_class = Step1FixedGapDataset
+    schedule_kwargs: dict[str, Any] = {}
     if dataset_class is Step1AdaptiveGapDataset:
-        adaptive_kwargs = {
+        schedule_kwargs = {
             "curriculum_phases": adaptive_gap["phases"],
             "calibration_json": adaptive_gap["calibration_json"],
+        }
+    elif dataset_class is Step1ProvidedGapDataset:
+        schedule_kwargs = {
+            "min_gap": int(provided_gap["min_gap"]),
+            "max_gap": int(provided_gap["max_gap"]),
+            "resample_each_epoch": bool(
+                provided_gap["resample_each_epoch"] if training else False
+            ),
         }
     guidance_enabled = bool(
         frozen_step2_guidance is not None
@@ -753,7 +804,7 @@ def build_dataset(
             if guidance_enabled
             else None
         ),
-        **adaptive_kwargs,
+        **schedule_kwargs,
     )
 
 
@@ -1450,6 +1501,11 @@ def main() -> None:
         config,
         num_epochs=requested_epochs,
     )
+    provided_gap = validate_provided_gap_config(config)
+    if bool(adaptive_gap["enabled"]) and bool(provided_gap["enabled"]):
+        raise ValueError(
+            "adaptive_gap and provided_gap_training are mutually exclusive"
+        )
     frozen_step2_guidance = validate_frozen_step2_guidance_config(config)
     if args.step2_guidance_weight is not None:
         if args.step2_guidance_weight < 0:
@@ -1462,11 +1518,17 @@ def main() -> None:
         config.setdefault("frozen_step2_guidance", {})["weight"] = float(
             args.step2_guidance_weight
         )
-    if bool(adaptive_gap["enabled"]) and bool(
+    if (
+        bool(adaptive_gap["enabled"])
+        or (
+            bool(provided_gap["enabled"])
+            and bool(provided_gap["resample_each_epoch"])
+        )
+    ) and bool(
         data_config.get("persistent_workers", False)
     ):
         raise ValueError(
-            "Adaptive curriculum changes schedules at epoch boundaries; set "
+            "The configured training schedule changes at epoch boundaries; set "
             "data.persistent_workers=false so workers receive the new epoch."
         )
     generated_history = validate_generated_history_config(config)
@@ -1474,9 +1536,14 @@ def main() -> None:
     auxiliary_loss = validate_auxiliary_loss_config(config)
     condition_alignment = validate_condition_alignment_config(config)
     if planner_context["attention_mode"] == "prefix_lm":
-        if not bool(adaptive_gap["enabled"]):
+        if not (
+            bool(adaptive_gap["enabled"])
+            or bool(provided_gap["enabled"])
+        ):
             raise ValueError(
-                "The offline full-audio teacher requires adaptive_gap.enabled=true"
+                "The offline full-audio planner requires either "
+                "adaptive_gap.enabled=true or "
+                "provided_gap_training.enabled=true"
             )
         incompatible = []
         if bool(frozen_step2_guidance["enabled"]):
@@ -1491,7 +1558,7 @@ def main() -> None:
             incompatible.append("condition_alignment")
         if incompatible:
             raise ValueError(
-                "The first offline teacher run isolates DP gap and anchor CE; "
+                "The offline full-audio run requires an isolated planner objective; "
                 f"disable: {', '.join(incompatible)}"
             )
         if data_config.get("generated_anchor_dir") is not None or float(
@@ -1513,6 +1580,10 @@ def main() -> None:
         if bool(adaptive_gap["enabled"]):
             raise ValueError(
                 "Experiment A isolates anchor content; disable adaptive_gap"
+            )
+        if bool(provided_gap["enabled"]):
+            raise ValueError(
+                "Experiment A uses a fixed gap; disable provided_gap_training"
             )
         left_boundary_mode = str(
             frozen_step2_guidance["left_boundary_mode"]
@@ -1673,6 +1744,7 @@ def main() -> None:
         neutral_seed=neutral_seed,
         training=True,
         adaptive_gap=adaptive_gap,
+        provided_gap=provided_gap,
         frozen_step2_guidance=frozen_step2_guidance,
     )
     eval_dataset = build_dataset(
@@ -1684,6 +1756,7 @@ def main() -> None:
         neutral_seed=neutral_seed,
         training=False,
         adaptive_gap=adaptive_gap,
+        provided_gap=provided_gap,
         frozen_step2_guidance=frozen_step2_guidance,
     )
     # Fail before DDP training if the serialization contract is broken.
@@ -1786,11 +1859,12 @@ def main() -> None:
         trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
         total = sum(parameter.numel() for parameter in model.parameters())
         print("=" * 76)
-        print(
-            "Phase 1 adaptive-gap multipart planner"
-            if adaptive_gap["enabled"]
-            else "Phase 1 fixed-gap multipart planner"
-        )
+        if provided_gap["enabled"]:
+            print("Stage 1 supplied-gap anchor-CE pretraining")
+        elif adaptive_gap["enabled"]:
+            print("Phase 1 adaptive-gap multipart planner")
+        else:
+            print("Phase 1 fixed-gap multipart planner")
         print(f"Base/init/resume:  {model_checkpoint or paths['base_model']}")
         print(f"Output:            {paths['output_dir']}")
         print(f"Motion tokens:     {paths['motion_token_dir']}")
@@ -1827,6 +1901,18 @@ def main() -> None:
                     f"{phase.schedule_loss_weight_end}, "
                     f"temperature={phase.temperature}"
                 )
+        if provided_gap["enabled"]:
+            print(
+                "Supplied gaps:     "
+                f"distribution={provided_gap['distribution']}, "
+                f"range={provided_gap['min_gap']}-{provided_gap['max_gap']}, "
+                f"resample_train={provided_gap['resample_each_epoch']}, "
+                "resample_eval=False"
+            )
+            print(
+                "Gap supervision:  disabled "
+                "(gap tokens are inputs; anchor CE is the sole planner loss)"
+            )
         print(
             "Generated history: "
             f"enabled={bool(generated_history['enabled'])}, "

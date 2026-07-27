@@ -10,6 +10,7 @@ from train_step1_multipart_fixed_gap3 import (
     load_training_state,
     validate_auxiliary_loss_config,
     validate_condition_alignment_config,
+    validate_provided_gap_config,
 )
 
 
@@ -115,3 +116,44 @@ def test_condition_alignment_weight_has_ce_warmup_and_linear_ramp() -> None:
     assert condition_alignment_weight(5.0, config) == 0.0
     assert math.isclose(condition_alignment_weight(6.5, config), 0.015)
     assert condition_alignment_weight(8.0, config) == 0.03
+
+
+def test_provided_gap_training_defaults_and_uniform_contract() -> None:
+    disabled = validate_provided_gap_config({})
+    assert disabled == {
+        "enabled": False,
+        "distribution": "uniform",
+        "min_gap": 3,
+        "max_gap": 15,
+        "resample_each_epoch": True,
+    }
+    supplied = validate_provided_gap_config(
+        {
+            "provided_gap_training": {
+                "enabled": True,
+                "distribution": "uniform",
+                "min_gap": 3,
+                "max_gap": 15,
+                "resample_each_epoch": True,
+            }
+        }
+    )
+    assert supplied["enabled"] is True
+    assert supplied["min_gap"] == 3
+    assert supplied["max_gap"] == 15
+
+
+def test_provided_gap_training_rejects_invalid_ranges_and_distributions() -> None:
+    for payload in (
+        {"distribution": "dp", "min_gap": 3, "max_gap": 15},
+        {"distribution": "uniform", "min_gap": 2, "max_gap": 15},
+        {"distribution": "uniform", "min_gap": 3, "max_gap": 16},
+    ):
+        try:
+            validate_provided_gap_config(
+                {"provided_gap_training": {"enabled": True, **payload}}
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Invalid supplied-gap config was accepted: {payload}")

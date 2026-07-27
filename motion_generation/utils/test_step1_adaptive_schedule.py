@@ -7,6 +7,7 @@ from .step1_adaptive_schedule import (
     calibrate_anchor_penalty,
     parse_curriculum,
     random_curriculum_schedule,
+    random_uniform_schedule,
     solve_step2_schedule,
 )
 
@@ -103,6 +104,33 @@ def test_random_warmup_is_deterministic_and_legal() -> None:
     assert first == second
     assert all(3 <= gap <= 7 for gap in first.normal_gaps)
     assert first.tail_gap is None or 0 <= first.tail_gap <= 2
+
+
+def test_uniform_supplied_gaps_are_deterministic_legal_and_cover_full_range() -> None:
+    first = random_uniform_schedule(
+        180, min_gap=3, max_gap=15, seed=42, epoch=7, name="clip/a"
+    )
+    second = random_uniform_schedule(
+        180, min_gap=3, max_gap=15, seed=42, epoch=7, name="clip/a"
+    )
+    assert first == second
+    assert first.anchor_times[0] == 0
+    assert first.anchor_times[-1] == 179
+    assert all(3 <= gap <= 15 for gap in first.normal_gaps)
+    assert first.tail_gap is None or 0 <= first.tail_gap <= 2
+    observed = {
+        gap
+        for epoch in range(64)
+        for gap in random_uniform_schedule(
+            180,
+            min_gap=3,
+            max_gap=15,
+            seed=42,
+            epoch=epoch,
+            name="clip/a",
+        ).normal_gaps
+    }
+    assert observed == set(range(3, 16))
 
 
 def test_50_epoch_curriculum_parses_contiguously() -> None:

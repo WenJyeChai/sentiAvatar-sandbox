@@ -1,10 +1,11 @@
-"""Audio-token-conditioned Qwen planner and fixed/adaptive-gap Step 1 dataset.
+"""Audio-token-conditioned Qwen planner and Step 1 datasets.
 
 The historical class names retain ``Mimi`` for checkpoint compatibility, while
 the runtime audio contract now supports both Mimi and MOSS Nano tokens. The
 default sequence remains causal/interleaved. The offline teacher additionally
 supports a full-audio prefix-LM layout whose condition block is bidirectional
-and whose gap/anchor plan remains autoregressive.
+and whose gap/anchor plan remains autoregressive. Supplied-gap pretraining
+randomizes legal gap inputs while supervising anchor content only.
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ from utils.step1_adaptive_schedule import (
     load_calibration,
     phase_for_epoch,
     random_curriculum_schedule,
+    random_uniform_schedule,
 )
 
 
@@ -1171,6 +1173,45 @@ class Step1AdaptiveGapDataset(Step1FixedGapDataset):
         # GapSchedule is frozen and intentionally minimal. Attach the phase
         # weight on a tiny proxy object used only during serialization.
         return _WeightedGapSchedule(base, phase.loss_weight(self.epoch))
+
+
+class Step1ProvidedGapDataset(Step1FixedGapDataset):
+    """Anchor-CE pretraining with externally supplied uniform random gaps.
+
+    The schedule changes which GT motion frames become anchors, but it never
+    creates gap targets. Consequently, ``[gap_g]`` is a conditioning token and
+    only the following 16 body IDs receive supervision.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        min_gap: int = 3,
+        max_gap: int = 15,
+        resample_each_epoch: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.provided_min_gap = int(min_gap)
+        self.provided_max_gap = int(max_gap)
+        self.resample_each_epoch = bool(resample_each_epoch)
+        if not 3 <= self.provided_min_gap <= self.provided_max_gap <= 15:
+            raise ValueError("Supplied normal gaps must lie in [3, 15]")
+
+    def _anchor_schedule(
+        self,
+        name: str,
+        motion_tokens: Sequence[Sequence[int]],
+    ) -> GapSchedule:
+        schedule_epoch = self.epoch if self.resample_each_epoch else 0
+        return random_uniform_schedule(
+            len(motion_tokens),
+            min_gap=self.provided_min_gap,
+            max_gap=self.provided_max_gap,
+            seed=self.random_seed,
+            epoch=schedule_epoch,
+            name=name,
+        )
 
 
 class _WeightedGapSchedule:
