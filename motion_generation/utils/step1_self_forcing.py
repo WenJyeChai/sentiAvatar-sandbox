@@ -145,6 +145,7 @@ def generate_history_batch(
     audio_codes: torch.Tensor,
     target_slots: torch.Tensor,
     use_bf16: bool,
+    bidirectional_prefix_mask: torch.Tensor | None = None,
 ) -> GeneratedHistoryResult:
     """Replace every supervised anchor token with an autoregressive prediction.
 
@@ -154,6 +155,21 @@ def generate_history_batch(
     """
 
     _validate_rollout_tensors(input_ids, attention_mask, audio_codes, target_slots)
+    if bidirectional_prefix_mask is not None and tuple(
+        bidirectional_prefix_mask.shape
+    ) != tuple(input_ids.shape):
+        raise ValueError(
+            "bidirectional_prefix_mask must share the rollout [B,L] shape"
+        )
+    if (
+        str(getattr(model.config, "planner_attention_mode", "causal"))
+        == "prefix_lm"
+        and input_ids.shape[0] != 1
+    ):
+        raise ValueError(
+            "Prefix-LM generated-history rollout currently requires batch size 1 "
+            "because condition-prefix lengths differ between clips"
+        )
     generated_ids = input_ids.clone()
     predicted = torch.full_like(target_slots, -1)
     confidence = torch.zeros_like(target_slots, dtype=torch.float32)
@@ -179,9 +195,22 @@ def generate_history_batch(
             dtype=torch.bfloat16,
             enabled=autocast_enabled,
         ):
+            model_attention = (
+                model.prepare_planner_attention_mask(
+                    attention_mask[:, :right],
+                    (
+                        None
+                        if bidirectional_prefix_mask is None
+                        else bidirectional_prefix_mask[:, :right]
+                    ),
+                    dtype=embeddings.dtype,
+                )
+                if past_key_values is None
+                else attention_mask[:, :right]
+            )
             outputs = model._base_model_forward(  # pylint: disable=protected-access
                 inputs_embeds=embeddings,
-                attention_mask=attention_mask[:, :right],
+                attention_mask=model_attention,
                 past_key_values=past_key_values,
                 use_cache=True,
                 return_dict=True,
@@ -261,6 +290,11 @@ def apply_generated_history(
             audio_codes=batch["audio_codes"].index_select(0, indices),
             target_slots=batch["target_slots"].index_select(0, indices),
             use_bf16=use_bf16,
+            bidirectional_prefix_mask=(
+                batch["bidirectional_prefix_mask"].index_select(0, indices)
+                if "bidirectional_prefix_mask" in batch
+                else None
+            ),
         )
         generated_input_ids.index_copy_(0, indices, result.input_ids)
         labels = batch["motion_local_labels"].index_select(0, indices)
@@ -302,7 +336,14 @@ def rollout_quality_metrics(
             for key, value in batch.items()
             if torch.is_tensor(value)
             and key
-            in {"input_ids", "attention_mask", "audio_codes", "target_slots", "motion_local_labels"}
+            in {
+                "input_ids",
+                "attention_mask",
+                "bidirectional_prefix_mask",
+                "audio_codes",
+                "target_slots",
+                "motion_local_labels",
+            }
         }
         selected = list(range(tensor_batch["input_ids"].shape[0]))
         _, stats = apply_generated_history(

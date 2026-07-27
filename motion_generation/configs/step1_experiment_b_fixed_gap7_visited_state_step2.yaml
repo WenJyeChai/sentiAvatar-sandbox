@@ -84,6 +84,8 @@ frozen_step2_guidance:
   left_boundary_mode: planner_history
   # Group zero has no predicted previous anchor, so it is excluded.
   min_anchor_group: 1
+  # Exclude shortened EOS tails from this controlled fixed-gap experiment.
+  required_gap: 7
   weight: 0.05
   warmup_epochs: 0.0
   temperature: 1.0

@@ -71,6 +71,12 @@ class _FakePlanner:
             (*input_ids.shape, 1), dtype=torch.float32, device=input_ids.device
         )
 
+    def prepare_planner_attention_mask(
+        self, attention_mask, bidirectional_prefix_mask, *, dtype
+    ):
+        del bidirectional_prefix_mask, dtype
+        return attention_mask
+
     def _base_model_forward(self, *, inputs_embeds, **kwargs):
         del kwargs
         return SimpleNamespace(
@@ -124,6 +130,32 @@ def test_control_results_cover_exact_final_frame():
     assert fixed.executed_gaps == (7, 7, 0)
     assert oracle.anchor_times == (0, 8, 17)
     assert oracle.executed_gaps == (7, 8)
+
+
+def test_full_audio_teacher_rollout_marks_audio_as_preloaded():
+    example = _example("teacher", 17, 30, (0, 8, 16))
+    prefix_audio = np.full((30, 4), -1, dtype=np.int64)
+    prefix_audio[2 : 2 + len(example.audio_codes)] = 0
+    example = AdaptiveRolloutExample(
+        name=example.name,
+        initial_input_ids=example.initial_input_ids,
+        audio_codes=example.audio_codes,
+        dense_motion_tokens=example.dense_motion_tokens,
+        oracle_anchor_times=example.oracle_anchor_times,
+        initial_audio_codes=prefix_audio,
+        bidirectional_prefix_mask=np.ones(30, dtype=bool),
+    )
+    result = rollout_policy_batch(
+        _FakePlanner(),
+        _Tokenizer(),
+        [example],
+        policy="adaptive",
+        anchor_history="generated",
+        device=torch.device("cpu"),
+        use_bf16=False,
+    )[0]
+    assert result.anchor_times == (0, 8, 16)
+    assert result.executed_gaps == (7, 7)
 
 
 def test_step2_assembly_skips_adjacent_eos_interval():

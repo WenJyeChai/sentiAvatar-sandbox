@@ -240,6 +240,18 @@ def build_rollout_examples(
         prefix, audio_codes = initial_prefix_from_serialized_item(
             item, motion_start_id=motion_start_id
         )
+        prefix_length = len(prefix)
+        serialized_audio = np.asarray(item["audio_codes"], dtype=np.int64)
+        if serialized_audio.ndim == 1:
+            serialized_audio = serialized_audio[:, None]
+        prefix_audio_codes = serialized_audio[:prefix_length].copy()
+        bidirectional_prefix_mask = np.asarray(
+            item.get(
+                "bidirectional_prefix_mask",
+                [0] * len(item["input_ids"]),
+            ),
+            dtype=bool,
+        )[:prefix_length].copy()
         dense, _ = load_motion_tokens(
             canonical_data_path(paths["motion_token_dir"], name, ".json"),
             require_causal=True,
@@ -251,6 +263,8 @@ def build_rollout_examples(
                 audio_codes=audio_codes,
                 dense_motion_tokens=np.asarray(dense, dtype=np.int64),
                 oracle_anchor_times=tuple(int(value) for value in item["anchor_times"]),
+                initial_audio_codes=prefix_audio_codes,
+                bidirectional_prefix_mask=bidirectional_prefix_mask,
                 audio_fps=float(dataset.audio_frame_rate),
                 motion_fps=10.0,
             )

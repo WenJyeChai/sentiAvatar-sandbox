@@ -214,7 +214,15 @@ def _move_tensor_batch(batch: Mapping[str, Any], device: torch.device) -> dict[s
         key: value.to(device, non_blocking=True)
         for key, value in batch.items()
         if torch.is_tensor(value)
-        and key in {"input_ids", "attention_mask", "audio_codes", "target_slots", "motion_local_labels"}
+        and key
+        in {
+            "input_ids",
+            "attention_mask",
+            "bidirectional_prefix_mask",
+            "audio_codes",
+            "target_slots",
+            "motion_local_labels",
+        }
     }
 
 
@@ -244,9 +252,14 @@ def teacher_forced_metrics(
             embeddings = model.prepare_input_embeddings(
                 values["input_ids"], values["audio_codes"]
             )
+            planner_attention = model.prepare_planner_attention_mask(
+                values["attention_mask"],
+                values.get("bidirectional_prefix_mask"),
+                dtype=embeddings.dtype,
+            )
             outputs = model._base_model_forward(  # pylint: disable=protected-access
                 inputs_embeds=embeddings,
-                attention_mask=values["attention_mask"],
+                attention_mask=planner_attention,
                 use_cache=False,
                 return_dict=True,
             )
@@ -360,6 +373,14 @@ def greedy_rollout_item(
         audio_codes=audio_codes,
         target_slots=target_slots,
         use_bf16=use_bf16,
+        bidirectional_prefix_mask=torch.as_tensor(
+            item.get(
+                "bidirectional_prefix_mask",
+                [0] * len(item["input_ids"]),
+            ),
+            dtype=torch.bool,
+            device=device,
+        ).unsqueeze(0),
     )
     predicted_array = rollout.predicted_local_ids[0].cpu().numpy()
     confidence_array = rollout.confidence[0].cpu().numpy()
@@ -412,6 +433,32 @@ def greedy_rollout_batch(
     anchor_times = list(batch["anchor_times"])
     if len(names) != len(anchor_times):
         raise ValueError("names and anchor_times must have the same batch length")
+    if str(getattr(model.config, "planner_attention_mode", "causal")) == "prefix_lm":
+        outputs = []
+        for row, name in enumerate(names):
+            length = int(batch["attention_mask"][row].sum().item())
+            item = {
+                "name": name,
+                "input_ids": batch["input_ids"][row, :length].tolist(),
+                "audio_codes": batch["audio_codes"][row, :length].tolist(),
+                "target_slots": batch["target_slots"][row, :length].tolist(),
+                "motion_local_labels": batch["motion_local_labels"][
+                    row, :length
+                ].tolist(),
+                "bidirectional_prefix_mask": batch[
+                    "bidirectional_prefix_mask"
+                ][row, :length].tolist(),
+                "anchor_times": anchor_times[row],
+            }
+            outputs.append(
+                greedy_rollout_item(
+                    model,
+                    item,
+                    device=device,
+                    use_bf16=use_bf16,
+                )
+            )
+        return outputs
 
     tensor_batch = {
         key: batch[key].to(device=device, non_blocking=True)
@@ -431,6 +478,11 @@ def greedy_rollout_batch(
         audio_codes=tensor_batch["audio_codes"],
         target_slots=tensor_batch["target_slots"],
         use_bf16=use_bf16,
+        bidirectional_prefix_mask=batch.get(
+            "bidirectional_prefix_mask"
+        ).to(device=device, non_blocking=True)
+        if "bidirectional_prefix_mask" in batch
+        else None,
     )
     elapsed_per_clip = (time.perf_counter() - started) / max(1, len(names))
 

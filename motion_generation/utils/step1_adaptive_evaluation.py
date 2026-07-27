@@ -47,6 +47,8 @@ class AdaptiveRolloutExample:
     audio_codes: np.ndarray
     dense_motion_tokens: np.ndarray
     oracle_anchor_times: tuple[int, ...]
+    initial_audio_codes: Optional[np.ndarray] = None
+    bidirectional_prefix_mask: Optional[np.ndarray] = None
     audio_fps: float = 12.5
     motion_fps: float = 10.0
 
@@ -70,6 +72,37 @@ class AdaptiveRolloutExample:
                 raise ValueError(f"{self.name}: oracle schedule must begin at zero")
             if self.oracle_anchor_times[-1] != len(dense) - 1:
                 raise ValueError(f"{self.name}: oracle schedule must end at T-1")
+        if self.initial_audio_codes is not None:
+            initial_audio = np.asarray(self.initial_audio_codes)
+            expected = (len(self.initial_input_ids), audio.shape[1])
+            if initial_audio.shape != expected:
+                raise ValueError(
+                    f"{self.name}: initial_audio_codes must have shape {expected}"
+                )
+        if self.bidirectional_prefix_mask is not None:
+            prefix = np.asarray(self.bidirectional_prefix_mask, dtype=bool)
+            if prefix.shape != (len(self.initial_input_ids),):
+                raise ValueError(
+                    f"{self.name}: bidirectional_prefix_mask must match the prefix"
+                )
+            prefix_length = int(prefix.sum())
+            if prefix_length and not np.array_equal(
+                prefix,
+                np.arange(len(prefix)) < prefix_length,
+            ):
+                raise ValueError(
+                    f"{self.name}: bidirectional prefix must be contiguous"
+                )
+            if prefix_length:
+                if self.initial_audio_codes is None:
+                    raise ValueError(
+                        f"{self.name}: full-audio prefix requires aligned initial audio codes"
+                    )
+                initial_audio = np.asarray(self.initial_audio_codes)
+                if int(np.all(initial_audio >= 0, axis=1).sum()) != len(audio):
+                    raise ValueError(
+                        f"{self.name}: full-audio prefix does not contain every audio frame"
+                    )
 
 
 @dataclass
@@ -308,7 +341,21 @@ def rollout_policy_batch(
         device=device,
     )
     current_times = torch.zeros(batch_size, dtype=torch.long, device=device)
-    audio_cursors = [0] * batch_size
+    preloaded_audio = [
+        bool(
+            example.bidirectional_prefix_mask is not None
+            and np.asarray(example.bidirectional_prefix_mask, dtype=bool).any()
+        )
+        for example in examples
+    ]
+    if any(preloaded_audio) and not all(preloaded_audio):
+        raise ValueError(
+            "A rollout batch cannot mix full-audio teachers and causal students"
+        )
+    audio_cursors = [
+        len(stream) if preloaded else 0
+        for stream, preloaded in zip(audio_streams, preloaded_audio)
+    ]
     schedule_indices = [0] * batch_size
     anchor_times: list[list[int]] = [[0] for _ in examples]
     anchors: list[list[list[int]]] = [[] for _ in examples]
@@ -337,6 +384,7 @@ def rollout_policy_batch(
         device=device,
     )
     prefix_lengths = []
+    prefix_bidirectional_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
     for row, example in enumerate(examples):
         length = len(example.initial_input_ids)
         prefix_lengths.append(length)
@@ -344,6 +392,18 @@ def rollout_policy_batch(
             example.initial_input_ids, dtype=torch.long, device=device
         )
         attention_mask[row, :length] = 1
+        if example.initial_audio_codes is not None:
+            audio_codes[row, :length] = torch.as_tensor(
+                np.asarray(example.initial_audio_codes),
+                dtype=torch.long,
+                device=device,
+            )
+        if example.bidirectional_prefix_mask is not None:
+            prefix_bidirectional_mask[row, :length] = torch.as_tensor(
+                np.asarray(example.bidirectional_prefix_mask, dtype=bool),
+                dtype=torch.bool,
+                device=device,
+            )
 
     autocast_enabled = bool(use_bf16 and device.type == "cuda")
     with torch.autocast(
@@ -351,9 +411,15 @@ def rollout_policy_batch(
         dtype=torch.bfloat16,
         enabled=autocast_enabled,
     ):
+        initial_embeddings = model.prepare_input_embeddings(input_ids, audio_codes)
+        initial_attention = model.prepare_planner_attention_mask(
+            attention_mask,
+            prefix_bidirectional_mask,
+            dtype=initial_embeddings.dtype,
+        )
         initial = model._base_model_forward(  # pylint: disable=protected-access
-            inputs_embeds=model.prepare_input_embeddings(input_ids, audio_codes),
-            attention_mask=attention_mask,
+            inputs_embeds=initial_embeddings,
+            attention_mask=initial_attention,
             position_ids=_position_ids(attention_mask),
             use_cache=True,
             return_dict=True,
@@ -462,12 +528,16 @@ def rollout_policy_batch(
         next_boundaries = list(audio_cursors)
         audio_counts = [0] * batch_size
         for row in active_rows.tolist():
-            boundary = _audio_boundary(
-                int(target_times[row]),
-                final_time=int(final_times[row]),
-                audio_frames=len(audio_streams[row]),
-                audio_fps=examples[row].audio_fps,
-                motion_fps=examples[row].motion_fps,
+            boundary = (
+                audio_cursors[row]
+                if preloaded_audio[row]
+                else _audio_boundary(
+                    int(target_times[row]),
+                    final_time=int(final_times[row]),
+                    audio_frames=len(audio_streams[row]),
+                    audio_fps=examples[row].audio_fps,
+                    motion_fps=examples[row].motion_fps,
+                )
             )
             if boundary < audio_cursors[row]:
                 raise ValueError(

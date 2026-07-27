@@ -104,6 +104,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--num_train_epochs", type=int, default=None)
     parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help=(
+            "Debug-only cap on optimizer updates. The configured curriculum "
+            "and scheduler remain unchanged; use this for a remote smoke test."
+        ),
+    )
+    parser.add_argument(
         "--step2_guidance_weight",
         type=float,
         default=None,
@@ -211,7 +220,26 @@ def data_config_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     data["_audio_contract"] = audio_contract_from_config(config)
     text = section(config, "text")
     data["text_serialization"] = str(text.get("serialization", "raw"))
+    context = planner_context_from_config(config)
+    data["sequence_layout"] = context["sequence_layout"]
     return data
+
+
+def planner_context_from_config(config: Mapping[str, Any]) -> dict[str, str]:
+    context = section(config, "planner_context")
+    mode = str(context.get("attention_mode", "causal"))
+    layout = str(context.get("sequence_layout", "causal_interleaved"))
+    valid_pairs = {
+        ("causal", "causal_interleaved"),
+        ("prefix_lm", "full_audio_prefix"),
+    }
+    if (mode, layout) not in valid_pairs:
+        raise ValueError(
+            "planner_context must use either causal+causal_interleaved or "
+            "prefix_lm+full_audio_prefix; got "
+            f"attention_mode={mode!r}, sequence_layout={layout!r}"
+        )
+    return {"attention_mode": mode, "sequence_layout": layout}
 
 
 def validate_adaptive_gap_config(
@@ -302,6 +330,11 @@ def validate_frozen_step2_guidance_config(
             "min_anchor_group": int(
                 guidance.get("min_anchor_group", 0)
             ),
+            "required_gap": (
+                int(guidance["required_gap"])
+                if guidance.get("required_gap") is not None
+                else None
+            ),
         }
     )
     if guidance["weight"] < 0:
@@ -318,6 +351,10 @@ def validate_frozen_step2_guidance_config(
     if guidance["min_anchor_group"] < 0:
         raise ValueError(
             "frozen_step2_guidance.min_anchor_group must be non-negative"
+        )
+    if guidance["required_gap"] is not None and guidance["required_gap"] < 3:
+        raise ValueError(
+            "frozen_step2_guidance.required_gap must be at least 3"
         )
     return guidance
 
@@ -432,6 +469,7 @@ def build_model_and_tokenizer(
     dtype: torch.dtype,
     audio_contract: Mapping[str, Any],
     text_serialization: str = "raw",
+    planner_attention_mode: str = "causal",
 ) -> tuple[MimiQwenPlanner, Any, list[str]]:
     if resume is not None:
         resume = resume.resolve()
@@ -476,17 +514,32 @@ def build_model_and_tokenizer(
             raise RuntimeError(
                 f"Resume checkpoint audio contract {actual_audio} != requested {expected_audio}"
             )
+        actual_attention_mode = str(
+            getattr(model.config, "planner_attention_mode", "causal")
+        )
+        if actual_attention_mode != planner_attention_mode:
+            raise RuntimeError(
+                "Resume checkpoint planner attention mode does not match the "
+                f"requested configuration: checkpoint={actual_attention_mode}, "
+                f"requested={planner_attention_mode}"
+            )
+        if planner_attention_mode == "prefix_lm":
+            model.language_model.config._attn_implementation = "sdpa"
         model.set_gap_token_ids(
             [int(tokenizer.convert_tokens_to_ids(token)) for token in GAP_TOKENS]
         )
         return model, tokenizer, []
 
     tokenizer = AutoTokenizer.from_pretrained(base_model, local_files_only=True, trust_remote_code=True)
+    language_model_kwargs: dict[str, Any] = {}
+    if planner_attention_mode == "prefix_lm":
+        language_model_kwargs["attn_implementation"] = "sdpa"
     language_model = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=dtype,
         local_files_only=True,
         trust_remote_code=True,
+        **language_model_kwargs,
     )
     added = ensure_step1_special_tokens(
         tokenizer,
@@ -513,6 +566,7 @@ def build_model_and_tokenizer(
         gap_token_ids=[
             int(tokenizer.convert_tokens_to_ids(token)) for token in GAP_TOKENS
         ],
+        planner_attention_mode=planner_attention_mode,
     )
     model = MimiQwenPlanner(planner_config, language_model=language_model)
     model.tie_weights()
@@ -589,6 +643,9 @@ def build_dataset(
         audio_cardinality=int(audio_contract["cardinality"]),
         audio_codebooks_used=audio_contract["codebooks_used"],
         text_serialization=str(data_config.get("text_serialization", "raw")),
+        sequence_layout=str(
+            data_config.get("sequence_layout", "causal_interleaved")
+        ),
         drop_structured_tags=bool(data_config.get("drop_structured_tags", False)),
         step2_guidance_audio_feature_dir=(
             frozen_step2_guidance["audio_feature_dir"]
@@ -611,6 +668,11 @@ def build_dataset(
             if guidance_enabled
             else 0
         ),
+        step2_guidance_required_gap=(
+            frozen_step2_guidance.get("required_gap")
+            if guidance_enabled
+            else None
+        ),
         **adaptive_kwargs,
     )
 
@@ -620,6 +682,7 @@ def move_batch(batch: Mapping[str, Any], device: torch.device) -> dict[str, torc
         "input_ids",
         "attention_mask",
         "audio_codes",
+        "bidirectional_prefix_mask",
         "target_slots",
         "motion_local_labels",
         "gap_target_probs",
@@ -1280,7 +1343,10 @@ def main() -> None:
         if args.num_train_epochs <= 0:
             raise ValueError("--num_train_epochs must be positive")
         training["num_train_epochs"] = int(args.num_train_epochs)
+    if args.max_train_steps is not None and args.max_train_steps <= 0:
+        raise ValueError("--max_train_steps must be positive")
     requested_epochs = int(training.get("num_train_epochs", 10))
+    planner_context = planner_context_from_config(config)
     data_config = data_config_from_config(config)
     audio_contract = audio_contract_from_config(config)
     adaptive_gap = validate_adaptive_gap_config(
@@ -1310,6 +1376,37 @@ def main() -> None:
     visited_state = validate_visited_state_config(config)
     auxiliary_loss = validate_auxiliary_loss_config(config)
     condition_alignment = validate_condition_alignment_config(config)
+    if planner_context["attention_mode"] == "prefix_lm":
+        if not bool(adaptive_gap["enabled"]):
+            raise ValueError(
+                "The offline full-audio teacher requires adaptive_gap.enabled=true"
+            )
+        incompatible = []
+        if bool(frozen_step2_guidance["enabled"]):
+            incompatible.append("frozen_step2_guidance")
+        if bool(generated_history["enabled"]):
+            incompatible.append("generated_history")
+        if bool(visited_state["enabled"]):
+            incompatible.append("visited_state_guidance")
+        if auxiliary_loss["type"] != "none":
+            incompatible.append("auxiliary_loss")
+        if bool(condition_alignment["enabled"]):
+            incompatible.append("condition_alignment")
+        if incompatible:
+            raise ValueError(
+                "The first offline teacher run isolates DP gap and anchor CE; "
+                f"disable: {', '.join(incompatible)}"
+            )
+        if data_config.get("generated_anchor_dir") is not None or float(
+            data_config.get("generated_prefix_probability", 0.0)
+        ) != 0.0:
+            raise ValueError(
+                "The offline teacher uses GT history; disable generated-prefix caches"
+            )
+        if list(audio_contract["codebooks_used"]) != [0, 1, 2, 3]:
+            raise ValueError(
+                "The matched teacher/student experiment requires Nano q0-q3"
+            )
     if bool(frozen_step2_guidance["enabled"]):
         if int(data_config.get("fixed_gap", -1)) != 7:
             raise ValueError(
@@ -1417,6 +1514,7 @@ def main() -> None:
         dtype=dtype,
         audio_contract=audio_contract,
         text_serialization=str(data_config.get("text_serialization", "raw")),
+        planner_attention_mode=planner_context["attention_mode"],
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1603,11 +1701,18 @@ def main() -> None:
             f"({audio_contract['cardinality']}-way, {audio_contract['frame_rate']} Hz)"
         )
         print(f"Text serialization:{data_config.get('text_serialization', 'raw')}")
+        print(
+            "Planner context:   "
+            f"attention={planner_context['attention_mode']}, "
+            f"layout={planner_context['sequence_layout']}"
+        )
         print(f"Train/eval clips:  {len(train_dataset)}/{len(eval_dataset)}")
         print(f"World size:        {world_size}")
         print(f"Added controls:    {added_tokens}")
         print(f"Parameters:        {trainable:,} trainable / {total:,} total")
         print(f"Updates:           {total_steps} ({updates_per_epoch}/epoch)")
+        if args.max_train_steps is not None:
+            print(f"Smoke step cap:    {args.max_train_steps}")
         if adaptive_gap["enabled"]:
             print(f"Gap calibration:   {adaptive_gap['calibration_json']}")
             for phase_index, phase in enumerate(adaptive_gap["phases"]):
@@ -1696,6 +1801,7 @@ def main() -> None:
 
     completed_epochs = start_epoch
     stopped_early = False
+    reached_step_limit = False
     for epoch in range(start_epoch, epochs):
         current_gap_phase_index = None
         current_gap_phase = None
@@ -2271,6 +2377,16 @@ def main() -> None:
                     curriculum_activation_epoch=curriculum_activation_epoch,
                     best_rollout_accuracy=best_rollout_accuracy,
                 )
+            if (
+                args.max_train_steps is not None
+                and global_step >= args.max_train_steps
+            ):
+                reached_step_limit = True
+                if is_main(rank):
+                    print(
+                        f"[smoke stop] reached --max_train_steps={args.max_train_steps}"
+                    )
+                break
         resume_batch = 0
 
         eval_metrics = evaluate(
@@ -2542,6 +2658,8 @@ def main() -> None:
             if is_main(rank):
                 print(f"Early stopping after {completed_epochs} completed epochs")
             break
+        if reached_step_limit:
+            break
 
     save_checkpoint(
         model,
@@ -2562,7 +2680,13 @@ def main() -> None:
         best_rollout_accuracy=best_rollout_accuracy,
     )
     if is_main(rank):
-        suffix = " (early stopped)" if stopped_early else ""
+        suffix = (
+            " (smoke step cap)"
+            if reached_step_limit
+            else " (early stopped)"
+            if stopped_early
+            else ""
+        )
         print(f"Training complete{suffix} in {time.perf_counter() - run_start:.1f}s")
         if wandb_run is not None:
             wandb_run.finish()

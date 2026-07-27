@@ -1,7 +1,10 @@
-"""Causal audio-token-conditioned Qwen planner and fixed-gap Step 1 dataset.
+"""Audio-token-conditioned Qwen planner and fixed/adaptive-gap Step 1 dataset.
 
 The historical class names retain ``Mimi`` for checkpoint compatibility, while
-the runtime audio contract now supports both Mimi and MOSS Nano tokens.
+the runtime audio contract now supports both Mimi and MOSS Nano tokens. The
+default sequence remains causal/interleaved. The offline teacher additionally
+supports a full-audio prefix-LM layout whose condition block is bidirectional
+and whose gap/anchor plan remains autoregressive.
 """
 
 from __future__ import annotations
@@ -62,6 +65,8 @@ MIMI_FRAME_SIZE = 1_920
 MIMI_CARDINALITY = 2_048
 MIMI_STORED_CODEBOOKS = 8
 MOTION_TOKEN_FPS = 10.0
+SEQUENCE_LAYOUTS = ("causal_interleaved", "full_audio_prefix")
+ATTENTION_MODES = ("causal", "prefix_lm")
 STRUCTURED_TAG_PATTERN = re.compile(r"【\s*(表情|动作)\s*[:：]\s*(.*?)\s*】")
 
 
@@ -226,6 +231,7 @@ class Step1Sequence:
     expression_mask: list[int]
     action_mask: list[int]
     transcript_mask: list[int]
+    bidirectional_prefix_mask: list[int]
     audio_anchor_ids: list[int]
     target_anchor_ids: list[int]
     anchor_times: tuple[int, ...]
@@ -244,11 +250,13 @@ class Step1Sequence:
 
 
 class Step1FixedGapDataset(Dataset):
-    """One causal, interleaved planner sequence per utterance.
+    """One planner sequence per utterance.
 
-    Text is fully visible at the beginning.  A runtime gap control is followed
-    by only the new causal audio-token frames for that interval, then a 16-slot anchor.
-    Only anchor slots are supervised in Phase 1.
+    ``causal_interleaved`` retains the online student contract: a gap control is
+    followed by only the newly available audio frames and then a 16-slot
+    anchor. ``full_audio_prefix`` places all text/audio plus the known seed in
+    one prefix before the causal plan. The model makes only that prefix
+    bidirectional, so no target motion can leak into the condition block.
     """
 
     def __init__(
@@ -279,12 +287,14 @@ class Step1FixedGapDataset(Dataset):
         audio_cardinality: int = MIMI_CARDINALITY,
         audio_codebooks_used: Optional[Sequence[int]] = None,
         text_serialization: str = "raw",
+        sequence_layout: str = "causal_interleaved",
         drop_structured_tags: bool = False,
         step2_guidance_audio_feature_dir: Optional[Path] = None,
         step2_guidance_audio_fps: float = 12.5,
         step2_guidance_audio_feat_dim: int = 768,
         step2_guidance_resample: bool = False,
         step2_guidance_min_anchor_group: int = 0,
+        step2_guidance_required_gap: Optional[int] = None,
     ) -> None:
         if seed_mode not in {"observed", "previous", "neutral", "mixed_known", "mixed_all"}:
             raise ValueError(
@@ -343,6 +353,11 @@ class Step1FixedGapDataset(Dataset):
         if text_serialization not in {"raw", "structured_fields"}:
             raise ValueError("text_serialization must be raw or structured_fields")
         self.text_serialization = str(text_serialization)
+        if sequence_layout not in SEQUENCE_LAYOUTS:
+            raise ValueError(
+                f"sequence_layout must be one of {SEQUENCE_LAYOUTS}, got {sequence_layout!r}"
+            )
+        self.sequence_layout = str(sequence_layout)
         self.drop_structured_tags = bool(drop_structured_tags)
         self.step2_guidance_audio_feature_dir = (
             Path(step2_guidance_audio_feature_dir)
@@ -355,9 +370,21 @@ class Step1FixedGapDataset(Dataset):
         self.step2_guidance_min_anchor_group = int(
             step2_guidance_min_anchor_group
         )
+        self.step2_guidance_required_gap = (
+            int(step2_guidance_required_gap)
+            if step2_guidance_required_gap is not None
+            else None
+        )
         if self.step2_guidance_min_anchor_group < 0:
             raise ValueError(
                 "step2_guidance_min_anchor_group must be non-negative"
+            )
+        if (
+            self.step2_guidance_required_gap is not None
+            and self.step2_guidance_required_gap < 3
+        ):
+            raise ValueError(
+                "step2_guidance_required_gap must be at least 3"
             )
         if self.step2_guidance_audio_feature_dir is not None:
             if self.step2_guidance_audio_fps <= 0:
@@ -473,6 +500,10 @@ class Step1FixedGapDataset(Dataset):
             if (
                 gap >= 3
                 and anchor_group >= self.step2_guidance_min_anchor_group
+                and (
+                    self.step2_guidance_required_gap is None
+                    or gap == self.step2_guidance_required_gap
+                )
             ):
                 candidates.append(
                     (anchor_group, int(left_time), int(right_time), int(gap))
@@ -630,6 +661,7 @@ class Step1FixedGapDataset(Dataset):
             "expression_mask": sequence.expression_mask,
             "action_mask": sequence.action_mask,
             "transcript_mask": sequence.transcript_mask,
+            "bidirectional_prefix_mask": sequence.bidirectional_prefix_mask,
             "audio_anchor_ids": sequence.audio_anchor_ids,
             "target_anchor_ids": sequence.target_anchor_ids,
             "anchor_times": sequence.anchor_times,
@@ -706,10 +738,13 @@ class Step1FixedGapDataset(Dataset):
         audio_codes = [empty_audio.copy() for _ in input_ids]
         target_slots = [-1] * len(input_ids)
         motion_local_labels = [IGNORE_INDEX] * len(input_ids)
+        full_audio_prefix = self.sequence_layout == "full_audio_prefix"
+        bidirectional_prefix_mask = [int(full_audio_prefix)] * len(input_ids)
         audio_anchor_ids = [-1] * len(input_ids)
         target_anchor_ids = [-1] * len(input_ids)
         gap_target_probs = [[0.0] * len(GAP_TOKENS) for _ in input_ids]
         gap_target_mask = [0] * len(input_ids)
+        in_bidirectional_prefix = full_audio_prefix
 
         def append_control(token: str) -> None:
             input_ids.append(self._single_token_ids[token])
@@ -720,6 +755,7 @@ class Step1FixedGapDataset(Dataset):
             expression_mask.append(0)
             action_mask.append(0)
             transcript_mask.append(0)
+            bidirectional_prefix_mask.append(int(in_bidirectional_prefix))
             audio_anchor_ids.append(-1)
             target_anchor_ids.append(-1)
             gap_target_probs.append([0.0] * len(GAP_TOKENS))
@@ -744,6 +780,7 @@ class Step1FixedGapDataset(Dataset):
                 expression_mask.append(0)
                 action_mask.append(0)
                 transcript_mask.append(0)
+                bidirectional_prefix_mask.append(int(in_bidirectional_prefix))
                 audio_anchor_ids.append(-1)
                 gap_target_probs.append([0.0] * len(GAP_TOKENS))
                 gap_target_mask.append(0)
@@ -756,12 +793,22 @@ class Step1FixedGapDataset(Dataset):
                     motion_local_labels.append(int(target_anchor[slot]))
                     target_anchor_ids.append(int(anchor_group))
 
+        audio_cursor = 0
+        if full_audio_prefix:
+            for frame_codes in audio_token_codes.T:
+                append_control(MIMI_FRAME_TOKEN)
+                audio_codes[-1] = [int(code) for code in frame_codes]
+            audio_cursor = int(audio_token_codes.shape[1])
+            append_control(AUDIO_END_TOKEN)
+
         append_control(MOTION_START_TOKEN)
         selected_seed_mode, seed_anchor = self._select_seed(name, motion_tokens[0])
         append_control(SEED_TOKEN_BY_MODE[selected_seed_mode])
         append_anchor(seed_anchor, target_anchor=None)
+        # The complete known condition ends at the seed. Every following token
+        # is part of the autoregressive gap/anchor plan.
+        in_bidirectional_prefix = False
 
-        audio_cursor = 0
         generated_prefix_anchors = 0
         for anchor_index in range(1, len(anchor_times)):
             left_time = anchor_times[anchor_index - 1]
@@ -777,12 +824,13 @@ class Step1FixedGapDataset(Dataset):
                     )
                 gap_target_probs[-1] = [float(value) for value in soft_target]
                 gap_target_mask[-1] = 1
-            next_audio_boundary = audio_boundaries[anchor_index]
-            for frame_codes in audio_token_codes[:, audio_cursor:next_audio_boundary].T:
-                append_control(MIMI_FRAME_TOKEN)
-                audio_codes[-1] = [int(code) for code in frame_codes]
-                audio_anchor_ids[-1] = anchor_index - 1
-            audio_cursor = next_audio_boundary
+            if not full_audio_prefix:
+                next_audio_boundary = audio_boundaries[anchor_index]
+                for frame_codes in audio_token_codes[:, audio_cursor:next_audio_boundary].T:
+                    append_control(MIMI_FRAME_TOKEN)
+                    audio_codes[-1] = [int(code) for code in frame_codes]
+                    audio_anchor_ids[-1] = anchor_index - 1
+                audio_cursor = next_audio_boundary
 
             gt_anchor = tuple(int(v) for v in motion_tokens[target_time])
             input_anchor = gt_anchor
@@ -806,7 +854,8 @@ class Step1FixedGapDataset(Dataset):
                 f"Did not consume all {self.audio_codec} frames for {name}: "
                 f"{audio_cursor}/{audio_token_codes.shape[1]}"
             )
-        append_control(AUDIO_END_TOKEN)
+        if not full_audio_prefix:
+            append_control(AUDIO_END_TOKEN)
         append_control(MOTION_END_TOKEN)
         input_ids.append(int(im_end_ids[0]))
         audio_codes.append(empty_audio.copy())
@@ -816,6 +865,7 @@ class Step1FixedGapDataset(Dataset):
         expression_mask.append(0)
         action_mask.append(0)
         transcript_mask.append(0)
+        bidirectional_prefix_mask.append(0)
         audio_anchor_ids.append(-1)
         target_anchor_ids.append(-1)
         gap_target_probs.append([0.0] * len(GAP_TOKENS))
@@ -830,6 +880,7 @@ class Step1FixedGapDataset(Dataset):
             len(expression_mask),
             len(action_mask),
             len(transcript_mask),
+            len(bidirectional_prefix_mask),
             len(audio_anchor_ids),
             len(target_anchor_ids),
             len(gap_target_probs),
@@ -837,6 +888,23 @@ class Step1FixedGapDataset(Dataset):
         }
         if len(lengths) != 1:
             raise AssertionError(f"Serialized field lengths differ for {name}: {lengths}")
+        if full_audio_prefix:
+            prefix_length = sum(bidirectional_prefix_mask)
+            expected_prefix = [1] * prefix_length + [0] * (
+                len(bidirectional_prefix_mask) - prefix_length
+            )
+            if bidirectional_prefix_mask != expected_prefix:
+                raise AssertionError(
+                    f"{name}: bidirectional teacher prefix is not contiguous"
+                )
+            if prefix_length <= 0 or prefix_length >= len(input_ids):
+                raise AssertionError(
+                    f"{name}: invalid teacher prefix length {prefix_length}"
+                )
+        elif any(bidirectional_prefix_mask):
+            raise AssertionError(
+                f"{name}: causal layout unexpectedly marks a bidirectional prefix"
+            )
         if len(input_ids) > self.max_length:
             raise ValueError(
                 f"Serialized sequence for {name} has {len(input_ids)} tokens, exceeding "
@@ -861,6 +929,7 @@ class Step1FixedGapDataset(Dataset):
             expression_mask=expression_mask,
             action_mask=action_mask,
             transcript_mask=transcript_mask,
+            bidirectional_prefix_mask=bidirectional_prefix_mask,
             audio_anchor_ids=audio_anchor_ids,
             target_anchor_ids=target_anchor_ids,
             anchor_times=anchor_times,
@@ -1090,6 +1159,9 @@ class Step1PlannerCollator:
             "expression_mask": padded_optional("expression_mask", 0).bool(),
             "action_mask": padded_optional("action_mask", 0).bool(),
             "transcript_mask": padded_optional("transcript_mask", 0).bool(),
+            "bidirectional_prefix_mask": padded_optional(
+                "bidirectional_prefix_mask", 0
+            ).bool(),
             "audio_anchor_ids": padded_optional("audio_anchor_ids", -1),
             "target_anchor_ids": padded_optional("target_anchor_ids", -1),
             "names": [str(example["name"]) for example in examples],
@@ -1227,6 +1299,7 @@ class MimiQwenPlannerConfig(PretrainedConfig):
         audio_codebooks_stored: Optional[int] = None,
         audio_codebooks_used: Optional[Sequence[int]] = None,
         gap_token_ids: Optional[Sequence[int]] = None,
+        planner_attention_mode: str = "causal",
         **kwargs: Any,
     ) -> None:
         kwargs.setdefault("tie_word_embeddings", False)
@@ -1254,6 +1327,12 @@ class MimiQwenPlannerConfig(PretrainedConfig):
         self.mimi_codebooks_stored = self.audio_codebooks_stored
         self.mimi_codebooks_used = list(self.audio_codebooks_used)
         self.gap_token_ids = list(map(int, gap_token_ids or []))
+        if planner_attention_mode not in ATTENTION_MODES:
+            raise ValueError(
+                "planner_attention_mode must be one of "
+                f"{ATTENTION_MODES}, got {planner_attention_mode!r}"
+            )
+        self.planner_attention_mode = str(planner_attention_mode)
 
 
 @dataclass
@@ -1276,8 +1355,56 @@ class MimiQwenPlannerOutput(ModelOutput):
     selected_anchor_logits: Optional[torch.Tensor] = None
 
 
+def build_prefix_lm_attention_mask(
+    attention_mask: torch.Tensor,
+    bidirectional_prefix_mask: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build an additive prefix-LM mask accepted by Qwen/SDPA.
+
+    Prefix queries attend every valid prefix key. Plan queries retain ordinary
+    left-to-right attention, which lets them read the prefix and prior plan
+    tokens but never future plan tokens. Padding is excluded as a key. Padded
+    queries keep a causal row to avoid fully masked SDPA rows; they never
+    contribute to a supervised loss.
+    """
+
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must have shape [B,L]")
+    if tuple(bidirectional_prefix_mask.shape) != tuple(attention_mask.shape):
+        raise ValueError(
+            "bidirectional_prefix_mask must have the same [B,L] shape as attention_mask"
+        )
+    if not dtype.is_floating_point:
+        raise ValueError("Prefix-LM additive mask requires a floating-point dtype")
+    valid = attention_mask.bool()
+    prefix = bidirectional_prefix_mask.bool()
+    if bool((prefix & ~valid).any()):
+        raise ValueError("A padded token cannot belong to the bidirectional prefix")
+    positions = torch.arange(attention_mask.shape[1], device=attention_mask.device)
+    prefix_lengths = prefix.sum(dim=-1)
+    expected_prefix = positions.unsqueeze(0) < prefix_lengths.unsqueeze(1)
+    if not torch.equal(prefix, expected_prefix):
+        raise ValueError(
+            "The bidirectional prefix must be one non-empty contiguous block "
+            "starting at sequence position zero"
+        )
+    if bool(prefix_lengths.eq(0).any()):
+        raise ValueError("Every prefix-LM example must contain a non-empty prefix")
+    causal = positions.view(1, -1, 1) >= positions.view(1, 1, -1)
+    prefix_block = prefix.unsqueeze(2) & prefix.unsqueeze(1)
+    allowed = (causal | prefix_block) & valid.unsqueeze(1)
+    additive = torch.zeros(
+        (attention_mask.shape[0], 1, attention_mask.shape[1], attention_mask.shape[1]),
+        dtype=dtype,
+        device=attention_mask.device,
+    )
+    return additive.masked_fill(~allowed.unsqueeze(1), torch.finfo(dtype).min)
+
+
 class MimiQwenPlanner(PreTrainedModel):
-    """Qwen with codebook-specific causal audio embeddings and slot CE."""
+    """Qwen with codebook-specific audio embeddings and slot CE."""
 
     config_class = MimiQwenPlannerConfig
     base_model_prefix = "language_model"
@@ -1294,6 +1421,10 @@ class MimiQwenPlanner(PreTrainedModel):
             language_config = AutoConfig.for_model(model_type, **language_config_dict)
             language_model = AutoModelForCausalLM.from_config(language_config)
         self.language_model = language_model
+        if config.planner_attention_mode == "prefix_lm":
+            # FlashAttention-2 does not accept a general 4-D prefix mask.
+            # SDPA retains fused attention kernels while honoring the mask.
+            self.language_model.config._attn_implementation = "sdpa"
         hidden_size = int(language_model.config.hidden_size)
         embedding_dtype = language_model.get_input_embeddings().weight.dtype
         if not config.audio_codebooks_used:
@@ -1485,6 +1616,37 @@ class MimiQwenPlanner(PreTrainedModel):
         flat_positions = complete_code_mask.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
         return flat_embeddings.index_copy(0, flat_positions, fused_audio).view_as(text_embeddings)
 
+    def prepare_planner_attention_mask(
+        self,
+        attention_mask: torch.Tensor,
+        bidirectional_prefix_mask: Optional[torch.Tensor],
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return the 2-D causal mask or the teacher's additive 4-D mask."""
+
+        mode = str(self.config.planner_attention_mode)
+        if mode == "causal":
+            if (
+                bidirectional_prefix_mask is not None
+                and bool(bidirectional_prefix_mask.bool().any())
+            ):
+                raise ValueError(
+                    "Causal planner received a non-empty bidirectional prefix mask"
+                )
+            return attention_mask
+        if mode != "prefix_lm":
+            raise RuntimeError(f"Unsupported planner attention mode: {mode}")
+        if bidirectional_prefix_mask is None:
+            raise ValueError(
+                "prefix_lm planner requires bidirectional_prefix_mask"
+            )
+        return build_prefix_lm_attention_mask(
+            attention_mask,
+            bidirectional_prefix_mask,
+            dtype=dtype,
+        )
+
     def _base_model_forward(self, **kwargs: Any):
         base_prefix = getattr(self.language_model, "base_model_prefix", "model")
         base_model = getattr(self.language_model, base_prefix)
@@ -1497,6 +1659,7 @@ class MimiQwenPlanner(PreTrainedModel):
         audio_codes: torch.Tensor,
         target_slots: torch.Tensor,
         motion_local_labels: torch.Tensor,
+        bidirectional_prefix_mask: Optional[torch.Tensor] = None,
         expected_distortion_weight: float = 0.0,
         expected_distortion_example_mask: Optional[torch.Tensor] = None,
         gap_target_probs: Optional[torch.Tensor] = None,
@@ -1549,9 +1712,14 @@ class MimiQwenPlanner(PreTrainedModel):
             )
 
         inputs_embeds = self.prepare_input_embeddings(input_ids, audio_codes)
+        model_attention_mask = self.prepare_planner_attention_mask(
+            attention_mask,
+            bidirectional_prefix_mask,
+            dtype=inputs_embeds.dtype,
+        )
         base_outputs = self._base_model_forward(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=model_attention_mask,
             use_cache=False,
             return_dict=True,
         )
@@ -1736,15 +1904,21 @@ class MimiQwenPlanner(PreTrainedModel):
         attention_mask: torch.Tensor,
         audio_codes: torch.Tensor,
         slot: int,
+        bidirectional_prefix_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return the restricted 512-way logits for the next anchor slot."""
 
         if not 0 <= int(slot) < BODY_SLOT_COUNT:
             raise ValueError(f"slot must be in [0, {BODY_SLOT_COUNT - 1}]")
         inputs_embeds = self.prepare_input_embeddings(input_ids, audio_codes)
+        model_attention_mask = self.prepare_planner_attention_mask(
+            attention_mask,
+            bidirectional_prefix_mask,
+            dtype=inputs_embeds.dtype,
+        )
         outputs = self._base_model_forward(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=model_attention_mask,
             use_cache=False,
             return_dict=True,
         )
@@ -1759,15 +1933,21 @@ class MimiQwenPlanner(PreTrainedModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         audio_codes: torch.Tensor,
+        bidirectional_prefix_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Return the restricted 16-way logits for the next causal gap decision."""
 
         if self.gap_token_ids.numel() != len(GAP_TOKENS):
             raise RuntimeError("This checkpoint does not define the 16 gap-token ids")
         inputs_embeds = self.prepare_input_embeddings(input_ids, audio_codes)
+        model_attention_mask = self.prepare_planner_attention_mask(
+            attention_mask,
+            bidirectional_prefix_mask,
+            dtype=inputs_embeds.dtype,
+        )
         outputs = self._base_model_forward(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=model_attention_mask,
             use_cache=False,
             return_dict=True,
         )

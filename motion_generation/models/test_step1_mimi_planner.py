@@ -23,6 +23,7 @@ from models.step1_mimi_planner import (  # noqa: E402
     Step1AdaptiveGapDataset,
     Step1FixedGapDataset,
     Step1PlannerCollator,
+    build_prefix_lm_attention_mask,
     parse_structured_text,
 )
 from utils.adaptive_anchor_tokens import (  # noqa: E402
@@ -164,6 +165,69 @@ def test_dataset_serializes_causal_audio_before_each_anchor(tmp_path: Path, step
     assert item["target_anchor_ids"][first_target_position : first_target_position + 16] == [0] * 16
 
 
+def test_dataset_serializes_full_audio_and_seed_as_one_teacher_prefix(
+    tmp_path: Path, step1_tokenizer
+):
+    name = "session/full_audio_teacher"
+    motion_dir, audio_dir, _, codes = _write_synthetic_clip(tmp_path, name)
+    dataset = Step1FixedGapDataset(
+        [name],
+        tokenizer=step1_tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "full audio teacher"},
+        fixed_gap=7,
+        seed_mode="observed",
+        sequence_layout="full_audio_prefix",
+    )
+    item = dataset[0]
+    prefix = np.asarray(item["bidirectional_prefix_mask"], dtype=bool)
+    prefix_length = int(prefix.sum())
+    assert np.array_equal(
+        prefix,
+        np.arange(len(prefix)) < prefix_length,
+    )
+    assert not (np.asarray(item["target_slots"])[prefix] >= 0).any()
+
+    audio_positions = np.flatnonzero(
+        np.asarray(item["audio_codes"], dtype=np.int64)[:, 0] >= 0
+    )
+    assert len(audio_positions) == codes.shape[1]
+    assert bool(prefix[audio_positions].all())
+    assert np.array_equal(
+        np.asarray(item["audio_codes"], dtype=np.int64)[audio_positions, 0],
+        codes[0].astype(np.int64),
+    )
+    first_gap_position = next(
+        index
+        for index, token_id in enumerate(item["input_ids"])
+        if token_id
+        in {
+            step1_tokenizer.convert_tokens_to_ids(token)
+            for token in GAP_TOKENS
+        }
+    )
+    assert first_gap_position == prefix_length
+    assert not prefix[first_gap_position]
+
+
+def test_prefix_lm_mask_has_bidirectional_prefix_and_causal_plan():
+    attention = torch.tensor([[1, 1, 1, 1, 1, 0]])
+    prefix = torch.tensor([[1, 1, 1, 0, 0, 0]], dtype=torch.bool)
+    mask = build_prefix_lm_attention_mask(
+        attention,
+        prefix,
+        dtype=torch.float32,
+    )[0, 0]
+    allowed = mask.eq(0)
+    assert allowed[0].tolist() == [True, True, True, False, False, False]
+    assert allowed[2].tolist() == [True, True, True, False, False, False]
+    assert allowed[3].tolist() == [True, True, True, True, False, False]
+    assert allowed[4].tolist() == [True, True, True, True, True, False]
+    # Padding queries keep valid causal keys to avoid an all-masked SDPA row.
+    assert allowed[5].tolist() == [True, True, True, True, True, False]
+
+
 def test_dataset_and_collator_build_one_step2_guidance_window(
     tmp_path: Path,
     step1_tokenizer,
@@ -187,6 +251,7 @@ def test_dataset_and_collator_build_one_step2_guidance_window(
         step2_guidance_audio_fps=12.5,
         step2_guidance_audio_feat_dim=8,
         step2_guidance_resample=True,
+        step2_guidance_required_gap=7,
     )
     item = dataset[0]
     assert item["step2_guidance_gap"] == 7
@@ -527,7 +592,9 @@ def test_counterfactual_loss_rewards_higher_wrong_condition_nll():
     assert bool((negative.grad[mask] < 0).all())
 
 
-def _tiny_planner() -> MimiQwenPlanner:
+def _tiny_planner(
+    planner_attention_mode: str = "causal",
+) -> MimiQwenPlanner:
     vocabulary = BODY_SLOT_COUNT * BODY_CODEBOOK_SIZE + 8
     qwen_config = Qwen2Config(
         vocab_size=vocabulary,
@@ -548,10 +615,41 @@ def _tiny_planner() -> MimiQwenPlanner:
         language_model_config=language_model.config.to_dict(),
         audio_placeholder_id=BODY_SLOT_COUNT * BODY_CODEBOOK_SIZE,
         motion_token_ids=table,
+        planner_attention_mode=planner_attention_mode,
     )
     planner = MimiQwenPlanner(config, language_model=language_model)
     planner.tie_weights()
     return planner
+
+
+def test_tiny_prefix_lm_planner_backpropagates_without_plan_leakage():
+    planner = _tiny_planner("prefix_lm")
+    labels = torch.tensor(
+        [(slot * 13 + 5) % BODY_CODEBOOK_SIZE for slot in range(BODY_SLOT_COUNT)]
+    )
+    input_ids = torch.zeros((1, 22), dtype=torch.long)
+    for slot in range(BODY_SLOT_COUNT):
+        input_ids[0, 5 + slot] = planner.motion_token_ids[slot, labels[slot]]
+    target_slots = torch.full_like(input_ids, -1)
+    target_slots[0, 5:21] = torch.arange(BODY_SLOT_COUNT)
+    motion_labels = torch.full_like(input_ids, IGNORE_INDEX)
+    motion_labels[0, 5:21] = labels
+    prefix = torch.zeros_like(input_ids, dtype=torch.bool)
+    prefix[:, :4] = True
+    output = planner(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        audio_codes=torch.full_like(input_ids, -1),
+        target_slots=target_slots,
+        motion_local_labels=motion_labels,
+        bidirectional_prefix_mask=prefix,
+    )
+    assert torch.isfinite(output.loss)
+    output.loss.backward()
+    assert (
+        planner.language_model.model.layers[0].self_attn.q_proj.weight.grad
+        is not None
+    )
 
 
 def test_wrapping_does_not_reinitialize_language_model():

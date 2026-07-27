@@ -66,6 +66,7 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
     anchor_counts: list[int] = []
     audio_counts: list[int] = []
     target_counts: list[int] = []
+    prefix_counts: list[int] = []
     gap_counts = Counter()
     annotation_patterns = Counter()
     step2_guidance_gaps = Counter()
@@ -94,6 +95,9 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
             anchor_counts.append(len(item["anchor_times"]))
             audio_counts.append(item["audio_boundaries"][-1])
             target_counts.append(sum(slot >= 0 for slot in item["target_slots"]))
+            prefix_counts.append(
+                sum(bool(value) for value in item["bidirectional_prefix_mask"])
+            )
             annotation_patterns[item.get("annotation_pattern", "unknown")] += 1
             gap_counts.update(item_gaps)
             if guidance_gap is not None:
@@ -115,6 +119,7 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
         "mimi_frame_counts": percentile_summary(audio_counts),
         "annotation_patterns": dict(sorted(annotation_patterns.items())),
         "supervised_token_counts": percentile_summary(target_counts),
+        "bidirectional_prefix_token_counts": percentile_summary(prefix_counts),
         "gap_counts": {str(key): value for key, value in sorted(gap_counts.items())},
         "step2_guidance_gap_counts": {
             str(key): value for key, value in sorted(step2_guidance_gaps.items())
