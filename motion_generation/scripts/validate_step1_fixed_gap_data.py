@@ -19,6 +19,7 @@ if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
 from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
+    audio_contract_from_config,
     build_dataset,
     data_config_from_config,
     load_config,
@@ -30,7 +31,11 @@ from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     validate_paths,
 )
 from models.step1_mimi_planner import load_text_map, read_split_names  # noqa: E402
-from utils.adaptive_anchor_tokens import ensure_step1_special_tokens, gap_from_anchor_times  # noqa: E402
+from utils.adaptive_anchor_tokens import (  # noqa: E402
+    ensure_nano_audio_tokens,
+    ensure_step1_special_tokens,
+    gap_from_anchor_times,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,15 +70,58 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
     sequence_lengths: list[int] = []
     anchor_counts: list[int] = []
     audio_counts: list[int] = []
+    audio_metadata_frame_counts: list[int] = []
+    audio_vocabulary_token_position_counts: list[int] = []
     target_counts: list[int] = []
     prefix_counts: list[int] = []
     gap_counts = Counter()
     annotation_patterns = Counter()
     step2_guidance_gaps = Counter()
     errors = []
+    audio_input_representation = str(
+        getattr(dataset, "audio_input_representation", "fused_frame")
+    )
+    audio_token_ids = {
+        int(token_id)
+        for row in getattr(dataset, "audio_token_ids", ())
+        for token_id in row
+    }
     for index, name in enumerate(dataset.names):
         try:
             item = dataset[index]
+            item_audio_codes = np.asarray(item["audio_codes"], dtype=np.int64)
+            if item_audio_codes.ndim != 2:
+                raise ValueError(
+                    f"Serialized audio_codes must be [L,K], got {item_audio_codes.shape}"
+                )
+            metadata_audio_frames = int(
+                np.any(item_audio_codes >= 0, axis=-1).sum()
+            )
+            vocabulary_audio_positions = sum(
+                int(token_id) in audio_token_ids for token_id in item["input_ids"]
+            )
+            expected_audio_frames = int(item["audio_boundaries"][-1])
+            if metadata_audio_frames != expected_audio_frames:
+                raise ValueError(
+                    "Serialized audio metadata frame count does not match the "
+                    f"aligned audio length: {metadata_audio_frames} != "
+                    f"{expected_audio_frames}"
+                )
+            if audio_input_representation == "ordinary_tokens":
+                expected_audio_positions = (
+                    expected_audio_frames * len(dataset.audio_codebooks_used)
+                )
+                if vocabulary_audio_positions != expected_audio_positions:
+                    raise ValueError(
+                        "Ordinary audio-token position count does not equal "
+                        "frames times configured codebooks: "
+                        f"{vocabulary_audio_positions} != {expected_audio_positions}"
+                    )
+            elif vocabulary_audio_positions:
+                raise ValueError(
+                    "Fused-frame serialization unexpectedly contains ordinary "
+                    f"audio vocabulary tokens: {vocabulary_audio_positions}"
+                )
             item_gaps = [
                 gap_from_anchor_times(left, right)
                 for left, right in zip(
@@ -94,6 +142,10 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
             sequence_lengths.append(len(item["input_ids"]))
             anchor_counts.append(len(item["anchor_times"]))
             audio_counts.append(item["audio_boundaries"][-1])
+            audio_metadata_frame_counts.append(metadata_audio_frames)
+            audio_vocabulary_token_position_counts.append(
+                vocabulary_audio_positions
+            )
             target_counts.append(sum(slot >= 0 for slot in item["target_slots"]))
             prefix_counts.append(
                 sum(bool(value) for value in item["bidirectional_prefix_mask"])
@@ -117,6 +169,12 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
         "anchor_counts": percentile_summary(anchor_counts),
         "audio_frame_counts": percentile_summary(audio_counts),
         "mimi_frame_counts": percentile_summary(audio_counts),
+        "audio_metadata_frame_counts": percentile_summary(
+            audio_metadata_frame_counts
+        ),
+        "audio_vocabulary_token_position_counts": percentile_summary(
+            audio_vocabulary_token_position_counts
+        ),
         "annotation_patterns": dict(sorted(annotation_patterns.items())),
         "supervised_token_counts": percentile_summary(target_counts),
         "bidirectional_prefix_token_counts": percentile_summary(prefix_counts),
@@ -133,6 +191,7 @@ def main() -> None:
     paths = resolve_data_paths(config)
     validate_paths(paths, resume=None)
     data_config = data_config_from_config(config)
+    audio_contract = audio_contract_from_config(config)
     training = section(config, "training")
     adaptive_gap = validate_adaptive_gap_config(
         config,
@@ -145,6 +204,10 @@ def main() -> None:
         include_structured_text=data_config.get("text_serialization") == "structured_fields",
     )
     print(f"Tokenizer controls added in-memory: {len(added)}")
+    added_audio = []
+    if audio_contract["input_representation"] == "ordinary_tokens":
+        added_audio = ensure_nano_audio_tokens(tokenizer)
+        print(f"Ordinary Nano audio tokens added in-memory: {len(added_audio)}")
     text_map = load_text_map(paths["text_json"])
     neutral_seed = load_neutral_seed(data_config.get("neutral_seed_json"))
     train_names = read_split_names(paths["train_split"])
@@ -176,7 +239,17 @@ def main() -> None:
         adaptive_gap=adaptive_gap,
         frozen_step2_guidance=frozen_step2_guidance,
     )
-    report = {"config": str(args.config.resolve())}
+    report = {
+        "config": str(args.config.resolve()),
+        "audio_input_representation": audio_contract["input_representation"],
+        "audio_vocabulary_token_count": (
+            len(audio_contract["codebooks_used"])
+            * int(audio_contract["cardinality"])
+            if audio_contract["input_representation"] == "ordinary_tokens"
+            else 0
+        ),
+        "audio_vocabulary_tokens_added_in_memory": len(added_audio),
+    }
     if adaptive_gap["enabled"]:
         report["adaptive_phases"] = []
         for phase_index, phase in enumerate(adaptive_gap["phases"]):

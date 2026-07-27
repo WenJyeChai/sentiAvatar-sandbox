@@ -43,9 +43,12 @@ from models.step1_mimi_planner import (  # noqa: E402
     read_split_names,
 )
 from utils.adaptive_anchor_tokens import (  # noqa: E402
+    AUDIO_INPUT_REPRESENTATIONS,
     BODY_SLOTS,
     GAP_TOKENS,
     MIMI_FRAME_TOKEN,
+    audio_token_id_table,
+    ensure_nano_audio_tokens,
     ensure_step1_special_tokens,
     motion_token_id_table,
     validate_anchor,
@@ -139,6 +142,17 @@ def audio_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     audio = section(config, "audio")
     data = section(config, "data")
     codec = str(audio.get("codec", data.get("audio_codec", "mimi")))
+    input_representation = str(
+        audio.get(
+            "input_representation",
+            data.get("audio_input_representation", "fused_frame"),
+        )
+    )
+    if input_representation not in AUDIO_INPUT_REPRESENTATIONS:
+        raise ValueError(
+            "audio.input_representation must be one of "
+            f"{AUDIO_INPUT_REPRESENTATIONS}, got {input_representation!r}"
+        )
     codec_defaults = {
         "mimi": {
             "sample_rate": 24_000,
@@ -185,13 +199,26 @@ def audio_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
         data_codebooks = [int(value) for value in data["audio_codebooks_used"]]
         if data_codebooks != codebooks:
             raise ValueError("audio and data audio-codebook configurations disagree")
-    if len(codebooks) > 1:
+    if input_representation == "fused_frame" and len(codebooks) > 1:
         if str(audio.get("fusion", "concat_linear")) != "concat_linear":
             raise ValueError("q0-q3 currently supports only concat_linear audio fusion")
         if not bool(audio.get("sparse_audio_embedding", True)):
             raise ValueError("q0-q3 requires sparse_audio_embedding on 24 GB GPUs")
+    if input_representation == "ordinary_tokens":
+        expected = ("moss_audio_tokenizer_nano", [0, 1, 2, 3], 1_024)
+        actual = (
+            codec,
+            codebooks,
+            int(audio.get("cardinality", defaults["cardinality"])),
+        )
+        if actual != expected:
+            raise ValueError(
+                "ordinary audio tokens currently require MOSS Nano q0-q3 "
+                f"with cardinality 1024; got {actual}"
+            )
     contract = {
         "codec": codec,
+        "input_representation": input_representation,
         "sample_rate": int(audio.get("sample_rate", defaults["sample_rate"])),
         "frame_rate": float(audio.get("frame_rate", defaults["frame_rate"])),
         "frame_size": int(audio.get("frame_size", defaults["frame_size"])),
@@ -218,6 +245,9 @@ def mimi_codebooks_from_config(config: Mapping[str, Any]) -> list[int]:
 def data_config_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     data = section(config, "data")
     data["_audio_contract"] = audio_contract_from_config(config)
+    data["audio_input_representation"] = data["_audio_contract"][
+        "input_representation"
+    ]
     text = section(config, "text")
     data["text_serialization"] = str(text.get("serialization", "raw"))
     context = planner_context_from_config(config)
@@ -485,6 +515,41 @@ def build_model_and_tokenizer(
         )
         if added:
             raise RuntimeError(f"Resume checkpoint is missing Step 1 controls: {added}")
+        requested_audio_representation = str(
+            audio_contract["input_representation"]
+        )
+        actual_audio_representation = str(
+            getattr(model.config, "audio_input_representation", "fused_frame")
+        )
+        if actual_audio_representation != requested_audio_representation:
+            raise RuntimeError(
+                "Resume checkpoint audio input representation does not match "
+                "the requested configuration: "
+                f"checkpoint={actual_audio_representation}, "
+                f"requested={requested_audio_representation}"
+            )
+        requested_audio_token_ids: list[list[int]] = []
+        if requested_audio_representation == "ordinary_tokens":
+            added_audio = ensure_nano_audio_tokens(tokenizer)
+            if added_audio:
+                raise RuntimeError(
+                    "Resume checkpoint tokenizer is missing "
+                    f"{len(added_audio)} ordinary Nano audio tokens"
+                )
+            requested_audio_token_ids = audio_token_id_table(
+                tokenizer,
+                codebooks=audio_contract["codebooks_used"],
+                cardinality=int(audio_contract["cardinality"]),
+            )
+        actual_audio_token_ids = [
+            [int(token_id) for token_id in row]
+            for row in getattr(model.config, "audio_token_ids", [])
+        ]
+        if actual_audio_token_ids != requested_audio_token_ids:
+            raise RuntimeError(
+                "Resume checkpoint ordinary-audio token table does not match "
+                "its tokenizer/configuration"
+            )
         expected_table = torch.tensor(motion_token_id_table(tokenizer), dtype=torch.long)
         if not torch.equal(model.motion_token_ids.cpu(), expected_table):
             raise RuntimeError("Resume checkpoint motion-token classifier table does not match tokenizer")
@@ -546,6 +611,15 @@ def build_model_and_tokenizer(
         language_model,
         include_structured_text=text_serialization == "structured_fields",
     )
+    audio_token_ids: list[list[int]] = []
+    if audio_contract["input_representation"] == "ordinary_tokens":
+        added_audio = ensure_nano_audio_tokens(tokenizer, language_model)
+        added.extend(added_audio)
+        audio_token_ids = audio_token_id_table(
+            tokenizer,
+            codebooks=audio_contract["codebooks_used"],
+            cardinality=int(audio_contract["cardinality"]),
+        )
     language_model.config.use_cache = False
     table = motion_token_id_table(tokenizer)
     audio_placeholder_id = int(tokenizer.convert_tokens_to_ids(MIMI_FRAME_TOKEN))
@@ -560,6 +634,8 @@ def build_model_and_tokenizer(
         audio_cardinality=int(audio_contract["cardinality"]),
         audio_codebooks_stored=int(audio_contract["stored_codebooks"]),
         audio_codebooks_used=list(audio_contract["codebooks_used"]),
+        audio_input_representation=str(audio_contract["input_representation"]),
+        audio_token_ids=audio_token_ids,
         mimi_cardinality=int(audio_contract["cardinality"]),
         mimi_codebooks_stored=int(audio_contract["stored_codebooks"]),
         mimi_codebooks_used=list(audio_contract["codebooks_used"]),
@@ -599,6 +675,9 @@ def build_dataset(
             "codebooks_used": data_config.get(
                 "audio_codebooks_used",
                 data_config.get("mimi_codebooks_used", [0]),
+            ),
+            "input_representation": str(
+                data_config.get("audio_input_representation", "fused_frame")
             ),
         }
     dataset_class = (
@@ -642,6 +721,7 @@ def build_dataset(
         audio_codebooks_stored=int(audio_contract["stored_codebooks"]),
         audio_cardinality=int(audio_contract["cardinality"]),
         audio_codebooks_used=audio_contract["codebooks_used"],
+        audio_input_representation=str(audio_contract["input_representation"]),
         text_serialization=str(data_config.get("text_serialization", "raw")),
         sequence_layout=str(
             data_config.get("sequence_layout", "causal_interleaved")
@@ -769,6 +849,17 @@ def evaluate(
     step2_guidance_weight: float = 0.0,
 ) -> dict[str, Any]:
     model.eval()
+    planner_model = (
+        model.module if isinstance(model, DistributedDataParallel) else model
+    )
+    audio_input_representation = str(
+        getattr(
+            planner_model.config,
+            "audio_input_representation",
+            "fused_frame",
+        )
+    )
+    audio_token_ids = getattr(planner_model, "audio_token_ids", None)
     base_count = 3 + 2 * len(BODY_SLOTS)
     gap_offset = base_count
     condition_offset = gap_offset + 7
@@ -845,6 +936,8 @@ def evaluate(
                     seed=alignment_seed,
                     epoch=0,
                     batch_index=batch_index,
+                    audio_input_representation=audio_input_representation,
+                    audio_token_ids=audio_token_ids,
                 )
                 if not corruption.selected_indices.numel():
                     continue
@@ -1241,6 +1334,8 @@ def build_condition_corruption(
     seed: int,
     epoch: int,
     batch_index: int,
+    audio_input_representation: str = "fused_frame",
+    audio_token_ids: Optional[torch.Tensor] = None,
 ) -> ConditionCorruption:
     if modality == "audio":
         return corrupt_audio_with_causal_past(
@@ -1250,6 +1345,8 @@ def build_condition_corruption(
             target_anchor_ids=metadata["target_anchor_ids"],
             selected_indices=selected_indices,
             shift_anchors=int(alignment["audio_past_shift_anchors"]),
+            audio_input_representation=audio_input_representation,
+            audio_token_ids=audio_token_ids,
         )
     if modality == "text":
         return corrupt_text_condition(
@@ -1600,6 +1697,9 @@ def main() -> None:
                     "sequence_length": len(first["input_ids"]),
                     "anchor_times": first["anchor_times"],
                     "audio_boundaries": first["audio_boundaries"],
+                    "audio_input_representation": audio_contract[
+                        "input_representation"
+                    ],
                     "supervised_tokens": sum(slot >= 0 for slot in first["target_slots"]),
                 },
             )
@@ -1698,7 +1798,8 @@ def main() -> None:
         print(
             "Audio contract:    "
             f"{audio_contract['codec']} q{audio_contract['codebooks_used']} "
-            f"({audio_contract['cardinality']}-way, {audio_contract['frame_rate']} Hz)"
+            f"({audio_contract['cardinality']}-way, {audio_contract['frame_rate']} Hz), "
+            f"input={audio_contract['input_representation']}"
         )
         print(f"Text serialization:{data_config.get('text_serialization', 'raw')}")
         print(
@@ -1708,7 +1809,9 @@ def main() -> None:
         )
         print(f"Train/eval clips:  {len(train_dataset)}/{len(eval_dataset)}")
         print(f"World size:        {world_size}")
-        print(f"Added controls:    {added_tokens}")
+        print(f"Added tokens:      {len(added_tokens)}")
+        if len(added_tokens) <= 64:
+            print(f"Added token names: {added_tokens}")
         print(f"Parameters:        {trainable:,} trainable / {total:,} total")
         print(f"Updates:           {total_steps} ({updates_per_epoch}/epoch)")
         if args.max_train_steps is not None:
@@ -2013,6 +2116,18 @@ def main() -> None:
                     seed=seed,
                     epoch=epoch,
                     batch_index=batch_index,
+                    audio_input_representation=str(
+                        audio_contract["input_representation"]
+                    ),
+                    audio_token_ids=getattr(
+                        (
+                            model.module
+                            if isinstance(model, DistributedDataParallel)
+                            else model
+                        ),
+                        "audio_token_ids",
+                        None,
+                    ),
                 )
                 if corruption.selected_indices.numel():
                     negative_inputs = corrupted_model_inputs(inputs, corruption)

@@ -49,6 +49,11 @@ class _LanguageModel:
 
 class _FakePlanner:
     def __init__(self):
+        self.config = SimpleNamespace(
+            audio_input_representation="fused_frame",
+            audio_cardinality=1024,
+            audio_token_ids=[],
+        )
         self.language_model = _LanguageModel()
         self.motion_token_ids = torch.stack(
             [
@@ -83,6 +88,27 @@ class _FakePlanner:
             last_hidden_state=torch.ones_like(inputs_embeds),
             past_key_values=(),
         )
+
+
+class _OrdinaryTokenFakePlanner(_FakePlanner):
+    def __init__(self):
+        super().__init__()
+        table = np.stack(
+            [
+                np.arange(1024, dtype=np.int64) + 2000 + codebook * 1024
+                for codebook in range(4)
+            ]
+        )
+        self.config = SimpleNamespace(
+            audio_input_representation="ordinary_tokens",
+            audio_cardinality=1024,
+            audio_token_ids=table.tolist(),
+        )
+        self.prepared_input_ids = []
+
+    def prepare_input_embeddings(self, input_ids, audio_codes):
+        self.prepared_input_ids.append(input_ids.detach().cpu().clone())
+        return super().prepare_input_embeddings(input_ids, audio_codes)
 
 
 def _example(name, token_length, prefix_length, oracle_times):
@@ -156,6 +182,39 @@ def test_full_audio_teacher_rollout_marks_audio_as_preloaded():
     )[0]
     assert result.anchor_times == (0, 8, 16)
     assert result.executed_gaps == (7, 7)
+
+
+def test_ordinary_audio_rollout_appends_q0_q3_tokens_per_frame():
+    example = _example("ordinary", 9, 5, (0, 8))
+    # Give every codebook a distinct code so flattening order is observable.
+    example.audio_codes[:] = np.arange(4, dtype=np.int64)[None, :] + np.arange(
+        len(example.audio_codes), dtype=np.int64
+    )[:, None]
+    planner = _OrdinaryTokenFakePlanner()
+    result = rollout_policy_batch(
+        planner,
+        _Tokenizer(),
+        [example],
+        policy="fixed",
+        fixed_gap=7,
+        anchor_history="generated",
+        device=torch.device("cpu"),
+        use_bf16=False,
+    )[0]
+    assert result.anchor_times == (0, 8)
+
+    # First call is the known seed prefix. The next call contains gap,
+    # time-major q0..q3 audio tokens for every frame, and [anchor].
+    known = planner.prepared_input_ids[1][0].tolist()
+    expected_audio = []
+    table = np.asarray(planner.config.audio_token_ids)
+    for frame_codes in example.audio_codes:
+        expected_audio.extend(
+            int(table[codebook, frame_codes[codebook]])
+            for codebook in range(4)
+        )
+    assert known == [17, *expected_audio, 30]
+    assert 31 not in known
 
 
 def test_step2_assembly_skips_adjacent_eos_interval():

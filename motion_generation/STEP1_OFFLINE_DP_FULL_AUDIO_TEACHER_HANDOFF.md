@@ -236,3 +236,60 @@ tokens are then appended causally. Audio is not inserted again during rollout.
 This model is an offline upper-bound teacher. It cannot be deployed as the
 online causal student because it consumes the complete utterance audio before
 the first gap decision.
+
+## Ordinary q0-q3 vocabulary-token ablation
+
+The matched ablation config is:
+
+```text
+motion_generation/configs/step1_offline_dp_full_audio_teacher50_nano_q0q3_vocab.yaml
+```
+
+It reuses the same Nano `.npz` exports and offline DP calibration. No audio or
+motion preprocessing needs to be repeated. The only modeling change is the
+audio input representation: each 12.5 Hz frame becomes four ordinary Qwen
+vocabulary positions in `q0,q1,q2,q3` order instead of one custom fused-frame
+embedding. It still initializes from `checkpoints/llm`, uses GT anchor history,
+and retains the full-audio prefix-LM teacher context and the same 50-epoch DP
+curriculum.
+
+Run the full preflight first:
+
+```bash
+python motion_generation/scripts/validate_step1_fixed_gap_data.py \
+  --config motion_generation/configs/step1_offline_dp_full_audio_teacher50_nano_q0q3_vocab.yaml \
+  --output_json checkpoints/step1_offline_dp_full_audio_teacher50_nano_q0q3_vocab/data_preflight.json
+```
+
+The report must show `audio_vocabulary_token_count: 4096`, all records valid,
+and per-clip vocabulary-token positions equal to four times the audio-frame
+count. Supervised targets must never be truncated.
+
+Then run a two-update smoke test:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_offline_dp_full_audio_teacher50_nano_q0q3_vocab.yaml \
+  --max_train_clips 64 --max_eval_clips 32 \
+  --max_train_steps 2 \
+  --output_dir checkpoints/step1_offline_dp_full_audio_teacher50_nano_q0q3_vocab_smoke
+```
+
+The header must show `input=ordinary_tokens`,
+`attention=prefix_lm, layout=full_audio_prefix`, and all generated-history and
+online-guidance features disabled.
+
+Finally, start the full run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=4 --master_port=29514 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_offline_dp_full_audio_teacher50_nano_q0q3_vocab.yaml
+```
+
+The per-device batch is 8 with four accumulation microsteps, preserving the
+original four-GPU global batch of 128. Do not initialize this ablation from the
+previous fused-audio teacher: its tokenizer, sequence layout at audio frames,
+and audio input parameters have a different contract.

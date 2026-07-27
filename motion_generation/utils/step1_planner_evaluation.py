@@ -603,6 +603,8 @@ class ShuffledAudioDataset(Dataset):
         *,
         donor_names: Sequence[str],
         mimi_token_dir: Path,
+        audio_input_representation: Optional[str] = None,
+        audio_token_ids: Optional[Sequence[Sequence[int]]] = None,
     ) -> None:
         if len(base_dataset) != len(donor_names):
             raise ValueError("base_dataset and donor_names must have the same length")
@@ -610,6 +612,45 @@ class ShuffledAudioDataset(Dataset):
         self.donor_names = [str(name) for name in donor_names]
         self.mimi_token_dir = Path(mimi_token_dir)
         self.names = list(base_dataset.names)
+        self.audio_input_representation = str(
+            audio_input_representation
+            if audio_input_representation is not None
+            else getattr(
+                base_dataset,
+                "audio_input_representation",
+                "fused_frame",
+            )
+        )
+        if self.audio_input_representation not in {
+            "fused_frame",
+            "ordinary_tokens",
+        }:
+            raise ValueError(
+                "audio_input_representation must be fused_frame or ordinary_tokens"
+            )
+        raw_audio_token_ids = (
+            audio_token_ids
+            if audio_token_ids is not None
+            else getattr(base_dataset, "audio_token_ids", None)
+        )
+        self.audio_token_ids = (
+            None
+            if raw_audio_token_ids is None
+            else np.asarray(raw_audio_token_ids, dtype=np.int64)
+        )
+        if self.audio_input_representation == "ordinary_tokens":
+            codebook_count = len(
+                tuple(getattr(self.base_dataset, "audio_codebooks_used", (0,)))
+            )
+            if (
+                self.audio_token_ids is None
+                or self.audio_token_ids.ndim != 2
+                or self.audio_token_ids.shape[0] != codebook_count
+                or not self.audio_token_ids.shape[1]
+            ):
+                raise ValueError(
+                    "ordinary shuffled audio requires audio_token_ids with shape [C,V]"
+                )
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -636,14 +677,34 @@ class ShuffledAudioDataset(Dataset):
         audio_codes = np.asarray(item["audio_codes"], dtype=np.int64)
         if audio_codes.ndim == 1:
             audio_codes = audio_codes[:, None]
-        positions = np.flatnonzero(np.all(audio_codes >= 0, axis=-1))
-        if not len(positions) or donor.shape[1] == 0:
+        frame_starts = np.flatnonzero(np.all(audio_codes >= 0, axis=-1))
+        if not len(frame_starts) or donor.shape[1] == 0:
             return item
         donor_indices = np.rint(
-            np.linspace(0, donor.shape[1] - 1, num=len(positions))
+            np.linspace(0, donor.shape[1] - 1, num=len(frame_starts))
         ).astype(np.int64)
-        audio_codes[positions] = donor[:, donor_indices].T
+        replacement_codes = donor[:, donor_indices].T
+        audio_codes[frame_starts] = replacement_codes
         item["audio_codes"] = audio_codes.tolist()
+        if self.audio_input_representation == "ordinary_tokens":
+            assert self.audio_token_ids is not None
+            if replacement_codes.min() < 0 or replacement_codes.max() >= int(
+                self.audio_token_ids.shape[1]
+            ):
+                raise ValueError("Donor code is outside the ordinary-token table")
+            codebooks = int(self.audio_token_ids.shape[0])
+            input_ids = np.asarray(item["input_ids"], dtype=np.int64).copy()
+            for frame_start, frame_codes in zip(
+                frame_starts.tolist(), replacement_codes
+            ):
+                frame_start = int(frame_start)
+                if frame_start + codebooks > len(input_ids):
+                    raise ValueError("Truncated ordinary audio token frame")
+                input_ids[frame_start : frame_start + codebooks] = [
+                    int(self.audio_token_ids[codebook, frame_codes[codebook]])
+                    for codebook in range(codebooks)
+                ]
+            item["input_ids"] = input_ids.tolist()
         return item
 
 

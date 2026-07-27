@@ -29,6 +29,7 @@ from utils.adaptive_anchor_tokens import (
     ACTION_MISSING_TOKEN,
     ACTION_TOKEN,
     ANCHOR_TOKEN,
+    AUDIO_INPUT_REPRESENTATIONS,
     AUDIO_END_TOKEN,
     BODY_CODEBOOK_SIZE,
     BODY_PART_ORDER,
@@ -39,9 +40,12 @@ from utils.adaptive_anchor_tokens import (
     MIMI_FRAME_TOKEN,
     MOTION_END_TOKEN,
     MOTION_START_TOKEN,
+    NANO_AUDIO_CARDINALITY,
+    NANO_AUDIO_CODEBOOKS,
     SEED_TOKEN_BY_MODE,
     STEP1_ROLE_TOKEN,
     TRANSCRIPT_TOKEN,
+    audio_token_id_table,
     body_token,
     causal_audio_boundaries,
     fixed_anchor_times,
@@ -286,6 +290,7 @@ class Step1FixedGapDataset(Dataset):
         audio_codebooks_stored: int = MIMI_STORED_CODEBOOKS,
         audio_cardinality: int = MIMI_CARDINALITY,
         audio_codebooks_used: Optional[Sequence[int]] = None,
+        audio_input_representation: str = "fused_frame",
         text_serialization: str = "raw",
         sequence_layout: str = "causal_interleaved",
         drop_structured_tags: bool = False,
@@ -350,6 +355,37 @@ class Step1FixedGapDataset(Dataset):
             raise ValueError("Audio sample rate, frame rate, and frame size must be positive")
         if self.audio_codebooks_stored <= 0 or self.audio_cardinality <= 1:
             raise ValueError("Audio codebook count/cardinality is invalid")
+        if audio_input_representation not in AUDIO_INPUT_REPRESENTATIONS:
+            raise ValueError(
+                "audio_input_representation must be one of "
+                f"{AUDIO_INPUT_REPRESENTATIONS}, got {audio_input_representation!r}"
+            )
+        self.audio_input_representation = str(audio_input_representation)
+        if self.audio_input_representation == "ordinary_tokens":
+            if self.audio_codec != "moss_audio_tokenizer_nano":
+                raise ValueError(
+                    "ordinary_tokens currently supports only moss_audio_tokenizer_nano"
+                )
+            if self.audio_codebooks_used != NANO_AUDIO_CODEBOOKS:
+                raise ValueError(
+                    "ordinary_tokens requires Nano codebooks "
+                    f"{NANO_AUDIO_CODEBOOKS}, got {self.audio_codebooks_used}"
+                )
+            if self.audio_cardinality != NANO_AUDIO_CARDINALITY:
+                raise ValueError(
+                    "ordinary_tokens requires Nano cardinality "
+                    f"{NANO_AUDIO_CARDINALITY}, got {self.audio_cardinality}"
+                )
+            self.audio_token_ids = tuple(
+                tuple(int(value) for value in row)
+                for row in audio_token_id_table(
+                    self.tokenizer,
+                    codebooks=self.audio_codebooks_used,
+                    cardinality=self.audio_cardinality,
+                )
+            )
+        else:
+            self.audio_token_ids = ()
         if text_serialization not in {"raw", "structured_fields"}:
             raise ValueError("text_serialization must be raw or structured_fields")
         self.text_serialization = str(text_serialization)
@@ -761,6 +797,44 @@ class Step1FixedGapDataset(Dataset):
             gap_target_probs.append([0.0] * len(GAP_TOKENS))
             gap_target_mask.append(0)
 
+        def append_audio_frame(
+            frame_codes: Sequence[int],
+            *,
+            anchor_group: int = -1,
+        ) -> None:
+            values = [int(code) for code in frame_codes]
+            if len(values) != len(self.audio_codebooks_used):
+                raise ValueError(
+                    f"{name}: audio frame has {len(values)} codebooks, expected "
+                    f"{len(self.audio_codebooks_used)}"
+                )
+            if self.audio_input_representation == "fused_frame":
+                append_control(MIMI_FRAME_TOKEN)
+                audio_codes[-1] = values
+                audio_anchor_ids[-1] = int(anchor_group)
+                return
+
+            # q0--q3 occur at one physical time but are serialized in stable
+            # time-major order as ordinary Qwen vocabulary tokens. Retain the
+            # complete frame codes only at q0 as side metadata so evaluation
+            # can recover one chronological audio frame without duplication.
+            for stream_index, code in enumerate(values):
+                input_ids.append(self.audio_token_ids[stream_index][code])
+                audio_codes.append(
+                    values.copy() if stream_index == 0 else empty_audio.copy()
+                )
+                target_slots.append(-1)
+                motion_local_labels.append(IGNORE_INDEX)
+                text_mask.append(0)
+                expression_mask.append(0)
+                action_mask.append(0)
+                transcript_mask.append(0)
+                bidirectional_prefix_mask.append(int(in_bidirectional_prefix))
+                audio_anchor_ids.append(int(anchor_group))
+                target_anchor_ids.append(-1)
+                gap_target_probs.append([0.0] * len(GAP_TOKENS))
+                gap_target_mask.append(0)
+
         def append_anchor(
             input_anchor: Sequence[int],
             target_anchor: Optional[Sequence[int]],
@@ -796,8 +870,7 @@ class Step1FixedGapDataset(Dataset):
         audio_cursor = 0
         if full_audio_prefix:
             for frame_codes in audio_token_codes.T:
-                append_control(MIMI_FRAME_TOKEN)
-                audio_codes[-1] = [int(code) for code in frame_codes]
+                append_audio_frame(frame_codes)
             audio_cursor = int(audio_token_codes.shape[1])
             append_control(AUDIO_END_TOKEN)
 
@@ -827,9 +900,10 @@ class Step1FixedGapDataset(Dataset):
             if not full_audio_prefix:
                 next_audio_boundary = audio_boundaries[anchor_index]
                 for frame_codes in audio_token_codes[:, audio_cursor:next_audio_boundary].T:
-                    append_control(MIMI_FRAME_TOKEN)
-                    audio_codes[-1] = [int(code) for code in frame_codes]
-                    audio_anchor_ids[-1] = anchor_index - 1
+                    append_audio_frame(
+                        frame_codes,
+                        anchor_group=anchor_index - 1,
+                    )
                 audio_cursor = next_audio_boundary
 
             gt_anchor = tuple(int(v) for v in motion_tokens[target_time])
@@ -1298,6 +1372,8 @@ class MimiQwenPlannerConfig(PretrainedConfig):
         audio_cardinality: Optional[int] = None,
         audio_codebooks_stored: Optional[int] = None,
         audio_codebooks_used: Optional[Sequence[int]] = None,
+        audio_input_representation: str = "fused_frame",
+        audio_token_ids: Optional[Sequence[Sequence[int]]] = None,
         gap_token_ids: Optional[Sequence[int]] = None,
         planner_attention_mode: str = "causal",
         **kwargs: Any,
@@ -1326,6 +1402,15 @@ class MimiQwenPlannerConfig(PretrainedConfig):
         self.mimi_cardinality = self.audio_cardinality
         self.mimi_codebooks_stored = self.audio_codebooks_stored
         self.mimi_codebooks_used = list(self.audio_codebooks_used)
+        if audio_input_representation not in AUDIO_INPUT_REPRESENTATIONS:
+            raise ValueError(
+                "audio_input_representation must be one of "
+                f"{AUDIO_INPUT_REPRESENTATIONS}, got {audio_input_representation!r}"
+            )
+        self.audio_input_representation = str(audio_input_representation)
+        self.audio_token_ids = [
+            list(map(int, row)) for row in (audio_token_ids or [])
+        ]
         self.gap_token_ids = list(map(int, gap_token_ids or []))
         if planner_attention_mode not in ATTENTION_MODES:
             raise ValueError(
@@ -1439,38 +1524,104 @@ class MimiQwenPlanner(PreTrainedModel):
         ):
             raise ValueError("Configured audio codebook index is outside the stored streams")
 
-        # Preserve the historical q0 parameter name so q0-only checkpoints remain loadable.
-        self.audio_embedding = nn.Embedding(
-            config.audio_cardinality, hidden_size, dtype=embedding_dtype
-        )
-        self.additional_audio_embeddings = nn.ModuleList(
-            nn.Embedding(config.audio_cardinality, hidden_size, dtype=embedding_dtype)
-            for _ in config.audio_codebooks_used[1:]
-        )
         codebook_count = len(config.audio_codebooks_used)
-        self.audio_fusion = (
-            nn.Linear(
-                codebook_count * hidden_size,
-                hidden_size,
-                bias=False,
-                dtype=embedding_dtype,
+        if config.audio_input_representation == "fused_frame":
+            # Preserve the historical q0 parameter name so q0-only checkpoints
+            # remain loadable without any state-dict translation.
+            self.audio_embedding = nn.Embedding(
+                config.audio_cardinality, hidden_size, dtype=embedding_dtype
             )
-            if codebook_count > 1
-            else nn.Identity()
-        )
-        initializer_range = float(getattr(language_model.config, "initializer_range", 0.02))
-        nn.init.normal_(self.audio_embedding.weight, mean=0.0, std=initializer_range)
-        for embedding in self.additional_audio_embeddings:
-            nn.init.normal_(embedding.weight, mean=0.0, std=initializer_range)
-        if isinstance(self.audio_fusion, nn.Linear):
-            # Start as a variance-preserving average while leaving the fusion learnable.
-            with torch.no_grad():
-                self.audio_fusion.weight.zero_()
-                scale = codebook_count ** -0.5
-                identity = torch.eye(hidden_size, dtype=self.audio_fusion.weight.dtype)
-                for index in range(codebook_count):
-                    left = index * hidden_size
-                    self.audio_fusion.weight[:, left : left + hidden_size].copy_(identity * scale)
+            self.additional_audio_embeddings = nn.ModuleList(
+                nn.Embedding(
+                    config.audio_cardinality,
+                    hidden_size,
+                    dtype=embedding_dtype,
+                )
+                for _ in config.audio_codebooks_used[1:]
+            )
+            self.audio_fusion = (
+                nn.Linear(
+                    codebook_count * hidden_size,
+                    hidden_size,
+                    bias=False,
+                    dtype=embedding_dtype,
+                )
+                if codebook_count > 1
+                else nn.Identity()
+            )
+            initializer_range = float(
+                getattr(language_model.config, "initializer_range", 0.02)
+            )
+            nn.init.normal_(
+                self.audio_embedding.weight,
+                mean=0.0,
+                std=initializer_range,
+            )
+            for embedding in self.additional_audio_embeddings:
+                nn.init.normal_(
+                    embedding.weight,
+                    mean=0.0,
+                    std=initializer_range,
+                )
+            if isinstance(self.audio_fusion, nn.Linear):
+                # Start as a variance-preserving average while leaving the
+                # fusion learnable.
+                with torch.no_grad():
+                    self.audio_fusion.weight.zero_()
+                    scale = codebook_count ** -0.5
+                    identity = torch.eye(
+                        hidden_size,
+                        dtype=self.audio_fusion.weight.dtype,
+                    )
+                    for index in range(codebook_count):
+                        left = index * hidden_size
+                        self.audio_fusion.weight[
+                            :, left : left + hidden_size
+                        ].copy_(identity * scale)
+            self.register_buffer(
+                "audio_token_ids",
+                torch.empty((0, 0), dtype=torch.long),
+                persistent=False,
+            )
+        else:
+            if config.audio_codec != "moss_audio_tokenizer_nano":
+                raise ValueError(
+                    "ordinary_tokens currently supports only moss_audio_tokenizer_nano"
+                )
+            if tuple(config.audio_codebooks_used) != NANO_AUDIO_CODEBOOKS:
+                raise ValueError(
+                    "ordinary_tokens requires Nano codebooks "
+                    f"{NANO_AUDIO_CODEBOOKS}, got {config.audio_codebooks_used}"
+                )
+            if int(config.audio_cardinality) != NANO_AUDIO_CARDINALITY:
+                raise ValueError(
+                    "ordinary_tokens requires Nano cardinality "
+                    f"{NANO_AUDIO_CARDINALITY}, got {config.audio_cardinality}"
+                )
+            token_ids = torch.as_tensor(config.audio_token_ids, dtype=torch.long)
+            expected = (codebook_count, config.audio_cardinality)
+            if tuple(token_ids.shape) != expected:
+                raise ValueError(
+                    f"audio_token_ids must have shape {expected}, got "
+                    f"{tuple(token_ids.shape)}"
+                )
+            if (
+                int(token_ids.min()) < 0
+                or int(token_ids.max()) >= language_model.config.vocab_size
+            ):
+                raise ValueError(
+                    "An ordinary audio token id is outside the Qwen vocabulary"
+                )
+            if int(torch.unique(token_ids).numel()) != token_ids.numel():
+                raise ValueError("Ordinary audio token ids must be unique")
+            self.audio_embedding = None
+            self.additional_audio_embeddings = nn.ModuleList()
+            self.audio_fusion = nn.Identity()
+            self.register_buffer(
+                "audio_token_ids",
+                token_ids.contiguous(),
+                persistent=False,
+            )
 
         motion_token_ids = torch.tensor(config.motion_token_ids, dtype=torch.long)
         if tuple(motion_token_ids.shape) != (BODY_SLOT_COUNT, BODY_CODEBOOK_SIZE):
@@ -1534,6 +1685,8 @@ class MimiQwenPlanner(PreTrainedModel):
         audio_cardinality: int = MIMI_CARDINALITY,
         audio_codebooks_stored: int = MIMI_STORED_CODEBOOKS,
         audio_codebooks_used: Optional[Sequence[int]] = None,
+        audio_input_representation: str = "fused_frame",
+        audio_token_ids: Optional[Sequence[Sequence[int]]] = None,
         gap_token_ids: Optional[Sequence[int]] = None,
     ) -> "MimiQwenPlanner":
         language_model = AutoModelForCausalLM.from_pretrained(
@@ -1553,6 +1706,8 @@ class MimiQwenPlanner(PreTrainedModel):
             audio_cardinality=audio_cardinality,
             audio_codebooks_stored=audio_codebooks_stored,
             audio_codebooks_used=audio_codebooks_used or mimi_codebooks_used or [0],
+            audio_input_representation=audio_input_representation,
+            audio_token_ids=audio_token_ids,
             mimi_cardinality=audio_cardinality,
             mimi_codebooks_stored=audio_codebooks_stored,
             mimi_codebooks_used=mimi_codebooks_used or [0],
@@ -1593,13 +1748,40 @@ class MimiQwenPlanner(PreTrainedModel):
         complete_code_mask = code_mask.all(dim=-1)
         if not torch.equal(code_mask.any(dim=-1), complete_code_mask):
             raise ValueError("Every audio frame must provide all configured codebooks")
-        if not torch.equal(placeholder_mask, complete_code_mask):
-            raise ValueError("audio_codes must be set exactly at [mimi_frame] placeholder positions")
         if complete_code_mask.any():
             selected = audio_codes[complete_code_mask]
             if int(selected.min()) < 0 or int(selected.max()) >= self.config.audio_cardinality:
                 raise ValueError("Audio input code is outside the configured cardinality")
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
+        if self.config.audio_input_representation == "ordinary_tokens":
+            if bool(placeholder_mask.any()):
+                raise ValueError(
+                    "ordinary_tokens input cannot contain [mimi_frame] placeholders"
+                )
+            if bool(complete_code_mask.any()):
+                positions = complete_code_mask.nonzero(as_tuple=False)
+                rows = positions[:, 0]
+                starts = positions[:, 1]
+                codebook_count = len(self.config.audio_codebooks_used)
+                if bool((starts + codebook_count > input_ids.shape[1]).any()):
+                    raise ValueError(
+                        "Ordinary audio q0 metadata points to a truncated q0--q3 block"
+                    )
+                selected_codes = audio_codes[complete_code_mask]
+                for stream_index in range(codebook_count):
+                    actual = input_ids[rows, starts + stream_index]
+                    expected = self.audio_token_ids[stream_index].index_select(
+                        0, selected_codes[:, stream_index]
+                    )
+                    if not torch.equal(actual, expected):
+                        raise ValueError(
+                            "Ordinary audio IDs do not match q0 metadata in "
+                            f"stream q{self.config.audio_codebooks_used[stream_index]}"
+                        )
+            return text_embeddings
+
+        if not torch.equal(placeholder_mask, complete_code_mask):
+            raise ValueError("audio_codes must be set exactly at [mimi_frame] placeholder positions")
         if not bool(complete_code_mask.any()):
             return text_embeddings
 

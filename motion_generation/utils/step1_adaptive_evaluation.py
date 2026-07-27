@@ -372,6 +372,31 @@ def rollout_policy_batch(
     audio_channels = int(np.asarray(examples[0].audio_codes).shape[1])
     if any(stream.shape[1] != audio_channels for stream in audio_streams):
         raise ValueError("All rollout examples must use the same audio codebooks")
+    model_config = getattr(model, "config", None)
+    audio_input_representation = str(
+        getattr(model_config, "audio_input_representation", "fused_frame")
+    )
+    if audio_input_representation not in {"fused_frame", "ordinary_tokens"}:
+        raise ValueError(
+            "Unsupported planner audio input representation: "
+            f"{audio_input_representation!r}"
+        )
+    audio_token_ids: Optional[torch.Tensor] = None
+    if audio_input_representation == "ordinary_tokens":
+        audio_token_ids = torch.as_tensor(
+            getattr(model_config, "audio_token_ids", ()),
+            dtype=torch.long,
+            device=device,
+        )
+        expected = (
+            audio_channels,
+            int(getattr(model_config, "audio_cardinality")),
+        )
+        if tuple(audio_token_ids.shape) != expected:
+            raise ValueError(
+                "Ordinary-token rollout requires config.audio_token_ids with "
+                f"shape {expected}, got {tuple(audio_token_ids.shape)}"
+            )
     prefix_width = max(len(example.initial_input_ids) for example in examples)
     input_ids = torch.full(
         (batch_size, prefix_width), pad_id, dtype=torch.long, device=device
@@ -437,7 +462,11 @@ def rollout_policy_batch(
         int(tokenizer.convert_tokens_to_ids(token)) for token in GAP_TOKENS
     ]
     anchor_token_id = int(tokenizer.convert_tokens_to_ids(ANCHOR_TOKEN))
-    audio_token_id = int(tokenizer.convert_tokens_to_ids(MIMI_FRAME_TOKEN))
+    audio_token_id = (
+        int(tokenizer.convert_tokens_to_ids(MIMI_FRAME_TOKEN))
+        if audio_input_representation == "fused_frame"
+        else None
+    )
 
     def cached_forward(
         chunk_ids: torch.Tensor,
@@ -546,7 +575,12 @@ def rollout_policy_batch(
             next_boundaries[row] = boundary
             audio_counts[row] = boundary - audio_cursors[row]
         max_audio = max(audio_counts)
-        known_width = max_audio + 2
+        audio_positions_per_frame = (
+            audio_channels
+            if audio_input_representation == "ordinary_tokens"
+            else 1
+        )
+        known_width = max_audio * audio_positions_per_frame + 2
         known_ids = torch.full(
             (batch_size, known_width),
             pad_id,
@@ -565,13 +599,44 @@ def rollout_policy_batch(
             known_mask[row, 0] = 1
             count = audio_counts[row]
             if count:
-                known_ids[row, 1 : 1 + count] = audio_token_id
-                known_audio[row, 1 : 1 + count] = torch.as_tensor(
+                frame_codes = torch.as_tensor(
                     audio_streams[row][audio_cursors[row] : next_boundaries[row]],
                     dtype=torch.long,
                     device=device,
                 )
-                known_mask[row, 1 : 1 + count] = 1
+                if audio_input_representation == "fused_frame":
+                    assert audio_token_id is not None
+                    known_ids[row, 1 : 1 + count] = audio_token_id
+                    known_audio[row, 1 : 1 + count] = frame_codes
+                    known_mask[row, 1 : 1 + count] = 1
+                else:
+                    assert audio_token_ids is not None
+                    if int(frame_codes.min()) < 0 or int(frame_codes.max()) >= int(
+                        audio_token_ids.shape[1]
+                    ):
+                        raise ValueError(
+                            f"{examples[row].name}: audio code is outside the "
+                            "ordinary-token table"
+                        )
+                    ordinary_ids = torch.stack(
+                        [
+                            audio_token_ids[codebook].index_select(
+                                0, frame_codes[:, codebook]
+                            )
+                            for codebook in range(audio_channels)
+                        ],
+                        dim=1,
+                    ).reshape(-1)
+                    width = count * audio_channels
+                    known_ids[row, 1 : 1 + width] = ordinary_ids
+                    known_mask[row, 1 : 1 + width] = 1
+                    # Keep one complete frame of metadata at its q0 token.
+                    # q1..qN are ordinary vocabulary positions and therefore
+                    # retain the -1 sentinel in ``audio_codes``.
+                    q0_positions = (
+                        torch.arange(count, device=device) * audio_channels + 1
+                    )
+                    known_audio[row, q0_positions] = frame_codes
             # Common physical column; padding before it is attention-masked.
             known_ids[row, -1] = anchor_token_id
             known_mask[row, -1] = 1

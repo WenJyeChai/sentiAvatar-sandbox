@@ -39,10 +39,13 @@ from utils.adaptive_anchor_tokens import (  # noqa: E402
     body_global_id,
     body_token,
     causal_audio_boundaries,
+    audio_token_id_table,
+    ensure_nano_audio_tokens,
     ensure_step1_special_tokens,
     fixed_anchor_times,
     gap_from_anchor_times,
     motion_token_id_table,
+    nano_audio_token,
     parse_body_token,
     split_body_global_id,
 )
@@ -467,6 +470,73 @@ def test_nano_q0_q3_contract_reads_all_16_stored_codebooks(
     assert np.array_equal(observed, nano_codes[:4].T)
 
 
+def test_nano_q0_q3_ordinary_tokens_are_time_major_and_keep_q0_metadata(
+    tmp_path: Path,
+):
+    tokenizer = AutoTokenizer.from_pretrained(
+        PROJECT_DIR / "checkpoints" / "llm",
+        local_files_only=True,
+    )
+    ensure_step1_special_tokens(tokenizer, include_structured_text=True)
+    added = ensure_nano_audio_tokens(tokenizer)
+    assert len(added) == 4 * 1_024
+    token_table = audio_token_id_table(tokenizer)
+
+    name = "nano/ordinary"
+    motion_dir, audio_dir, tokens, _ = _write_synthetic_clip(tmp_path, name)
+    nano_frames = 45
+    nano_codes = np.stack(
+        [
+            (np.arange(nano_frames, dtype=np.uint16) + codebook * 50) % 1_024
+            for codebook in range(16)
+        ]
+    )
+    np.savez_compressed(
+        audio_dir / f"{name}.npz",
+        codes=nano_codes,
+        sample_rate=np.asarray(48_000, dtype=np.int32),
+        num_samples=np.asarray(len(tokens) * 4_800, dtype=np.int64),
+        frame_rate=np.asarray(12.5, dtype=np.float32),
+        frame_size=np.asarray(3_840, dtype=np.int32),
+        num_codebooks=np.asarray(16, dtype=np.int32),
+        cardinality=np.asarray(1_024, dtype=np.int32),
+    )
+    dataset = Step1FixedGapDataset(
+        [name],
+        tokenizer=tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "ordinary Nano"},
+        audio_codec="moss_audio_tokenizer_nano",
+        audio_sample_rate=48_000,
+        audio_frame_rate=12.5,
+        audio_frame_size=3_840,
+        audio_codebooks_stored=16,
+        audio_cardinality=1_024,
+        audio_codebooks_used=[0, 1, 2, 3],
+        audio_input_representation="ordinary_tokens",
+        sequence_layout="full_audio_prefix",
+    )
+    item = dataset[0]
+    metadata = np.asarray(item["audio_codes"], dtype=np.int64)
+    starts = np.flatnonzero(np.all(metadata >= 0, axis=-1))
+    assert len(starts) == nano_frames
+    assert np.array_equal(metadata[starts], nano_codes[:4].T)
+    for frame, position in enumerate(starts):
+        expected = [
+            token_table[codebook][int(nano_codes[codebook, frame])]
+            for codebook in range(4)
+        ]
+        assert item["input_ids"][position : position + 4] == expected
+        assert np.all(metadata[position + 1 : position + 4] == -1)
+        assert all(item["bidirectional_prefix_mask"][position : position + 4])
+    assert tokenizer.encode(
+        nano_audio_token(3, 1_023),
+        add_special_tokens=False,
+    ) == [token_table[3][1_023]]
+    assert tokenizer.convert_tokens_to_ids(MIMI_FRAME_TOKEN) not in item["input_ids"]
+
+
 def test_generated_prefix_changes_inputs_but_keeps_gt_labels(tmp_path: Path, step1_tokenizer):
     name = "session/clip"
     motion_dir, audio_dir, tokens, _ = _write_synthetic_clip(tmp_path, name)
@@ -650,6 +720,56 @@ def test_tiny_prefix_lm_planner_backpropagates_without_plan_leakage():
         planner.language_model.model.layers[0].self_attn.q_proj.weight.grad
         is not None
     )
+
+
+def test_ordinary_audio_tokens_use_qwen_embeddings_without_custom_fusion():
+    body_vocabulary = BODY_SLOT_COUNT * BODY_CODEBOOK_SIZE
+    audio_ids = torch.arange(
+        body_vocabulary,
+        body_vocabulary + 4 * 1_024,
+        dtype=torch.long,
+    ).reshape(4, 1_024)
+    qwen_config = Qwen2Config(
+        vocab_size=body_vocabulary + 4 * 1_024 + 2,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        tie_word_embeddings=True,
+    )
+    language_model = AutoModelForCausalLM.from_config(qwen_config)
+    table = [
+        [body_global_id(slot, local_id) for local_id in range(BODY_CODEBOOK_SIZE)]
+        for slot in range(BODY_SLOT_COUNT)
+    ]
+    planner = MimiQwenPlanner(
+        MimiQwenPlannerConfig(
+            language_model_config=language_model.config.to_dict(),
+            audio_placeholder_id=qwen_config.vocab_size - 1,
+            motion_token_ids=table,
+            audio_codec="moss_audio_tokenizer_nano",
+            audio_sample_rate=48_000,
+            audio_frame_rate=12.5,
+            audio_frame_size=3_840,
+            audio_cardinality=1_024,
+            audio_codebooks_stored=16,
+            audio_codebooks_used=[0, 1, 2, 3],
+            audio_input_representation="ordinary_tokens",
+            audio_token_ids=audio_ids.tolist(),
+        ),
+        language_model=language_model,
+    )
+    codes = torch.tensor([[[7, 11, 13, 17]]])
+    input_ids = audio_ids[:, codes[0, 0]].diagonal().reshape(1, 4)
+    metadata = torch.full((1, 4, 4), -1, dtype=torch.long)
+    metadata[0, 0] = codes[0, 0]
+    expected = planner.language_model.get_input_embeddings()(input_ids)
+    actual = planner.prepare_input_embeddings(input_ids, metadata)
+    assert torch.equal(actual, expected)
+    assert planner.audio_embedding is None
+    assert len(planner.additional_audio_embeddings) == 0
 
 
 def test_wrapping_does_not_reinitialize_language_model():

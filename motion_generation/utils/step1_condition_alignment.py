@@ -130,17 +130,39 @@ def corrupt_audio_with_causal_past(
     target_anchor_ids: torch.Tensor,
     selected_indices: Sequence[int],
     shift_anchors: int,
+    audio_input_representation: str = "fused_frame",
+    audio_token_ids: torch.Tensor | Sequence[Sequence[int]] | None = None,
 ) -> ConditionCorruption:
     """Replace each eligible audio interval with a strictly earlier interval."""
 
     if shift_anchors <= 0:
         raise ValueError("audio shift_anchors must be positive")
+    audio_input_representation = str(audio_input_representation)
+    if audio_input_representation not in {"fused_frame", "ordinary_tokens"}:
+        raise ValueError(
+            "audio_input_representation must be fused_frame or ordinary_tokens"
+        )
     if input_ids.ndim != 2 or tuple(audio_codes.shape[:2]) != tuple(input_ids.shape):
         raise ValueError("input_ids/audio_codes must have compatible [B, L] shapes")
     if audio_anchor_ids.shape != input_ids.shape or target_anchor_ids.shape != input_ids.shape:
         raise ValueError("anchor-id tensors must share the input [B, L] shape")
+    ordinary_table: torch.Tensor | None = None
+    if audio_input_representation == "ordinary_tokens":
+        ordinary_table = torch.as_tensor(
+            audio_token_ids if audio_token_ids is not None else (),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        expected = (audio_codes.shape[-1],)
+        if ordinary_table.ndim != 2 or ordinary_table.shape[0] != expected[0]:
+            raise ValueError(
+                "ordinary audio corruption requires audio_token_ids with shape [C,V]"
+            )
+        if not ordinary_table.shape[1]:
+            raise ValueError("ordinary audio token table cannot be empty")
     original = audio_codes
     corrupted = audio_codes.clone()
+    corrupted_ids = input_ids.clone()
     target_mask = torch.zeros_like(target_anchor_ids, dtype=torch.bool)
     valid_rows: list[int] = []
     for row_value in selected_indices:
@@ -160,15 +182,88 @@ def corrupt_audio_with_causal_past(
             ).squeeze(-1)
             if not destination_positions.numel() or not source_positions.numel():
                 continue
-            source_indices = _resample_indices(
-                int(source_positions.numel()),
-                int(destination_positions.numel()),
-                audio_codes.device,
-            )
-            replacement = original[
-                row, source_positions.index_select(0, source_indices)
-            ]
-            corrupted[row, destination_positions] = replacement
+            if audio_input_representation == "fused_frame":
+                source_indices = _resample_indices(
+                    int(source_positions.numel()),
+                    int(destination_positions.numel()),
+                    audio_codes.device,
+                )
+                replacement = original[
+                    row, source_positions.index_select(0, source_indices)
+                ]
+                corrupted[row, destination_positions] = replacement
+            else:
+                assert ordinary_table is not None
+                complete = original[row].ge(0).all(dim=-1)
+                destination_starts = destination_positions[
+                    complete.index_select(0, destination_positions)
+                ]
+                source_starts = source_positions[
+                    complete.index_select(0, source_positions)
+                ]
+                codebooks = int(audio_codes.shape[-1])
+                if (
+                    int(destination_positions.numel())
+                    != int(destination_starts.numel()) * codebooks
+                    or int(source_positions.numel())
+                    != int(source_starts.numel()) * codebooks
+                ):
+                    raise ValueError(
+                        "Ordinary audio metadata must mark every q token with "
+                        "audio_anchor_ids and store frame codes only at q0"
+                    )
+                if not destination_starts.numel() or not source_starts.numel():
+                    continue
+                source_indices = _resample_indices(
+                    int(source_starts.numel()),
+                    int(destination_starts.numel()),
+                    audio_codes.device,
+                )
+                selected_source_starts = source_starts.index_select(
+                    0, source_indices
+                )
+                replacement_codes = original[row].index_select(
+                    0, selected_source_starts
+                )
+                if int(replacement_codes.min()) < 0 or int(
+                    replacement_codes.max()
+                ) >= int(ordinary_table.shape[1]):
+                    raise ValueError(
+                        "Audio code is outside the ordinary-token table"
+                    )
+                for destination_start, frame_codes in zip(
+                    destination_starts.tolist(), replacement_codes
+                ):
+                    destination_start = int(destination_start)
+                    expected_positions = torch.arange(
+                        destination_start,
+                        destination_start + codebooks,
+                        device=audio_anchor_ids.device,
+                    )
+                    if destination_start + codebooks > input_ids.shape[1] or not torch.equal(
+                        audio_anchor_ids[row].index_select(
+                            0, expected_positions
+                        ),
+                        torch.full(
+                            (codebooks,),
+                            group,
+                            dtype=audio_anchor_ids.dtype,
+                            device=audio_anchor_ids.device,
+                        ),
+                    ):
+                        raise ValueError(
+                            "Ordinary audio q0..qN tokens must be contiguous"
+                        )
+                    replacement_ids = torch.stack(
+                        [
+                            ordinary_table[codebook, frame_codes[codebook]]
+                            for codebook in range(codebooks)
+                        ]
+                    )
+                    corrupted_ids[
+                        row, destination_start : destination_start + codebooks
+                    ] = replacement_ids
+                    corrupted[row, destination_start] = frame_codes
             changed_groups.append(group)
         for group in changed_groups:
             target_mask[row] |= target_anchor_ids[row].eq(group)
@@ -176,7 +271,7 @@ def corrupt_audio_with_causal_past(
             valid_rows.append(row)
     indices = torch.as_tensor(valid_rows, dtype=torch.long, device=input_ids.device)
     return ConditionCorruption(
-        input_ids=input_ids.clone(),
+        input_ids=corrupted_ids,
         audio_codes=corrupted,
         selected_indices=indices,
         target_mask=target_mask,
@@ -210,4 +305,3 @@ def counterfactual_likelihood_loss(
     condition_gap = negative_nll - positive_nll
     loss = F.softplus(float(margin_nats) - condition_gap).mean()
     return loss, condition_gap.detach()
-

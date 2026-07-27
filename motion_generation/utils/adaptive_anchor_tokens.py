@@ -18,6 +18,10 @@ BODY_CODEBOOK_SIZE = 512
 BODY_SLOT_COUNT = len(BODY_PART_ORDER) * QUANTIZERS_PER_PART
 BODY_TOKEN_COUNT = BODY_SLOT_COUNT * BODY_CODEBOOK_SIZE
 MAX_GAP = 15
+NANO_AUDIO_CODEBOOKS = (0, 1, 2, 3)
+NANO_AUDIO_CARDINALITY = 1_024
+NANO_AUDIO_TOKEN_COUNT = len(NANO_AUDIO_CODEBOOKS) * NANO_AUDIO_CARDINALITY
+AUDIO_INPUT_REPRESENTATIONS = ("fused_frame", "ordinary_tokens")
 
 STEP1_ROLE_TOKEN = "[step1_planner]"
 MOTION_START_TOKEN = "[motion_start]"
@@ -128,6 +132,31 @@ def split_body_global_id(global_id: int) -> tuple[int, int]:
 
 def body_token(slot: int, local_id: int) -> str:
     return f"[body_{body_global_id(slot, local_id)}]"
+
+
+def nano_audio_token(codebook: int, local_id: int) -> str:
+    """Return one namespaced ordinary-vocabulary Nano RVQ token."""
+
+    if int(codebook) not in NANO_AUDIO_CODEBOOKS:
+        raise ValueError(
+            f"Nano audio codebook must be one of {NANO_AUDIO_CODEBOOKS}, got {codebook}"
+        )
+    if not 0 <= int(local_id) < NANO_AUDIO_CARDINALITY:
+        raise ValueError(
+            "Nano audio local_id must be in "
+            f"[0, {NANO_AUDIO_CARDINALITY - 1}], got {local_id}"
+        )
+    return f"[nano_audio_q{int(codebook)}_{int(local_id):04d}]"
+
+
+def nano_audio_tokens() -> tuple[str, ...]:
+    """Return the 4,096 q0--q3 tokens in stable codebook-major order."""
+
+    return tuple(
+        nano_audio_token(codebook, local_id)
+        for codebook in NANO_AUDIO_CODEBOOKS
+        for local_id in range(NANO_AUDIO_CARDINALITY)
+    )
 
 
 def parse_body_token(token: str) -> tuple[int, int]:
@@ -279,6 +308,72 @@ def ensure_step1_special_tokens(
             model.resize_token_embeddings(len(tokenizer))
     validate_body_tokenizer_contract(tokenizer)
     return missing
+
+
+def ensure_nano_audio_tokens(
+    tokenizer: Any,
+    model: Any | None = None,
+) -> list[str]:
+    """Register Nano q0--q3 as ordinary, non-special vocabulary tokens.
+
+    These symbols are conditioning inputs, not Step 1 control tokens. Keeping
+    them out of ``additional_special_tokens`` also ensures that ordinary
+    tokenizer decoding/inspection does not silently discard them.
+    """
+
+    required = nano_audio_tokens()
+    vocabulary = tokenizer.get_vocab()
+    missing = [token for token in required if token not in vocabulary]
+    if missing:
+        tokenizer.add_tokens(missing, special_tokens=False)
+        if model is not None:
+            model.resize_token_embeddings(len(tokenizer))
+    audio_token_id_table(tokenizer)
+    return missing
+
+
+def audio_token_id_table(
+    tokenizer: Any,
+    *,
+    codebooks: Sequence[int] = NANO_AUDIO_CODEBOOKS,
+    cardinality: int = NANO_AUDIO_CARDINALITY,
+) -> list[list[int]]:
+    """Return ``[configured codebook][local id]`` ordinary-token IDs."""
+
+    codebooks = tuple(int(value) for value in codebooks)
+    cardinality = int(cardinality)
+    if codebooks != NANO_AUDIO_CODEBOOKS:
+        raise ValueError(
+            "Ordinary Nano audio tokens require codebooks "
+            f"{NANO_AUDIO_CODEBOOKS}, got {codebooks}"
+        )
+    if cardinality != NANO_AUDIO_CARDINALITY:
+        raise ValueError(
+            "Ordinary Nano audio tokens require cardinality "
+            f"{NANO_AUDIO_CARDINALITY}, got {cardinality}"
+        )
+    vocabulary = tokenizer.get_vocab()
+    rows: list[list[int]] = []
+    for codebook in codebooks:
+        row = []
+        for local_id in range(cardinality):
+            token = nano_audio_token(codebook, local_id)
+            if token not in vocabulary:
+                raise ValueError(f"Tokenizer is missing required Nano audio token {token}")
+            token_id = int(vocabulary[token])
+            encoded = tokenizer.encode(token, add_special_tokens=False)
+            if encoded != [token_id]:
+                raise ValueError(
+                    f"{token} is not represented by exactly one tokenizer id: {encoded}"
+                )
+            row.append(token_id)
+        rows.append(row)
+    flat = [token_id for row in rows for token_id in row]
+    if len(set(flat)) != NANO_AUDIO_TOKEN_COUNT:
+        raise ValueError(
+            f"The {NANO_AUDIO_TOKEN_COUNT:,} Nano audio tokens do not map to unique IDs"
+        )
+    return rows
 
 
 def validate_body_tokenizer_contract(tokenizer: Any) -> None:

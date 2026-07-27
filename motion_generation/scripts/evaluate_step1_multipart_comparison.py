@@ -317,6 +317,9 @@ def main() -> None:
                 "audio_cardinality": int(candidate_audio["cardinality"]),
                 "audio_codebooks_stored": int(candidate_audio["stored_codebooks"]),
                 "audio_codebooks_used": json.dumps(list(codebooks)),
+                "audio_input_representation": str(
+                    candidate_audio.get("input_representation", "fused_frame")
+                ),
                 # Kept so older notebooks reading this column continue to work.
                 "mimi_codebooks_used": json.dumps(list(codebooks)),
                 "generated_history_enabled": bool(candidate_generated.get("enabled", False)),
