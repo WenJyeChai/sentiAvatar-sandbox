@@ -1,0 +1,140 @@
+paths:
+  # 100-epoch continuation of the ordinary-token audio ablation. Initialize
+  # from the motion-foundation Qwen checkpoint, not from a completed Step 1 run.
+  base_model: checkpoints/llm
+  output_dir: checkpoints/step1_offline_dp_full_audio_teacher100_nano_q0q3_vocab
+  data_dir: SuSuInterActs/SuSuInterActs
+  motion_token_dir: SuSuInterActs/SuSuInterActs/motion_token_data_multipart_causal_512x4
+  audio_token_dir: SuSuInterActs/SuSuInterActs/audio_tokens_moss_nano_48k_12p5hz_16cb
+  text_json: SuSuInterActs/SuSuInterActs/text_data/motion2text.json
+  train_split: SuSuInterActs/SuSuInterActs/split/train_file_list.txt
+  eval_split: SuSuInterActs/SuSuInterActs/split/val_file_list.txt
+
+data:
+  fixed_gap: 3
+  # Four ordinary vocabulary positions represent every Nano frame. Never
+  # truncate anchor supervision; the full preflight must certify this bound.
+  max_length: 4096
+  num_workers: 4
+  persistent_workers: false
+  require_causal_motion: true
+  max_duration_mismatch_seconds: 0.12
+  seed_mode: mixed_known
+  neutral_seed_json: null
+  neutral_seed_probability: 0.5
+  previous_seed_probability: 0.5
+  generated_anchor_dir: null
+  generated_prefix_probability: 0.0
+
+audio:
+  codec: moss_audio_tokenizer_nano
+  sample_rate: 48000
+  frame_rate: 12.5
+  frame_size: 3840
+  stored_codebooks: 16
+  cardinality: 1024
+  codebooks_used: [0, 1, 2, 3]
+  input_representation: ordinary_tokens
+
+text:
+  serialization: structured_fields
+  fields: [expression, action, transcript]
+  missing_markers: true
+
+planner_context:
+  # All text/audio plus the seed form a bidirectional prefix. The gap/anchor
+  # plan remains autoregressive.
+  attention_mode: prefix_lm
+  sequence_layout: full_audio_prefix
+
+adaptive_gap:
+  enabled: true
+  calibration_json: checkpoints/step1_adaptive_gap_oracle/calibration.json
+  # Keep the original Phases 1-3 unchanged and spend the additional training
+  # budget in the final, fully adaptive phase.
+  phases:
+    - start_epoch: 1
+      end_epoch: 5
+      mode: random
+      min_gap: 3
+      max_gap: 7
+      target_mean_gap: null
+      schedule_loss_weight: 0.0
+      temperature: 0.50
+    - start_epoch: 6
+      end_epoch: 12
+      mode: step2_dp
+      min_gap: 3
+      max_gap: 7
+      target_mean_gap: 4.5
+      schedule_loss_weight_start: 0.0
+      schedule_loss_weight_end: 1.0
+      temperature: 0.50
+    - start_epoch: 13
+      end_epoch: 25
+      mode: step2_dp
+      min_gap: 3
+      max_gap: 11
+      target_mean_gap: 6.0
+      schedule_loss_weight: 1.0
+      temperature: 0.40
+    - start_epoch: 26
+      end_epoch: 100
+      mode: step2_dp
+      min_gap: 3
+      max_gap: 15
+      target_mean_gap: 7.0
+      schedule_loss_weight: 1.0
+      temperature: 0.35
+
+generated_history:
+  enabled: false
+
+visited_state_guidance:
+  enabled: false
+
+frozen_step2_guidance:
+  enabled: false
+
+auxiliary_loss:
+  type: none
+
+condition_alignment:
+  enabled: false
+  evaluate: false
+  modalities: []
+  eval_modalities: []
+
+training:
+  seed: 42
+  num_train_epochs: 100
+  # Effective global batch: 8 examples/GPU x 4 GPUs x 4 microsteps = 128.
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  adam_betas: [0.9, 0.95]
+  adam_epsilon: 1.0e-8
+  # Warm up for epochs 1-25. The LR reaches 2e-5 when Phase 4 begins at
+  # epoch 26, then follows cosine decay for the remaining 75 epochs.
+  warmup_ratio: 0.25
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 10
+  eval_steps: 0
+  # Approximately 149 optimizer updates/epoch; save every five epochs.
+  save_steps: 745
+  save_best: true
+  milestone_epochs: [5, 12, 25, 50, 75, 100]
+  early_stopping_patience: 0
+
+monitoring:
+  report_to: wandb
+  wandb_project: sentiavatar-step1-planner
+  wandb_run_name: step1_offline_dp_full_audio_teacher100_nano_q0q3_vocab
+  wandb_tags:
+    [phase1, offline-teacher, full-audio, prefix-lm, adaptive-gap, dp-oracle, full-data, nano, q0q3, ordinary-audio-tokens, structured-text, 100-epochs, long-warmup]
+  wandb_mode: online
+  wandb_entity: null
