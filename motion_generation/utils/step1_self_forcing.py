@@ -290,6 +290,15 @@ def generate_history_batch(
     """
 
     _validate_rollout_tensors(input_ids, attention_mask, audio_codes, target_slots)
+    if (
+        str(getattr(model.config, "planner_attention_mode", "causal"))
+        == "segment_causal"
+    ):
+        raise ValueError(
+            "The sparse generated-history KV rollout is not valid for a "
+            "segment-causal checkpoint. Use the interval/Step-2 closed-loop "
+            "evaluator so each target receives its own dense history and audio."
+        )
     ordinary_audio_tokens = (
         str(getattr(model.config, "audio_input_representation", "fused_frame"))
         == "ordinary_tokens"

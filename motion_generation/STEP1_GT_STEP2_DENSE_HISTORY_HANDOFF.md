@@ -2,18 +2,18 @@
 
 ## Purpose
 
-This experiment changes the motion history seen by the Stage 1 anchor
-predictor. Instead of conditioning only on previous sparse anchors, the
-candidate receives a recent contiguous suffix of motion completed by the
-frozen Step 2 model.
+This experiment changes both motion history and audio visibility for the
+Stage 1 anchor predictor. Previous sparse anchors are blocked from later
+targets. Each target receives a recent contiguous suffix of motion completed
+by frozen Step 2 and only its own aligned audio interval.
 
 It tests one precise hypothesis:
 
 > Does local dense motion continuity make the next multipart anchor easier to
 > predict than a sparse sequence of earlier anchors?
 
-It does **not** learn gap placement. Every next gap is supplied as an input.
-Only the 16 IDs of each next anchor receive cross-entropy supervision.
+It does **not** learn gap placement. Every next gap is a supplied, unsupervised
+control. Only the 16 IDs of each next anchor receive cross-entropy.
 
 ## Exact causal contract
 
@@ -29,29 +29,53 @@ Before predicting `a(i+1)`, the serializer samples a contiguous suffix of
 There is no special GT-boundary token: the last frame has the same
 representation as every other dense motion frame.
 
-The resulting plan section is conceptually:
+All intervals remain physically packed in one utterance record:
 
 ```text
 [seed_observed] <16 seed IDs>
-[gap_g0] <16 target anchor a1 IDs>
+
+<Nano q0-q3 audio aligned from a0 to a1>
+[gap_g0]                         # input only; ignored label
+[anchor] <16 target a1 IDs>      # supervised
+
 [step2_history_start]
-  [motion_history_frame] <16 Step 2/endpoint IDs>
+  [motion_history_frame] <16 Step 2 IDs>
   ...
+  [motion_history_frame] <16 IDs ending at a1>
 [step2_history_end]
-[gap_g1] <16 target anchor a2 IDs>
+<Nano q0-q3 audio aligned from a1 to a2>
+[gap_g1]                         # input only; ignored label
+[anchor] <16 target a2 IDs>      # supervised
 ...
 ```
 
-All tokens between `step2_history_start` and `step2_history_end` have ignored
-labels. The preflight explicitly checks that the number of supervised
-positions remains exactly:
+For each Nano frame, q0, q1, q2 and q3 are ordinary vocabulary tokens in
+time-major order. The sum of all interval chunks equals the utterance audio,
+but the segment-causal attention mask prevents a target from reading any
+other interval.
+
+The mask permits a target to read:
+
+- complete structured text;
+- the observed seed;
+- previous supplied gap controls;
+- its current Step 2 history;
+- its own aligned audio interval;
+- earlier slots of the same 16-ID anchor.
+
+It blocks previous sparse anchors, previous audio intervals, and obsolete
+history blocks. Thus earlier anchor IDs remain physically present for their
+own teacher-forced loss but are not causal context for a later target.
+
+Text, seed, audio, gaps, history, and control markers all have ignored labels.
+The preflight checks that supervised positions remain exactly:
 
 ```text
 (number of anchors - 1) * 16
 ```
 
-Complete structured text and Nano q0--q3 audio are known in the prefix-LM
-condition. Motion history itself remains strictly causal.
+There is no gap CE, latent loss, frozen-Step-2 online loss, or generated
+history loss in this Stage 1 run.
 
 ## Robustness corruption
 
@@ -175,8 +199,8 @@ python motion_generation/scripts/validate_step1_fixed_gap_data.py \
 ```
 
 Do not train unless the result ends in `GO`. Inspect the reported dense-history
-frame and corrupted-token distributions as well as the maximum sequence
-length.
+frame and corrupted-token distributions, target-interval audio lengths,
+`supervised_gap_tokens` (which must be zero), and maximum sequence length.
 
 ## One-GPU smoke training
 
@@ -199,6 +223,9 @@ Dense corruption: enabled=True, examples=50%, rate=5%-15%, preserve_endpoint=Tru
 Gap supervision: disabled
 ```
 
+The serialized example and config must also report
+`segment_causal+interval_audio_isolated`.
+
 ## Full four-GPU candidate
 
 Do not pass `--init_from_checkpoint`; the YAML intentionally initializes from
@@ -213,10 +240,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun \
 
 ## Matched sparse-history control
 
-The control reads the same cached schedules, uses the same target anchors,
-registers the same added vocabulary, and starts independently from
-`checkpoints/llm`. Its sole intentional difference is omission of the dense
-history blocks.
+The control reads the same cached schedules, uses the same target-aligned
+audio, segment mask, targets and added vocabulary, and starts independently
+from `checkpoints/llm`. Its sole intentional difference is omission of the
+dense history blocks. Because previous sparse anchors are blocked in both
+runs, this is a deliberately difficult but clean history ablation.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun \

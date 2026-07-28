@@ -40,8 +40,8 @@ text:
   missing_markers: true
 
 planner_context:
-  attention_mode: prefix_lm
-  sequence_layout: full_audio_prefix
+  attention_mode: segment_causal
+  sequence_layout: interval_audio_isolated
 
 provided_gap_training:
   enabled: true
@@ -111,6 +111,6 @@ monitoring:
   wandb_project: sentiavatar-step1-planner
   wandb_run_name: step1_stage1_cached_schedule_sparse_control100
   wandb_tags:
-    [step1, stage1, control, sparse-history, anchor-ce-only, cached-schedule, supplied-gap, uniform-gap, full-audio, prefix-lm, nano, q0q3, 100-epochs]
+    [step1, stage1, control, sparse-history, anchor-ce-only, cached-schedule, supplied-gap, gap-unsupervised, uniform-gap, interval-audio, segment-causal, sparse-anchor-blocked, nano, q0q3, 100-epochs]
   wandb_mode: online
   wandb_entity: null

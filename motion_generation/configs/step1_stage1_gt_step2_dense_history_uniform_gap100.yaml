@@ -42,9 +42,11 @@ text:
   missing_markers: true
 
 planner_context:
-  # The teacher sees complete text/audio. Generated motion remains causal.
-  attention_mode: prefix_lm
-  sequence_layout: full_audio_prefix
+  # All intervals remain packed in one utterance record. Each target can see
+  # global text/seed, previous supplied gaps, its current dense history, and
+  # only its own aligned audio interval. Previous sparse anchors are masked.
+  attention_mode: segment_causal
+  sequence_layout: interval_audio_isolated
 
 provided_gap_training:
   enabled: true
@@ -127,6 +129,6 @@ monitoring:
   wandb_project: sentiavatar-step1-planner
   wandb_run_name: step1_stage1_gt_step2_dense_history_uniform_gap100
   wandb_tags:
-    [step1, stage1, anchor-ce-only, gt-boundary, step2-history, dense-history, history-corruption, supplied-gap, uniform-gap, full-audio, prefix-lm, nano, q0q3, 100-epochs]
+    [step1, stage1, anchor-ce-only, gt-boundary, step2-history, dense-history, history-corruption, supplied-gap, gap-unsupervised, uniform-gap, interval-audio, segment-causal, sparse-anchor-blocked, nano, q0q3, 100-epochs]
   wandb_mode: online
   wandb_entity: null

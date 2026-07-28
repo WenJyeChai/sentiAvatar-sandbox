@@ -25,6 +25,7 @@ from models.step1_mimi_planner import (  # noqa: E402
     Step1PlannerCollator,
     Step1ProvidedGapDataset,
     build_prefix_lm_attention_mask,
+    build_segment_causal_attention_mask,
     parse_structured_text,
 )
 from utils.adaptive_anchor_tokens import (  # noqa: E402
@@ -241,6 +242,34 @@ def test_prefix_lm_mask_has_bidirectional_prefix_and_causal_plan():
     assert allowed[5].tolist() == [True, True, True, True, True, False]
 
 
+def test_segment_causal_mask_hides_previous_anchor_and_audio_but_keeps_gaps():
+    attention = torch.ones((1, 8), dtype=torch.long)
+    # global text/seed, then two local interval segments
+    segments = torch.tensor([[0, 0, 1, 1, 1, 2, 2, 2]])
+    retained_gaps = torch.tensor(
+        [[0, 0, 0, 1, 0, 0, 1, 0]],
+        dtype=torch.bool,
+    )
+    allowed = build_segment_causal_attention_mask(
+        attention,
+        segments,
+        retained_gaps,
+        dtype=torch.float32,
+    )[0, 0].eq(0)
+    # The last anchor query sees global context, the previous gap, and its own
+    # interval. It cannot see the previous interval's audio or sparse anchor.
+    assert allowed[7].tolist() == [
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+        True,
+        True,
+    ]
+
+
 def test_gt_boundary_step2_history_is_dense_causal_context_only(
     tmp_path: Path,
 ):
@@ -310,7 +339,7 @@ def test_gt_boundary_step2_history_is_dense_causal_context_only(
         max_gap=15,
         resample_each_epoch=False,
         seed_mode="observed",
-        sequence_layout="full_audio_prefix",
+        sequence_layout="interval_audio_isolated",
         provided_schedule_cache_dir=cache_root,
         step2_history_cache_dir=cache_root,
         step2_history_min_frames=1,
@@ -324,6 +353,28 @@ def test_gt_boundary_step2_history_is_dense_causal_context_only(
     assert sum(slot >= 0 for slot in item["target_slots"]) == (
         len(anchors) - 1
     ) * BODY_SLOT_COUNT
+    assert not any(item["gap_target_mask"])
+    assert sum(item["planner_gap_context_mask"]) == len(anchors) - 1
+    assert set(item["planner_segment_ids"]) == set(range(len(anchors)))
+    for anchor_group in range(len(anchors) - 1):
+        expected_audio_positions = (
+            item["audio_boundaries"][anchor_group + 1]
+            - item["audio_boundaries"][anchor_group]
+        ) * len(dataset.audio_codebooks_used)
+        assert (
+            item["audio_anchor_ids"].count(anchor_group)
+            == expected_audio_positions
+        )
+        target_positions = [
+            position
+            for position, group in enumerate(item["target_anchor_ids"])
+            if group == anchor_group
+        ]
+        assert len(target_positions) == BODY_SLOT_COUNT
+        assert {
+            item["planner_segment_ids"][position]
+            for position in target_positions
+        } == {anchor_group + 1}
 
     start_id = tokenizer.convert_tokens_to_ids(STEP2_HISTORY_START_TOKEN)
     end_id = tokenizer.convert_tokens_to_ids(STEP2_HISTORY_END_TOKEN)
@@ -373,7 +424,7 @@ def test_gt_boundary_step2_history_is_dense_causal_context_only(
         max_gap=15,
         resample_each_epoch=False,
         seed_mode="observed",
-        sequence_layout="full_audio_prefix",
+        sequence_layout="interval_audio_isolated",
         provided_schedule_cache_dir=cache_root,
     )[0]
     assert control["anchor_times"] == item["anchor_times"]
@@ -381,6 +432,44 @@ def test_gt_boundary_step2_history_is_dense_causal_context_only(
     assert sum(slot >= 0 for slot in control["target_slots"]) == sum(
         slot >= 0 for slot in item["target_slots"]
     )
+
+    attention = torch.ones((1, len(item["input_ids"])), dtype=torch.long)
+    allowed = build_segment_causal_attention_mask(
+        attention,
+        torch.tensor([item["planner_segment_ids"]]),
+        torch.tensor([item["planner_gap_context_mask"]], dtype=torch.bool),
+        dtype=torch.float32,
+    )[0, 0].eq(0)
+    second_target = next(
+        position
+        for position, group in enumerate(item["target_anchor_ids"])
+        if group == 1
+    )
+    first_target = next(
+        position
+        for position, group in enumerate(item["target_anchor_ids"])
+        if group == 0
+    )
+    first_audio = next(
+        position
+        for position, group in enumerate(item["audio_anchor_ids"])
+        if group == 0
+    )
+    second_audio = next(
+        position
+        for position, group in enumerate(item["audio_anchor_ids"])
+        if group == 1
+    )
+    previous_gap = next(
+        position
+        for position, value in enumerate(item["planner_gap_context_mask"])
+        if value
+    )
+    assert not allowed[second_target, first_target]
+    assert not allowed[second_target, first_audio]
+    assert allowed[second_target, second_audio]
+    assert allowed[second_target, previous_gap]
+    assert allowed[second_target, 0]
 
 
 def test_step2_history_corruption_preserves_gt_endpoint(tmp_path: Path):
@@ -1006,6 +1095,45 @@ def test_tiny_prefix_lm_planner_backpropagates_without_plan_leakage():
         target_slots=target_slots,
         motion_local_labels=motion_labels,
         bidirectional_prefix_mask=prefix,
+    )
+    assert torch.isfinite(output.loss)
+    assert int(output.gap_count) == 0
+    assert torch.allclose(output.loss, output.ce_loss)
+    output.loss.backward()
+    assert (
+        planner.language_model.model.layers[0].self_attn.q_proj.weight.grad
+        is not None
+    )
+
+
+def test_tiny_segment_causal_planner_backpropagates_anchor_ce_only():
+    planner = _tiny_planner("segment_causal")
+    labels = torch.tensor(
+        [(slot * 17 + 3) % BODY_CODEBOOK_SIZE for slot in range(BODY_SLOT_COUNT)]
+    )
+    input_ids = torch.zeros((1, 22), dtype=torch.long)
+    for slot in range(BODY_SLOT_COUNT):
+        input_ids[0, 5 + slot] = planner.motion_token_ids[slot, labels[slot]]
+    target_slots = torch.full_like(input_ids, -1)
+    target_slots[0, 5:21] = torch.arange(BODY_SLOT_COUNT)
+    motion_labels = torch.full_like(input_ids, IGNORE_INDEX)
+    motion_labels[0, 5:21] = labels
+    segments = torch.ones_like(input_ids)
+    segments[:, :4] = 0
+    retained_gaps = torch.zeros_like(input_ids, dtype=torch.bool)
+    retained_gaps[:, 4] = True
+    output = planner(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        audio_codes=torch.full_like(input_ids, -1),
+        target_slots=target_slots,
+        motion_local_labels=motion_labels,
+        bidirectional_prefix_mask=torch.zeros_like(
+            input_ids,
+            dtype=torch.bool,
+        ),
+        planner_segment_ids=segments,
+        planner_gap_context_mask=retained_gaps,
     )
     assert torch.isfinite(output.loss)
     assert int(output.gap_count) == 0

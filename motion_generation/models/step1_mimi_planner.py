@@ -82,8 +82,12 @@ MIMI_FRAME_SIZE = 1_920
 MIMI_CARDINALITY = 2_048
 MIMI_STORED_CODEBOOKS = 8
 MOTION_TOKEN_FPS = 10.0
-SEQUENCE_LAYOUTS = ("causal_interleaved", "full_audio_prefix")
-ATTENTION_MODES = ("causal", "prefix_lm")
+SEQUENCE_LAYOUTS = (
+    "causal_interleaved",
+    "full_audio_prefix",
+    "interval_audio_isolated",
+)
+ATTENTION_MODES = ("causal", "prefix_lm", "segment_causal")
 STRUCTURED_TAG_PATTERN = re.compile(r"【\s*(表情|动作)\s*[:：]\s*(.*?)\s*】")
 
 
@@ -249,6 +253,8 @@ class Step1Sequence:
     action_mask: list[int]
     transcript_mask: list[int]
     bidirectional_prefix_mask: list[int]
+    planner_segment_ids: list[int]
+    planner_gap_context_mask: list[int]
     audio_anchor_ids: list[int]
     target_anchor_ids: list[int]
     anchor_times: tuple[int, ...]
@@ -276,8 +282,10 @@ class Step1FixedGapDataset(Dataset):
     ``causal_interleaved`` retains the online student contract: a gap control is
     followed by only the newly available audio frames and then a 16-slot
     anchor. ``full_audio_prefix`` places all text/audio plus the known seed in
-    one prefix before the causal plan. The model makes only that prefix
-    bidirectional, so no target motion can leak into the condition block.
+    one prefix before the causal plan. ``interval_audio_isolated`` packs all
+    intervals into one utterance record but assigns a new attention segment to
+    each interval. Later intervals can see global text/seed and preceding gap
+    controls, but not earlier audio, dense histories, or sparse anchors.
     """
 
     def __init__(
@@ -977,6 +985,8 @@ class Step1FixedGapDataset(Dataset):
             "action_mask": sequence.action_mask,
             "transcript_mask": sequence.transcript_mask,
             "bidirectional_prefix_mask": sequence.bidirectional_prefix_mask,
+            "planner_segment_ids": sequence.planner_segment_ids,
+            "planner_gap_context_mask": sequence.planner_gap_context_mask,
             "audio_anchor_ids": sequence.audio_anchor_ids,
             "target_anchor_ids": sequence.target_anchor_ids,
             "anchor_times": sequence.anchor_times,
@@ -1070,14 +1080,26 @@ class Step1FixedGapDataset(Dataset):
         target_slots = [-1] * len(input_ids)
         motion_local_labels = [IGNORE_INDEX] * len(input_ids)
         full_audio_prefix = self.sequence_layout == "full_audio_prefix"
+        interval_audio_isolated = (
+            self.sequence_layout == "interval_audio_isolated"
+        )
         bidirectional_prefix_mask = [int(full_audio_prefix)] * len(input_ids)
+        # Segment zero is the globally visible text/seed context. Positive
+        # segment IDs isolate one target interval from every other interval.
+        planner_segment_ids = [0] * len(input_ids)
+        planner_gap_context_mask = [0] * len(input_ids)
         audio_anchor_ids = [-1] * len(input_ids)
         target_anchor_ids = [-1] * len(input_ids)
         gap_target_probs = [[0.0] * len(GAP_TOKENS) for _ in input_ids]
         gap_target_mask = [0] * len(input_ids)
         in_bidirectional_prefix = full_audio_prefix
+        current_segment_id = 0
 
-        def append_control(token: str) -> None:
+        def append_control(
+            token: str,
+            *,
+            retain_as_gap_context: bool = False,
+        ) -> None:
             input_ids.append(self._single_token_ids[token])
             audio_codes.append(empty_audio.copy())
             target_slots.append(-1)
@@ -1087,6 +1109,10 @@ class Step1FixedGapDataset(Dataset):
             action_mask.append(0)
             transcript_mask.append(0)
             bidirectional_prefix_mask.append(int(in_bidirectional_prefix))
+            planner_segment_ids.append(int(current_segment_id))
+            planner_gap_context_mask.append(
+                int(retain_as_gap_context)
+            )
             audio_anchor_ids.append(-1)
             target_anchor_ids.append(-1)
             gap_target_probs.append([0.0] * len(GAP_TOKENS))
@@ -1125,6 +1151,8 @@ class Step1FixedGapDataset(Dataset):
                 action_mask.append(0)
                 transcript_mask.append(0)
                 bidirectional_prefix_mask.append(int(in_bidirectional_prefix))
+                planner_segment_ids.append(int(current_segment_id))
+                planner_gap_context_mask.append(0)
                 audio_anchor_ids.append(int(anchor_group))
                 target_anchor_ids.append(-1)
                 gap_target_probs.append([0.0] * len(GAP_TOKENS))
@@ -1150,6 +1178,8 @@ class Step1FixedGapDataset(Dataset):
                 action_mask.append(0)
                 transcript_mask.append(0)
                 bidirectional_prefix_mask.append(int(in_bidirectional_prefix))
+                planner_segment_ids.append(int(current_segment_id))
+                planner_gap_context_mask.append(0)
                 audio_anchor_ids.append(-1)
                 gap_target_probs.append([0.0] * len(GAP_TOKENS))
                 gap_target_mask.append(0)
@@ -1204,6 +1234,8 @@ class Step1FixedGapDataset(Dataset):
                     bidirectional_prefix_mask.append(
                         int(in_bidirectional_prefix)
                     )
+                    planner_segment_ids.append(int(current_segment_id))
+                    planner_gap_context_mask.append(0)
                     audio_anchor_ids.append(-1)
                     target_anchor_ids.append(-1)
                     gap_target_probs.append([0.0] * len(GAP_TOKENS))
@@ -1227,6 +1259,8 @@ class Step1FixedGapDataset(Dataset):
 
         generated_prefix_anchors = 0
         for anchor_index in range(1, len(anchor_times)):
+            if interval_audio_isolated:
+                current_segment_id = anchor_index
             if (
                 self.step2_history_cache_dir is not None
                 and anchor_index >= 2
@@ -1249,7 +1283,20 @@ class Step1FixedGapDataset(Dataset):
             left_time = anchor_times[anchor_index - 1]
             target_time = anchor_times[anchor_index]
             gap = gap_from_anchor_times(left_time, target_time)
-            append_control(GAP_TOKENS[gap])
+            if interval_audio_isolated:
+                next_audio_boundary = audio_boundaries[anchor_index]
+                for frame_codes in audio_token_codes[
+                    :, audio_cursor:next_audio_boundary
+                ].T:
+                    append_audio_frame(
+                        frame_codes,
+                        anchor_group=anchor_index - 1,
+                    )
+                audio_cursor = next_audio_boundary
+            append_control(
+                GAP_TOKENS[gap],
+                retain_as_gap_context=interval_audio_isolated,
+            )
             soft_target = schedule.soft_targets_by_left.get(left_time)
             if soft_target is not None:
                 if len(soft_target) != len(GAP_TOKENS):
@@ -1259,7 +1306,7 @@ class Step1FixedGapDataset(Dataset):
                     )
                 gap_target_probs[-1] = [float(value) for value in soft_target]
                 gap_target_mask[-1] = 1
-            if not full_audio_prefix:
+            if not full_audio_prefix and not interval_audio_isolated:
                 next_audio_boundary = audio_boundaries[anchor_index]
                 for frame_codes in audio_token_codes[:, audio_cursor:next_audio_boundary].T:
                     append_audio_frame(
@@ -1291,6 +1338,7 @@ class Step1FixedGapDataset(Dataset):
                 f"{audio_cursor}/{audio_token_codes.shape[1]}"
             )
         if not full_audio_prefix:
+            current_segment_id = 0
             append_control(AUDIO_END_TOKEN)
         append_control(MOTION_END_TOKEN)
         input_ids.append(int(im_end_ids[0]))
@@ -1302,6 +1350,8 @@ class Step1FixedGapDataset(Dataset):
         action_mask.append(0)
         transcript_mask.append(0)
         bidirectional_prefix_mask.append(0)
+        planner_segment_ids.append(0)
+        planner_gap_context_mask.append(0)
         audio_anchor_ids.append(-1)
         target_anchor_ids.append(-1)
         gap_target_probs.append([0.0] * len(GAP_TOKENS))
@@ -1317,6 +1367,8 @@ class Step1FixedGapDataset(Dataset):
             len(action_mask),
             len(transcript_mask),
             len(bidirectional_prefix_mask),
+            len(planner_segment_ids),
+            len(planner_gap_context_mask),
             len(audio_anchor_ids),
             len(target_anchor_ids),
             len(gap_target_probs),
@@ -1341,6 +1393,25 @@ class Step1FixedGapDataset(Dataset):
             raise AssertionError(
                 f"{name}: causal layout unexpectedly marks a bidirectional prefix"
             )
+        if interval_audio_isolated:
+            if any(segment < 0 for segment in planner_segment_ids):
+                raise AssertionError(
+                    f"{name}: interval layout contains a negative segment ID"
+                )
+            gap_positions = [
+                position
+                for position, is_gap in enumerate(planner_gap_context_mask)
+                if is_gap
+            ]
+            if len(gap_positions) != len(anchor_times) - 1:
+                raise AssertionError(
+                    f"{name}: expected {len(anchor_times) - 1} retained gap "
+                    f"controls, found {len(gap_positions)}"
+                )
+            if any(gap_target_mask):
+                raise AssertionError(
+                    f"{name}: interval Stage 1 must not supervise gap tokens"
+                )
         if len(input_ids) > self.max_length:
             raise ValueError(
                 f"Serialized sequence for {name} has {len(input_ids)} tokens, exceeding "
@@ -1366,6 +1437,8 @@ class Step1FixedGapDataset(Dataset):
             action_mask=action_mask,
             transcript_mask=transcript_mask,
             bidirectional_prefix_mask=bidirectional_prefix_mask,
+            planner_segment_ids=planner_segment_ids,
+            planner_gap_context_mask=planner_gap_context_mask,
             audio_anchor_ids=audio_anchor_ids,
             target_anchor_ids=target_anchor_ids,
             anchor_times=anchor_times,
@@ -1641,6 +1714,12 @@ class Step1PlannerCollator:
             "bidirectional_prefix_mask": padded_optional(
                 "bidirectional_prefix_mask", 0
             ).bool(),
+            "planner_segment_ids": padded_optional(
+                "planner_segment_ids", -1
+            ),
+            "planner_gap_context_mask": padded_optional(
+                "planner_gap_context_mask", 0
+            ).bool(),
             "audio_anchor_ids": padded_optional("audio_anchor_ids", -1),
             "target_anchor_ids": padded_optional("target_anchor_ids", -1),
             "names": [str(example["name"]) for example in examples],
@@ -1909,6 +1988,73 @@ def build_prefix_lm_attention_mask(
     return additive.masked_fill(~allowed.unsqueeze(1), torch.finfo(dtype).min)
 
 
+def build_segment_causal_attention_mask(
+    attention_mask: torch.Tensor,
+    planner_segment_ids: torch.Tensor,
+    planner_gap_context_mask: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build causal attention with shared global and retained-gap keys.
+
+    Segment zero is global structured text/seed context. Positive IDs identify
+    one target interval. A local query may read causal keys from its own
+    interval, any global key, and earlier supplied gap controls. It cannot read
+    audio, dense history, or sparse-anchor keys owned by another interval.
+    """
+
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must have shape [B,L]")
+    if tuple(planner_segment_ids.shape) != tuple(attention_mask.shape):
+        raise ValueError(
+            "planner_segment_ids must have the same [B,L] shape as attention_mask"
+        )
+    if tuple(planner_gap_context_mask.shape) != tuple(attention_mask.shape):
+        raise ValueError(
+            "planner_gap_context_mask must have the same [B,L] shape as attention_mask"
+        )
+    if not dtype.is_floating_point:
+        raise ValueError(
+            "Segment-causal additive mask requires a floating-point dtype"
+        )
+    valid = attention_mask.bool()
+    segments = planner_segment_ids.long()
+    retained_gap = planner_gap_context_mask.bool()
+    if bool((valid & segments.lt(0)).any()):
+        raise ValueError("Every non-padding token requires a non-negative segment ID")
+    if bool((retained_gap & ~valid).any()):
+        raise ValueError("A padded token cannot be retained as gap context")
+    if bool((retained_gap & segments.eq(0)).any()):
+        raise ValueError("Retained gap controls must belong to a local interval")
+
+    length = attention_mask.shape[1]
+    positions = torch.arange(length, device=attention_mask.device)
+    causal = positions.view(1, -1, 1) >= positions.view(1, 1, -1)
+    query_segments = segments.unsqueeze(2)
+    key_segments = segments.unsqueeze(1)
+    same_segment = query_segments.eq(key_segments)
+    globally_visible_key = segments.eq(0).unsqueeze(1)
+    retained_gap_key = retained_gap.unsqueeze(1)
+    allowed_key_type = (
+        same_segment | globally_visible_key | retained_gap_key
+    )
+    allowed = causal & allowed_key_type & valid.unsqueeze(1)
+    additive = torch.zeros(
+        (
+            attention_mask.shape[0],
+            1,
+            length,
+            length,
+        ),
+        dtype=dtype,
+        device=attention_mask.device,
+    )
+    return additive.masked_fill(
+        ~allowed.unsqueeze(1),
+        torch.finfo(dtype).min,
+    )
+
+
 class MimiQwenPlanner(PreTrainedModel):
     """Qwen with codebook-specific audio embeddings and slot CE."""
 
@@ -1927,8 +2073,8 @@ class MimiQwenPlanner(PreTrainedModel):
             language_config = AutoConfig.for_model(model_type, **language_config_dict)
             language_model = AutoModelForCausalLM.from_config(language_config)
         self.language_model = language_model
-        if config.planner_attention_mode == "prefix_lm":
-            # FlashAttention-2 does not accept a general 4-D prefix mask.
+        if config.planner_attention_mode in {"prefix_lm", "segment_causal"}:
+            # FlashAttention-2 does not accept these general 4-D masks.
             # SDPA retains fused attention kernels while honoring the mask.
             self.language_model.config._attn_implementation = "sdpa"
         hidden_size = int(language_model.config.hidden_size)
@@ -2246,6 +2392,8 @@ class MimiQwenPlanner(PreTrainedModel):
         self,
         attention_mask: torch.Tensor,
         bidirectional_prefix_mask: Optional[torch.Tensor],
+        planner_segment_ids: Optional[torch.Tensor] = None,
+        planner_gap_context_mask: Optional[torch.Tensor] = None,
         *,
         dtype: torch.dtype,
     ) -> torch.Tensor:
@@ -2261,6 +2409,27 @@ class MimiQwenPlanner(PreTrainedModel):
                     "Causal planner received a non-empty bidirectional prefix mask"
                 )
             return attention_mask
+        if mode == "segment_causal":
+            if bidirectional_prefix_mask is not None and bool(
+                bidirectional_prefix_mask.bool().any()
+            ):
+                raise ValueError(
+                    "segment_causal planner received a bidirectional prefix"
+                )
+            if (
+                planner_segment_ids is None
+                or planner_gap_context_mask is None
+            ):
+                raise ValueError(
+                    "segment_causal planner requires segment IDs and retained "
+                    "gap-context metadata"
+                )
+            return build_segment_causal_attention_mask(
+                attention_mask,
+                planner_segment_ids,
+                planner_gap_context_mask,
+                dtype=dtype,
+            )
         if mode != "prefix_lm":
             raise RuntimeError(f"Unsupported planner attention mode: {mode}")
         if bidirectional_prefix_mask is None:
@@ -2286,6 +2455,8 @@ class MimiQwenPlanner(PreTrainedModel):
         target_slots: torch.Tensor,
         motion_local_labels: torch.Tensor,
         bidirectional_prefix_mask: Optional[torch.Tensor] = None,
+        planner_segment_ids: Optional[torch.Tensor] = None,
+        planner_gap_context_mask: Optional[torch.Tensor] = None,
         expected_distortion_weight: float = 0.0,
         expected_distortion_example_mask: Optional[torch.Tensor] = None,
         gap_target_probs: Optional[torch.Tensor] = None,
@@ -2341,6 +2512,8 @@ class MimiQwenPlanner(PreTrainedModel):
         model_attention_mask = self.prepare_planner_attention_mask(
             attention_mask,
             bidirectional_prefix_mask,
+            planner_segment_ids,
+            planner_gap_context_mask,
             dtype=inputs_embeds.dtype,
         )
         base_outputs = self._base_model_forward(

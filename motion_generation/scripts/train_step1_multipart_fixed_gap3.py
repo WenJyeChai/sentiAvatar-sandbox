@@ -272,11 +272,13 @@ def planner_context_from_config(config: Mapping[str, Any]) -> dict[str, str]:
     valid_pairs = {
         ("causal", "causal_interleaved"),
         ("prefix_lm", "full_audio_prefix"),
+        ("segment_causal", "interval_audio_isolated"),
     }
     if (mode, layout) not in valid_pairs:
         raise ValueError(
-            "planner_context must use either causal+causal_interleaved or "
-            "prefix_lm+full_audio_prefix; got "
+            "planner_context must use causal+causal_interleaved, "
+            "prefix_lm+full_audio_prefix, or "
+            "segment_causal+interval_audio_isolated; got "
             f"attention_mode={mode!r}, sequence_layout={layout!r}"
         )
     return {"attention_mode": mode, "sequence_layout": layout}
@@ -972,6 +974,8 @@ def move_batch(batch: Mapping[str, Any], device: torch.device) -> dict[str, torc
         "attention_mask",
         "audio_codes",
         "bidirectional_prefix_mask",
+        "planner_segment_ids",
+        "planner_gap_context_mask",
         "target_slots",
         "motion_local_labels",
         "gap_target_probs",
@@ -2035,6 +2039,16 @@ def main() -> None:
                 "The controlled GT-boundary history experiment uses "
                 "data.seed_mode=observed"
             )
+        if (
+            planner_context["attention_mode"] != "segment_causal"
+            or planner_context["sequence_layout"]
+            != "interval_audio_isolated"
+        ):
+            raise ValueError(
+                "Dense Step 2 history Stage 1 requires "
+                "segment_causal+interval_audio_isolated so previous sparse "
+                "anchors and non-target audio are not visible"
+            )
     seed = int(training.get("seed", 42))
     seed_everything(seed, rank)
     resume = args.resume_from_checkpoint.resolve() if args.resume_from_checkpoint else None
@@ -2162,6 +2176,16 @@ def main() -> None:
                     "step2_history_corrupted_tokens": first[
                         "step2_history_corrupted_tokens"
                     ],
+                    "planner_segments": (
+                        max(first["planner_segment_ids"]) + 1
+                    ),
+                    "retained_gap_controls": sum(
+                        bool(value)
+                        for value in first["planner_gap_context_mask"]
+                    ),
+                    "supervised_gap_tokens": sum(
+                        bool(value) for value in first["gap_target_mask"]
+                    ),
                 },
             )
 

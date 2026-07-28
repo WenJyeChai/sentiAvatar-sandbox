@@ -83,6 +83,8 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
     step2_history_frame_counts: list[int] = []
     step2_history_available_frame_counts: list[int] = []
     step2_history_corrupted_token_counts: list[int] = []
+    interval_audio_frame_counts: list[int] = []
+    supervised_gap_counts: list[int] = []
     errors = []
     audio_input_representation = str(
         getattr(dataset, "audio_input_representation", "fused_frame")
@@ -128,6 +130,53 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
                     "Fused-frame serialization unexpectedly contains ordinary "
                     f"audio vocabulary tokens: {vocabulary_audio_positions}"
                 )
+            if getattr(dataset, "sequence_layout", "") == "interval_audio_isolated":
+                if any(bool(value) for value in item["gap_target_mask"]):
+                    raise ValueError(
+                        "Stage 1 interval layout must not supervise supplied gaps"
+                    )
+                if sum(
+                    bool(value)
+                    for value in item["planner_gap_context_mask"]
+                ) != len(item["anchor_times"]) - 1:
+                    raise ValueError(
+                        "Every interval must retain exactly one supplied gap "
+                        "as future context"
+                    )
+                for anchor_group, (left, right) in enumerate(
+                    zip(
+                        item["audio_boundaries"][:-1],
+                        item["audio_boundaries"][1:],
+                    )
+                ):
+                    observed = sum(
+                        int(group) == anchor_group
+                        and bool(np.any(codes >= 0))
+                        for group, codes in zip(
+                            item["audio_anchor_ids"],
+                            item_audio_codes,
+                        )
+                    )
+                    expected = int(right) - int(left)
+                    if observed != expected:
+                        raise ValueError(
+                            f"Interval {anchor_group} contains {observed} "
+                            f"audio frames, expected {expected}"
+                        )
+                    interval_audio_frame_counts.append(observed)
+                    target_segments = {
+                        int(segment)
+                        for segment, target_group in zip(
+                            item["planner_segment_ids"],
+                            item["target_anchor_ids"],
+                        )
+                        if int(target_group) == anchor_group
+                    }
+                    if target_segments != {anchor_group + 1}:
+                        raise ValueError(
+                            f"Anchor group {anchor_group} uses segment IDs "
+                            f"{sorted(target_segments)}"
+                        )
             item_gaps = [
                 gap_from_anchor_times(left, right)
                 for left, right in zip(
@@ -184,6 +233,9 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
             step2_history_corrupted_token_counts.append(
                 int(item.get("step2_history_corrupted_tokens", 0))
             )
+            supervised_gap_counts.append(
+                sum(bool(value) for value in item["gap_target_mask"])
+            )
         except Exception as exc:  # collect multiple data failures in one audit
             if len(errors) < max_reported_errors:
                 errors.append({"name": name, "error": f"{type(exc).__name__}: {exc}"})
@@ -223,6 +275,12 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
         ),
         "step2_history_corrupted_tokens": percentile_summary(
             step2_history_corrupted_token_counts
+        ),
+        "target_interval_audio_frames": percentile_summary(
+            interval_audio_frame_counts
+        ),
+        "supervised_gap_tokens": percentile_summary(
+            supervised_gap_counts
         ),
     }
 

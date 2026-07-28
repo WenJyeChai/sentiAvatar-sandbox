@@ -219,6 +219,8 @@ def _move_tensor_batch(batch: Mapping[str, Any], device: torch.device) -> dict[s
             "input_ids",
             "attention_mask",
             "bidirectional_prefix_mask",
+            "planner_segment_ids",
+            "planner_gap_context_mask",
             "audio_codes",
             "target_slots",
             "motion_local_labels",
@@ -255,6 +257,8 @@ def teacher_forced_metrics(
             planner_attention = model.prepare_planner_attention_mask(
                 values["attention_mask"],
                 values.get("bidirectional_prefix_mask"),
+                values.get("planner_segment_ids"),
+                values.get("planner_gap_context_mask"),
                 dtype=embeddings.dtype,
             )
             outputs = model._base_model_forward(  # pylint: disable=protected-access
