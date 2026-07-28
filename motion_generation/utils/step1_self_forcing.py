@@ -70,6 +70,15 @@ class GeneratedHistoryBatchStats:
         self.entropy_sum += other.entropy_sum
 
 
+@dataclass(frozen=True)
+class GeneratedHistoryCurriculumState:
+    phase_index: int
+    probability: float
+    min_previous_anchors: int
+    max_previous_anchors: int
+    full_prefix_probability: float
+
+
 def generated_history_probability(
     epoch_progress: float,
     *,
@@ -85,6 +94,28 @@ def generated_history_probability(
         return float(max_probability)
     progress = min(1.0, max(0.0, (epoch_progress - activation_epoch) / ramp_epochs))
     return float(max_probability) * 0.5 * (1.0 - math.cos(math.pi * progress))
+
+
+def generated_history_curriculum_state(
+    epoch_number: int,
+    phases: Sequence[Mapping[str, Any]],
+) -> GeneratedHistoryCurriculumState:
+    """Return the explicit generated-history phase for a one-based epoch."""
+
+    if epoch_number <= 0:
+        raise ValueError("epoch_number must be one-based and positive")
+    for phase_index, phase in enumerate(phases):
+        if int(phase["start_epoch"]) <= epoch_number <= int(phase["end_epoch"]):
+            return GeneratedHistoryCurriculumState(
+                phase_index=phase_index,
+                probability=float(phase["probability"]),
+                min_previous_anchors=int(phase["min_previous_anchors"]),
+                max_previous_anchors=int(phase["max_previous_anchors"]),
+                full_prefix_probability=float(phase["full_prefix_probability"]),
+            )
+    raise ValueError(
+        f"No generated-history curriculum phase covers epoch {epoch_number}"
+    )
 
 
 def deterministic_generated_indices(
@@ -106,6 +137,110 @@ def deterministic_generated_indices(
         score = int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
         scored.append((score, index))
     return sorted(index for _, index in sorted(scored)[:count])
+
+
+def generated_history_rollout_target_slots(
+    target_slots: torch.Tensor,
+    names: Sequence[str],
+    *,
+    min_previous_anchors: int,
+    max_previous_anchors: int,
+    full_prefix_probability: float,
+    seed: int,
+    epoch: int,
+    batch_index: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Choose coherent suffixes or full prefixes for selected training rows.
+
+    For a local suffix, ``min/max_previous_anchors`` describes how many
+    generated anchors must precede the final anchor in that suffix.  The final
+    anchor is generated too so that its 16 autoregressive losses are evaluated
+    at the visited history.  A full-prefix row rolls every anchor.
+    """
+
+    if target_slots.ndim != 2:
+        raise ValueError("target_slots must be [B,L]")
+    if len(names) != target_slots.shape[0]:
+        raise ValueError("names must match the target_slots batch dimension")
+    if min_previous_anchors < 0:
+        raise ValueError("min_previous_anchors must be non-negative")
+    if max_previous_anchors < min_previous_anchors:
+        raise ValueError(
+            "max_previous_anchors must be >= min_previous_anchors"
+        )
+    if not 0 <= full_prefix_probability <= 1:
+        raise ValueError("full_prefix_probability must be in [0,1]")
+
+    batch_size = target_slots.shape[0]
+    full_count = min(
+        batch_size,
+        max(0, math.floor(batch_size * full_prefix_probability + 0.5)),
+    )
+    full_scores = []
+    for row, name in enumerate(names):
+        key = (
+            f"full-prefix|{seed}|{epoch}|{batch_index}|{name}"
+        ).encode("utf-8")
+        full_scores.append(
+            (int.from_bytes(hashlib.sha256(key).digest()[:8], "big"), row)
+        )
+    full_rows = {
+        row for _, row in sorted(full_scores)[:full_count]
+    }
+
+    rollout_slots = torch.full_like(target_slots, -1)
+    previous_depths = torch.zeros(
+        batch_size, dtype=torch.long, device=target_slots.device
+    )
+    full_prefix_mask = torch.zeros(
+        batch_size, dtype=torch.bool, device=target_slots.device
+    )
+    for row, name in enumerate(names):
+        positions = target_slots[row].ge(0).nonzero(as_tuple=False).squeeze(-1)
+        if positions.numel() % BODY_SLOT_COUNT:
+            raise ValueError(
+                "Generated-history targets must form complete 16-slot anchors"
+            )
+        anchor_count = int(positions.numel() // BODY_SLOT_COUNT)
+        if anchor_count <= 0:
+            raise ValueError(
+                "Every selected generated-history row must contain an anchor"
+            )
+        slots = target_slots[row].index_select(0, positions)
+        expected = torch.arange(
+            BODY_SLOT_COUNT, device=target_slots.device
+        ).repeat(anchor_count)
+        if not torch.equal(slots, expected):
+            raise ValueError(
+                "Generated-history target slots must repeat in 0..15 order"
+            )
+
+        if row in full_rows:
+            generated_anchor_count = anchor_count
+            previous_depth = max(0, anchor_count - 1)
+            full_prefix_mask[row] = True
+        else:
+            available_previous = max(0, anchor_count - 1)
+            lower = min(min_previous_anchors, available_previous)
+            upper = min(max_previous_anchors, available_previous)
+            depth_key = (
+                f"previous-depth|{seed}|{epoch}|{batch_index}|{name}"
+            ).encode("utf-8")
+            depth_score = int.from_bytes(
+                hashlib.sha256(depth_key).digest()[:8], "big"
+            )
+            previous_depth = lower + depth_score % max(1, upper - lower + 1)
+            generated_anchor_count = previous_depth + 1
+
+        selected_positions = positions[
+            -generated_anchor_count * BODY_SLOT_COUNT :
+        ]
+        rollout_slots[row, selected_positions] = target_slots[
+            row, selected_positions
+        ]
+        previous_depths[row] = previous_depth
+
+    return rollout_slots, previous_depths, full_prefix_mask
 
 
 def _validate_rollout_tensors(
@@ -155,6 +290,14 @@ def generate_history_batch(
     """
 
     _validate_rollout_tensors(input_ids, attention_mask, audio_codes, target_slots)
+    ordinary_audio_tokens = (
+        str(getattr(model.config, "audio_input_representation", "fused_frame"))
+        == "ordinary_tokens"
+    )
+    if ordinary_audio_tokens:
+        # Validate complete q0--q3 blocks before the append-only cache creates
+        # slices that may legitimately begin or end inside one such block.
+        model.validate_audio_inputs(input_ids, audio_codes)
     if bidirectional_prefix_mask is not None and tuple(
         bidirectional_prefix_mask.shape
     ) != tuple(input_ids.shape):
@@ -187,8 +330,14 @@ def generate_history_batch(
 
     def cached_forward(left: int, right: int) -> torch.Tensor:
         nonlocal past_key_values
+        sliced_audio_codes = audio_codes[:, left:right]
+        if ordinary_audio_tokens:
+            # q0--q3 are already ordinary vocabulary IDs. Metadata is needed
+            # only for the complete-sequence integrity check above, not for
+            # embedding a temporary KV-cache slice.
+            sliced_audio_codes = torch.full_like(sliced_audio_codes, -1)
         embeddings = model.prepare_input_embeddings(
-            generated_ids[:, left:right], audio_codes[:, left:right]
+            generated_ids[:, left:right], sliced_audio_codes
         )
         with torch.autocast(
             device_type=input_ids.device.type,
@@ -262,6 +411,13 @@ def apply_generated_history(
     *,
     microbatch_size: int,
     use_bf16: bool,
+    names: Sequence[str] | None = None,
+    min_previous_anchors: int = 0,
+    max_previous_anchors: int = 0,
+    full_prefix_probability: float = 1.0,
+    seed: int = 0,
+    epoch: int = 0,
+    batch_index: int = 0,
 ) -> tuple[torch.Tensor, GeneratedHistoryBatchStats]:
     """Return a normal cloned input tensor with selected rows fully self-forced.
 
@@ -277,6 +433,30 @@ def apply_generated_history(
     if microbatch_size <= 0:
         raise ValueError("rollout microbatch_size must be positive")
 
+    rollout_target_slots = batch["target_slots"]
+    if names is not None:
+        if len(names) != batch["input_ids"].shape[0]:
+            raise ValueError("names must match the generated-history batch")
+        selected_tensor = torch.as_tensor(
+            selected_indices,
+            dtype=torch.long,
+            device=batch["input_ids"].device,
+        )
+        selected_slots, _, _ = generated_history_rollout_target_slots(
+            batch["target_slots"].index_select(0, selected_tensor),
+            [names[index] for index in selected_indices],
+            min_previous_anchors=min_previous_anchors,
+            max_previous_anchors=max_previous_anchors,
+            full_prefix_probability=full_prefix_probability,
+            seed=seed,
+            epoch=epoch,
+            batch_index=batch_index,
+        )
+        rollout_target_slots = torch.full_like(batch["target_slots"], -1)
+        rollout_target_slots.index_copy_(
+            0, selected_tensor, selected_slots
+        )
+
     for start in range(0, len(selected_indices), microbatch_size):
         indices = torch.as_tensor(
             selected_indices[start : start + microbatch_size],
@@ -288,7 +468,7 @@ def apply_generated_history(
             input_ids=batch["input_ids"].index_select(0, indices),
             attention_mask=batch["attention_mask"].index_select(0, indices),
             audio_codes=batch["audio_codes"].index_select(0, indices),
-            target_slots=batch["target_slots"].index_select(0, indices),
+            target_slots=rollout_target_slots.index_select(0, indices),
             use_bf16=use_bf16,
             bidirectional_prefix_mask=(
                 batch["bidirectional_prefix_mask"].index_select(0, indices)

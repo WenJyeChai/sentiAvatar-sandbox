@@ -214,3 +214,74 @@ Copy the complete `<label>/` bundle from one server to the other and register
 it in the notebook's `COPIED_BUNDLES` mapping. Comparison is rejected unless
 the selected clip list, supplied schedule, frozen Step 2 weights, and all four
 causal body codecs have matching fingerprints.
+
+## Twenty-epoch generated-history post-training
+
+The completed teacher checkpoint was trained for 50 clean-history epochs with
+32 examples per GPU on four GPUs (global batch 128). Post-training starts a
+new optimizer/scheduler from that checkpoint; it does not resume the old
+optimizer state.
+
+The generated-history configuration is:
+
+`motion_generation/configs/step1_stage1_teacher_generated_history_posttrain20.yaml`
+
+The curriculum keeps the supplied uniform 3--15 gaps and anchor CE objective:
+
+| Epochs | Generated-history examples | History used by generated examples | Clean replay |
+|---|---:|---|---:|
+| 1--3 | 20% | coherent suffix with 1--2 generated previous anchors | 80% |
+| 4--7 | 40% | coherent suffix with 1--4 generated previous anchors | 60% |
+| 8--12 | 60% | half local suffix, half complete generated prefix | 40% |
+| 13--20 | 60% | complete generated prefix from the known seed | 40% |
+
+The target RVQ IDs remain ground truth. Generated IDs are produced greedily
+under `torch.inference_mode()` and fed back as input context; the following
+normal forward pass carries the anchor-CE gradients.
+
+Run a one-GPU smoke test first:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_stage1_teacher_generated_history_posttrain20.yaml \
+  --init_from_checkpoint checkpoints/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab/best \
+  --max_train_clips 64 \
+  --max_eval_clips 32 \
+  --num_train_epochs 1 \
+  --max_train_steps 2 \
+  --output_dir checkpoints/step1_stage1_teacher_generated_history_posttrain20_smoke
+```
+
+The header must show the four `History phase` lines, prefix-LM mode, and
+`Generated history: enabled=True`. During epoch 1, logs must show
+`p_gen=0.200`.
+
+Run the full four-GPU post-train:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=4 --master_port=29516 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_stage1_teacher_generated_history_posttrain20.yaml \
+  --init_from_checkpoint checkpoints/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab/best
+```
+
+Use `--init_from_checkpoint`, not `--resume_from_checkpoint`: this experiment
+needs a fresh 20-epoch cosine schedule at `5e-6`.
+
+The matched clean-continuation control is:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=4 --master_port=29517 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_stage1_teacher_clean_control20.yaml \
+  --init_from_checkpoint checkpoints/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab/best
+```
+
+Both runs use per-device batch 32, gradient accumulation 1, and therefore the
+same global batch 128 as the completed teacher pretraining. The prefix-LM
+generated rollout is intentionally microbatched one clip at a time because
+full-audio prefix lengths differ; it is substantially slower than the clean
+control.

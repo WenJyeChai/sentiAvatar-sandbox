@@ -63,6 +63,7 @@ from utils.step1_self_forcing import (  # noqa: E402
     GeneratedHistoryBatchStats,
     apply_generated_history,
     deterministic_generated_indices,
+    generated_history_curriculum_state,
     generated_history_probability,
     rollout_quality_metrics,
     validate_generated_labels,
@@ -1213,7 +1214,11 @@ def initialize_wandb(
     )
 
 
-def validate_generated_history_config(config: Mapping[str, Any]) -> dict[str, Any]:
+def validate_generated_history_config(
+    config: Mapping[str, Any],
+    *,
+    num_epochs: int,
+) -> dict[str, Any]:
     generated = section(config, "generated_history")
     generated.setdefault("enabled", False)
     generated.setdefault("decoding", "greedy")
@@ -1228,6 +1233,7 @@ def validate_generated_history_config(config: Mapping[str, Any]) -> dict[str, An
     generated.setdefault("milestone_epochs", [5, 15, 25, 35, 50])
     generated.setdefault("rollout_eval_epochs", [5, 15, 25, 35, 50])
     generated.setdefault("start_immediately", False)
+    generated.setdefault("curriculum", [])
     if generated["decoding"] != "greedy":
         raise ValueError("Only greedy generated-history decoding is currently supported")
     for key in ("minimum_teacher_epochs", "ramp_epochs"):
@@ -1249,6 +1255,70 @@ def validate_generated_history_config(config: Mapping[str, Any]) -> dict[str, An
         if any(value <= 0 for value in values):
             raise ValueError(f"generated_history.{key} must contain positive epochs")
         generated[key] = sorted(set(values))
+    raw_phases = list(generated["curriculum"])
+    phases: list[dict[str, Any]] = []
+    for phase_index, raw_phase in enumerate(raw_phases):
+        phase = dict(raw_phase)
+        normalized = {
+            "start_epoch": int(phase["start_epoch"]),
+            "end_epoch": int(phase["end_epoch"]),
+            "probability": float(phase["probability"]),
+            "min_previous_anchors": int(
+                phase.get("min_previous_anchors", 0)
+            ),
+            "max_previous_anchors": int(
+                phase.get("max_previous_anchors", 0)
+            ),
+            "full_prefix_probability": float(
+                phase.get("full_prefix_probability", 0.0)
+            ),
+        }
+        if normalized["start_epoch"] <= 0:
+            raise ValueError(
+                f"generated_history.curriculum[{phase_index}].start_epoch "
+                "must be positive"
+            )
+        if normalized["end_epoch"] < normalized["start_epoch"]:
+            raise ValueError(
+                f"generated_history.curriculum[{phase_index}] has an invalid "
+                "epoch interval"
+            )
+        if not 0 <= normalized["probability"] <= 1:
+            raise ValueError(
+                f"generated_history.curriculum[{phase_index}].probability "
+                "must be in [0,1]"
+            )
+        if normalized["min_previous_anchors"] < 0 or (
+            normalized["max_previous_anchors"]
+            < normalized["min_previous_anchors"]
+        ):
+            raise ValueError(
+                f"generated_history.curriculum[{phase_index}] has an invalid "
+                "previous-anchor range"
+            )
+        if not 0 <= normalized["full_prefix_probability"] <= 1:
+            raise ValueError(
+                f"generated_history.curriculum[{phase_index}]."
+                "full_prefix_probability must be in [0,1]"
+            )
+        phases.append(normalized)
+    phases.sort(key=lambda value: value["start_epoch"])
+    for phase_index, phase in enumerate(phases):
+        expected_start = (
+            1 if phase_index == 0 else phases[phase_index - 1]["end_epoch"] + 1
+        )
+        if phase["start_epoch"] != expected_start:
+            raise ValueError(
+                "generated_history.curriculum phases must be contiguous and "
+                f"start at epoch 1; expected {expected_start}, got "
+                f"{phase['start_epoch']}"
+            )
+    if phases and phases[-1]["end_epoch"] < num_epochs:
+        raise ValueError(
+            "generated_history.curriculum does not cover the requested "
+            f"{num_epochs} epochs"
+        )
+    generated["curriculum"] = phases
     return generated
 
 
@@ -1531,7 +1601,10 @@ def main() -> None:
             "The configured training schedule changes at epoch boundaries; set "
             "data.persistent_workers=false so workers receive the new epoch."
         )
-    generated_history = validate_generated_history_config(config)
+    generated_history = validate_generated_history_config(
+        config,
+        num_epochs=requested_epochs,
+    )
     visited_state = validate_visited_state_config(config)
     auxiliary_loss = validate_auxiliary_loss_config(config)
     condition_alignment = validate_condition_alignment_config(config)
@@ -1548,8 +1621,6 @@ def main() -> None:
         incompatible = []
         if bool(frozen_step2_guidance["enabled"]):
             incompatible.append("frozen_step2_guidance")
-        if bool(generated_history["enabled"]):
-            incompatible.append("generated_history")
         if bool(visited_state["enabled"]):
             incompatible.append("visited_state_guidance")
         if auxiliary_loss["type"] != "none":
@@ -1565,7 +1636,16 @@ def main() -> None:
             data_config.get("generated_prefix_probability", 0.0)
         ) != 0.0:
             raise ValueError(
-                "The offline teacher uses GT history; disable generated-prefix caches"
+                "The offline teacher does not use disk-cached generated "
+                "prefixes; disable the legacy cache"
+            )
+        if bool(generated_history["enabled"]) and int(
+            generated_history["rollout_microbatch_size"]
+        ) != 1:
+            raise ValueError(
+                "Prefix-LM on-policy rollout requires "
+                "generated_history.rollout_microbatch_size=1 because full-audio "
+                "prefix lengths differ between clips"
             )
         if list(audio_contract["codebooks_used"]) != [0, 1, 2, 3]:
             raise ValueError(
@@ -1920,6 +2000,18 @@ def main() -> None:
             f"ramp={generated_history['ramp_epochs']} epochs, "
             f"p_max={generated_history['max_probability']}"
         )
+        for phase_index, phase in enumerate(
+            generated_history["curriculum"]
+        ):
+            print(
+                f"History phase {phase_index}: epochs "
+                f"{phase['start_epoch']}-{phase['end_epoch']}, "
+                f"examples={phase['probability']:.0%}, "
+                "previous_anchors="
+                f"{phase['min_previous_anchors']}-"
+                f"{phase['max_previous_anchors']}, "
+                f"full_prefix={phase['full_prefix_probability']:.0%}"
+            )
         print(
             "Visited state:     "
             f"enabled={bool(visited_state['enabled'])}, "
@@ -2066,15 +2158,32 @@ def main() -> None:
                 condition_modality = modalities[
                     (epoch * len(train_loader) + batch_index) % len(modalities)
                 ]
-            generated_probability = (
-                generated_history_probability(
-                    epoch_progress,
-                    activation_epoch=curriculum_activation_epoch,
-                    ramp_epochs=int(generated_history["ramp_epochs"]),
-                    max_probability=float(generated_history["max_probability"]),
+            generated_curriculum_state = (
+                generated_history_curriculum_state(
+                    epoch + 1,
+                    generated_history["curriculum"],
                 )
-                if bool(generated_history["enabled"])
-                else 0.0
+                if (
+                    bool(generated_history["enabled"])
+                    and generated_history["curriculum"]
+                )
+                else None
+            )
+            generated_probability = (
+                generated_curriculum_state.probability
+                if generated_curriculum_state is not None
+                else (
+                    generated_history_probability(
+                        epoch_progress,
+                        activation_epoch=curriculum_activation_epoch,
+                        ramp_epochs=int(generated_history["ramp_epochs"]),
+                        max_probability=float(
+                            generated_history["max_probability"]
+                        ),
+                    )
+                    if bool(generated_history["enabled"])
+                    else 0.0
+                )
             )
             generated_indices = deterministic_generated_indices(
                 batch["names"],
@@ -2099,6 +2208,29 @@ def main() -> None:
                     generated_indices,
                     microbatch_size=int(generated_history["rollout_microbatch_size"]),
                     use_bf16=use_bf16,
+                    names=(
+                        batch["names"]
+                        if generated_curriculum_state is not None
+                        else None
+                    ),
+                    min_previous_anchors=(
+                        generated_curriculum_state.min_previous_anchors
+                        if generated_curriculum_state is not None
+                        else 0
+                    ),
+                    max_previous_anchors=(
+                        generated_curriculum_state.max_previous_anchors
+                        if generated_curriculum_state is not None
+                        else 0
+                    ),
+                    full_prefix_probability=(
+                        generated_curriculum_state.full_prefix_probability
+                        if generated_curriculum_state is not None
+                        else 1.0
+                    ),
+                    seed=seed,
+                    epoch=epoch,
+                    batch_index=batch_index,
                 )
                 unwrapped.train(was_training)
                 inputs["input_ids"] = generated_input_ids
@@ -2370,6 +2502,10 @@ def main() -> None:
                         "curriculum/generated_history_probability": generated_probability,
                         "curriculum/generated_clips": float(totals[split_offset + 6]),
                         "curriculum/generated_anchors": float(totals[split_offset + 7]),
+                        "curriculum/generated_mean_rollout_anchors": (
+                            float(totals[split_offset + 7])
+                            / max(1.0, float(totals[split_offset + 6]))
+                        ),
                         "visited_state/probability": float(
                             visited_state["probability"]
                         ),
@@ -2389,6 +2525,23 @@ def main() -> None:
                         "condition/weight": current_condition_weight,
                         "step2_guidance/weight": current_step2_guidance_weight,
                     }
+                    if generated_curriculum_state is not None:
+                        train_metrics.update(
+                            {
+                                "curriculum/generated_history_phase": (
+                                    generated_curriculum_state.phase_index
+                                ),
+                                "curriculum/min_previous_anchors": (
+                                    generated_curriculum_state.min_previous_anchors
+                                ),
+                                "curriculum/max_previous_anchors": (
+                                    generated_curriculum_state.max_previous_anchors
+                                ),
+                                "curriculum/full_prefix_probability": (
+                                    generated_curriculum_state.full_prefix_probability
+                                ),
+                            }
+                        )
                     if float(step2_guidance_totals[1]) > 0:
                         guidance_examples = max(
                             1.0, float(step2_guidance_totals[1])
@@ -2688,6 +2841,7 @@ def main() -> None:
         rollout_metrics = None
         activation_check = (
             bool(generated_history["enabled"])
+            and not generated_history["curriculum"]
             and curriculum_activation_epoch is None
             and completed_epochs >= int(generated_history["minimum_teacher_epochs"])
         )

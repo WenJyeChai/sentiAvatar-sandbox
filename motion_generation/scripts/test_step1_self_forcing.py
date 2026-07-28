@@ -25,7 +25,9 @@ from utils.step1_self_forcing import (  # noqa: E402
     apply_generated_history,
     deterministic_generated_indices,
     generate_history_batch,
+    generated_history_curriculum_state,
     generated_history_probability,
+    generated_history_rollout_target_slots,
 )
 from utils.step1_visited_state import (  # noqa: E402
     apply_visited_state_history,
@@ -59,6 +61,58 @@ def tiny_q0q3_planner() -> MimiQwenPlanner:
             audio_placeholder_id=BODY_SLOT_COUNT * BODY_CODEBOOK_SIZE,
             motion_token_ids=table,
             mimi_codebooks_used=[0, 1, 2, 3],
+        ),
+        language_model=language_model,
+    )
+    planner.eval()
+    return planner
+
+
+def tiny_ordinary_q0q3_planner(
+    planner_attention_mode: str = "causal",
+) -> MimiQwenPlanner:
+    audio_cardinality = 1024
+    audio_start = BODY_SLOT_COUNT * BODY_CODEBOOK_SIZE
+    audio_token_ids = [
+        [
+            audio_start + stream * audio_cardinality + local_id
+            for local_id in range(audio_cardinality)
+        ]
+        for stream in range(4)
+    ]
+    vocabulary = audio_start + 4 * audio_cardinality + 8
+    language_model = AutoModelForCausalLM.from_config(
+        Qwen2Config(
+            vocab_size=vocabulary,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            tie_word_embeddings=True,
+            use_cache=True,
+        )
+    )
+    motion_table = [
+        [
+            body_global_id(slot, local_id)
+            for local_id in range(BODY_CODEBOOK_SIZE)
+        ]
+        for slot in range(BODY_SLOT_COUNT)
+    ]
+    planner = MimiQwenPlanner(
+        MimiQwenPlannerConfig(
+            language_model_config=language_model.config.to_dict(),
+            audio_placeholder_id=vocabulary - 1,
+            motion_token_ids=motion_table,
+            audio_codec="moss_audio_tokenizer_nano",
+            audio_cardinality=audio_cardinality,
+            audio_codebooks_stored=16,
+            audio_codebooks_used=[0, 1, 2, 3],
+            audio_input_representation="ordinary_tokens",
+            audio_token_ids=audio_token_ids,
+            planner_attention_mode=planner_attention_mode,
         ),
         language_model=language_model,
     )
@@ -157,6 +211,166 @@ def test_curriculum_probability_and_exact_selection() -> None:
     second = deterministic_generated_indices(names, 0.5, seed=42, epoch=9, batch_index=3)
     assert first == second
     assert len(first) == 16
+
+
+def test_explicit_suffix_to_full_curriculum() -> None:
+    phases = [
+        {
+            "start_epoch": 1,
+            "end_epoch": 3,
+            "probability": 0.2,
+            "min_previous_anchors": 1,
+            "max_previous_anchors": 2,
+            "full_prefix_probability": 0.0,
+        },
+        {
+            "start_epoch": 4,
+            "end_epoch": 7,
+            "probability": 0.4,
+            "min_previous_anchors": 1,
+            "max_previous_anchors": 4,
+            "full_prefix_probability": 0.0,
+        },
+        {
+            "start_epoch": 8,
+            "end_epoch": 12,
+            "probability": 0.6,
+            "min_previous_anchors": 1,
+            "max_previous_anchors": 4,
+            "full_prefix_probability": 0.5,
+        },
+        {
+            "start_epoch": 13,
+            "end_epoch": 20,
+            "probability": 0.6,
+            "min_previous_anchors": 1,
+            "max_previous_anchors": 4,
+            "full_prefix_probability": 1.0,
+        },
+    ]
+    first = generated_history_curriculum_state(1, phases)
+    assert first.probability == 0.2
+    assert first.max_previous_anchors == 2
+    final = generated_history_curriculum_state(20, phases)
+    assert final.probability == 0.6
+    assert final.full_prefix_probability == 1.0
+
+    slots = torch.arange(BODY_SLOT_COUNT).repeat(2).unsqueeze(0)
+    local, depths, full = generated_history_rollout_target_slots(
+        slots,
+        ["clip"],
+        min_previous_anchors=1,
+        max_previous_anchors=1,
+        full_prefix_probability=0.0,
+        seed=42,
+        epoch=0,
+        batch_index=0,
+    )
+    assert int(local.ge(0).sum()) == 2 * BODY_SLOT_COUNT
+    assert int(depths[0]) == 1
+    assert not bool(full[0])
+
+    full_slots, depths, full = generated_history_rollout_target_slots(
+        slots,
+        ["clip"],
+        min_previous_anchors=1,
+        max_previous_anchors=1,
+        full_prefix_probability=1.0,
+        seed=42,
+        epoch=12,
+        batch_index=0,
+    )
+    assert torch.equal(full_slots, slots)
+    assert int(depths[0]) == 1
+    assert bool(full[0])
+
+
+def test_ordinary_audio_kv_slices_are_validated_as_complete_sequences() -> None:
+    planner = tiny_ordinary_q0q3_planner()
+    length = 28
+    input_ids = torch.ones((2, length), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    audio_codes = torch.full((2, length, 4), -1, dtype=torch.long)
+    target_slots = torch.full_like(input_ids, -1)
+
+    for row, audio_start, codes in (
+        (0, 1, (10, 20, 30, 40)),
+        # Row 0's first target at position 6 cuts through this row's
+        # q0--q3 block at positions 5--8.
+        (1, 5, (11, 21, 31, 41)),
+    ):
+        audio_codes[row, audio_start] = torch.tensor(codes)
+        for stream, code in enumerate(codes):
+            input_ids[row, audio_start + stream] = planner.audio_token_ids[
+                stream, code
+            ]
+
+    for row, target_start in ((0, 6), (1, 10)):
+        target_slots[
+            row, target_start : target_start + BODY_SLOT_COUNT
+        ] = torch.arange(BODY_SLOT_COUNT)
+        for slot in range(BODY_SLOT_COUNT):
+            input_ids[row, target_start + slot] = planner.motion_token_ids[
+                slot, (row * 31 + slot * 7) % BODY_CODEBOOK_SIZE
+            ]
+
+    result = generate_history_batch(
+        planner,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        audio_codes=audio_codes,
+        target_slots=target_slots,
+        use_bf16=False,
+    )
+    assert result.generated_anchors == 2
+
+    corrupted = input_ids.clone()
+    corrupted[1, 6] = planner.audio_token_ids[1, 22]
+    try:
+        generate_history_batch(
+            planner,
+            input_ids=corrupted,
+            attention_mask=attention_mask,
+            audio_codes=audio_codes,
+            target_slots=target_slots,
+            use_bf16=False,
+        )
+    except ValueError as error:
+        assert "Ordinary audio IDs do not match" in str(error)
+    else:
+        raise AssertionError("Corrupted ordinary-audio block was not rejected")
+
+
+def test_prefix_lm_ordinary_audio_generated_suffix_runs_one_row() -> None:
+    planner = tiny_ordinary_q0q3_planner("prefix_lm")
+    length = 28
+    input_ids = torch.ones((1, length), dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    audio_codes = torch.full((1, length, 4), -1, dtype=torch.long)
+    audio_codes[0, 1] = torch.tensor([10, 20, 30, 40])
+    for stream, code in enumerate((10, 20, 30, 40)):
+        input_ids[0, 1 + stream] = planner.audio_token_ids[stream, code]
+    target_slots = torch.full_like(input_ids, -1)
+    target_slots[0, 6 : 6 + BODY_SLOT_COUNT] = torch.arange(
+        BODY_SLOT_COUNT
+    )
+    for slot in range(BODY_SLOT_COUNT):
+        input_ids[0, 6 + slot] = planner.motion_token_ids[
+            slot, (slot * 11 + 3) % BODY_CODEBOOK_SIZE
+        ]
+    prefix_mask = torch.zeros_like(input_ids)
+    prefix_mask[:, :6] = 1
+    result = generate_history_batch(
+        planner,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        audio_codes=audio_codes,
+        target_slots=target_slots,
+        bidirectional_prefix_mask=prefix_mask,
+        use_bf16=False,
+    )
+    assert result.generated_anchors == 1
+    assert int(result.predicted_local_ids.ge(0).sum()) == BODY_SLOT_COUNT
 
 
 def test_batched_cached_rollout_replaces_all_and_only_targets() -> None:

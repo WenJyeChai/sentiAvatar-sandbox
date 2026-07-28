@@ -1776,7 +1776,22 @@ class MimiQwenPlanner(PreTrainedModel):
     def gradient_checkpointing_disable(self) -> None:
         self.language_model.gradient_checkpointing_disable()
 
-    def prepare_input_embeddings(self, input_ids: torch.Tensor, audio_codes: torch.Tensor) -> torch.Tensor:
+    def validate_audio_inputs(
+        self,
+        input_ids: torch.Tensor,
+        audio_codes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Validate audio metadata without materializing Qwen embeddings.
+
+        Ordinary Nano audio is serialized as contiguous q0--q3 vocabulary
+        tokens while its four-code metadata lives only at q0.  KV-cache
+        rollout may temporarily slice through one of those blocks, so callers
+        can validate the complete sequence once and omit metadata from safe
+        ordinary-token slices.
+
+        Returns the boolean mask of positions carrying a complete audio frame.
+        """
+
         if audio_codes.ndim == input_ids.ndim:
             audio_codes = audio_codes.unsqueeze(-1)
         expected_audio_shape = (*input_ids.shape, len(self.config.audio_codebooks_used))
@@ -1793,7 +1808,6 @@ class MimiQwenPlanner(PreTrainedModel):
             selected = audio_codes[complete_code_mask]
             if int(selected.min()) < 0 or int(selected.max()) >= self.config.audio_cardinality:
                 raise ValueError("Audio input code is outside the configured cardinality")
-        text_embeddings = self.language_model.get_input_embeddings()(input_ids)
         if self.config.audio_input_representation == "ordinary_tokens":
             if bool(placeholder_mask.any()):
                 raise ValueError(
@@ -1819,10 +1833,19 @@ class MimiQwenPlanner(PreTrainedModel):
                             "Ordinary audio IDs do not match q0 metadata in "
                             f"stream q{self.config.audio_codebooks_used[stream_index]}"
                         )
-            return text_embeddings
+            return complete_code_mask
 
         if not torch.equal(placeholder_mask, complete_code_mask):
             raise ValueError("audio_codes must be set exactly at [mimi_frame] placeholder positions")
+        return complete_code_mask
+
+    def prepare_input_embeddings(self, input_ids: torch.Tensor, audio_codes: torch.Tensor) -> torch.Tensor:
+        if audio_codes.ndim == input_ids.ndim:
+            audio_codes = audio_codes.unsqueeze(-1)
+        complete_code_mask = self.validate_audio_inputs(input_ids, audio_codes)
+        text_embeddings = self.language_model.get_input_embeddings()(input_ids)
+        if self.config.audio_input_representation == "ordinary_tokens":
+            return text_embeddings
         if not bool(complete_code_mask.any()):
             return text_embeddings
 
