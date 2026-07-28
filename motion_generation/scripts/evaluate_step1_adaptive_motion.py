@@ -45,10 +45,19 @@ from scripts.evaluate_step1_anchor_fid import (  # noqa: E402
 from scripts.evaluate_step1_multipart_comparison import (  # noqa: E402
     load_source_config,
 )
-from scripts.cache_step2_interval_costs import checkpoint_fingerprint  # noqa: E402
+from scripts.cache_step2_interval_costs import (  # noqa: E402
+    checkpoint_fingerprint,
+    sha256_file,
+)
 from scripts.train_audio_mask_multipart import load_sequences  # noqa: E402
 from utils.inference_math import configure_strict_inference_math  # noqa: E402
-from utils.multipart_motion import PART_ORDER  # noqa: E402
+from utils.multipart_motion import (  # noqa: E402
+    PART_ORDER,
+    canonicalize_body_root,
+    load_motion_dict,
+    merge_parts_to_legacy_motion,
+    motion_path_for_name,
+)
 from utils.step1_adaptive_evaluation import (  # noqa: E402
     AdaptiveRolloutResult,
     load_adaptive_rollout_cache,
@@ -59,12 +68,11 @@ from utils.variable_c2f_evaluation import (  # noqa: E402
     VariableGapMaskExample,
     audio_feature_for_token_frame,
     clean_output_files,
-    decode_multipart_token_batch,
+    decode_multipart_part_batch,
     decoded_feature_metrics,
     infer_c2f_window_records_with_metrics,
     load_audio_motion_transformer,
     load_part_codecs,
-    load_raw_gt_body,
     save_evaluator_motion,
 )
 
@@ -396,6 +404,32 @@ def prepare_motion_root(root: Path, conditions: Sequence[str]) -> None:
         clean_output_files(root / "motions" / condition, "pred")
 
 
+def clean_visual_motion_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for old in path.glob("*.npy"):
+        old.unlink()
+
+
+def save_visual_motion(
+    path: Path,
+    name: str,
+    motion: Mapping[str, np.ndarray],
+    *,
+    frames: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(
+        path,
+        {
+            "name": str(name),
+            **{
+                key: np.asarray(motion[key][:frames], dtype=np.float32)
+                for key in ("body", "left", "right")
+            },
+        },
+    )
+
+
 def export_motion_conditions(
     *,
     names: Sequence[str],
@@ -413,8 +447,20 @@ def export_motion_conditions(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     anchor_root = output_dir / "anchor_substitution"
     step2_root = output_dir / "step2_infilled"
+    visual_root = output_dir / "visual_motion"
     prepare_motion_root(anchor_root, conditions)
     prepare_motion_root(step2_root, conditions)
+    visual_dirs = [
+        visual_root / "raw_gt",
+        visual_root / "causal_codec_reconstruction",
+    ]
+    visual_dirs.extend(
+        visual_root / protocol / condition
+        for protocol in ("anchor_substitution", "step2_infilled")
+        for condition in conditions
+    )
+    for directory in visual_dirs:
+        clean_visual_motion_dir(directory)
     manifest_rows = []
     metric_rows = []
     for clip_index, name in enumerate(names):
@@ -434,13 +480,22 @@ def export_motion_conditions(
             *(anchor_tokens[value] for value in conditions),
             *(step2_tokens[value] for value in conditions),
         ]
-        decoded = decode_multipart_token_batch(
+        decoded_parts = decode_multipart_part_batch(
             np.stack(ordered, axis=0),
             codecs,
             device,
             part_order=PART_ORDER,
             clip_invalid=False,
         )
+        decoded = [
+            merge_parts_to_legacy_motion(
+                {
+                    part: decoded_parts[part][batch_index]
+                    for part in PART_ORDER
+                }
+            )
+            for batch_index in range(len(ordered))
+        ]
         decoded_codec = decoded[0]
         anchor_decoded = dict(
             zip(conditions, decoded[1 : 1 + len(conditions)])
@@ -448,28 +503,52 @@ def export_motion_conditions(
         step2_decoded = dict(
             zip(conditions, decoded[1 + len(conditions) :])
         )
-        raw_gt = load_raw_gt_body(
-            motion_dir,
-            name,
-            len(decoded_codec),
-            canonicalize_root=canonicalize_raw_root,
-        )
-        if raw_gt is None or not len(raw_gt):
+        raw_path = motion_path_for_name(motion_dir, name)
+        if not raw_path.is_file():
             raise FileNotFoundError(f"Missing raw GT motion for {name}")
+        source_motion = load_motion_dict(raw_path)
+        raw_body = np.asarray(source_motion["body"], dtype=np.float32)
+        if canonicalize_raw_root:
+            raw_body, _, _ = canonicalize_body_root(raw_body)
+        raw_gt = {
+            "body": raw_body,
+            "left": np.asarray(source_motion["left"], dtype=np.float32),
+            "right": np.asarray(source_motion["right"], dtype=np.float32),
+        }
         target_len = min(
-            len(raw_gt),
-            len(decoded_codec),
-            *(len(value) for value in anchor_decoded.values()),
-            *(len(value) for value in step2_decoded.values()),
+            *(len(raw_gt[key]) for key in ("body", "left", "right")),
+            *(len(decoded_codec[key]) for key in ("body", "left", "right")),
+            *(
+                len(value[key])
+                for value in anchor_decoded.values()
+                for key in ("body", "left", "right")
+            ),
+            *(
+                len(value[key])
+                for value in step2_decoded.values()
+                for key in ("body", "left", "right")
+            ),
         )
         if target_len < 2:
             raise ValueError(f"{name}: fewer than two aligned decoded frames")
         stem = f"{clip_index:06d}"
+        save_visual_motion(
+            visual_root / "raw_gt" / f"{stem}.npy",
+            name,
+            raw_gt,
+            frames=target_len,
+        )
+        save_visual_motion(
+            visual_root / "causal_codec_reconstruction" / f"{stem}.npy",
+            name,
+            decoded_codec,
+            frames=target_len,
+        )
         for root in (anchor_root, step2_root):
             save_evaluator_motion(
                 root / "motions" / "raw_gt" / f"{stem}_gt.npy",
                 name,
-                raw_gt[:target_len],
+                raw_gt["body"][:target_len],
             )
             save_evaluator_motion(
                 root
@@ -477,7 +556,7 @@ def export_motion_conditions(
                 / "causal_codec_reconstruction"
                 / f"{stem}_pred.npy",
                 name,
-                decoded_codec[:target_len],
+                decoded_codec["body"][:target_len],
             )
         for protocol, values, token_values in (
             ("anchor_substitution", anchor_decoded, anchor_tokens),
@@ -491,7 +570,13 @@ def export_motion_conditions(
                     / condition
                     / f"{stem}_pred.npy",
                     name,
-                    motion[:target_len],
+                    motion["body"][:target_len],
+                )
+                save_visual_motion(
+                    visual_root / protocol / condition / f"{stem}.npy",
+                    name,
+                    motion,
+                    frames=target_len,
                 )
                 row = {
                     "clip_index": clip_index,
@@ -499,13 +584,13 @@ def export_motion_conditions(
                     "protocol": protocol,
                     "condition": condition,
                     **decoded_feature_metrics(
-                        decoded_codec[:target_len],
-                        motion[:target_len],
+                        decoded_codec["body"][:target_len],
+                        motion["body"][:target_len],
                         prefix="codec_relative",
                     ),
                     **decoded_feature_metrics(
-                        raw_gt[:target_len],
-                        motion[:target_len],
+                        raw_gt["body"][:target_len],
+                        motion["body"][:target_len],
                         prefix="raw_gt",
                     ),
                 }
@@ -525,6 +610,7 @@ def export_motion_conditions(
                 "token_frames": len(dense),
                 "motion_frames": target_len,
                 "canonicalize_raw_root": canonicalize_raw_root,
+                "visual_motion_stem": stem,
             }
         )
         if (clip_index + 1) % 25 == 0:
@@ -644,8 +730,8 @@ def main() -> None:
             raise ValueError(
                 "Adaptive schedule costs came from mixed Step 2 checkpoints"
             )
+        selected_fingerprint = checkpoint_fingerprint(step2_checkpoint)
         if manifest_fingerprints:
-            selected_fingerprint = checkpoint_fingerprint(step2_checkpoint)
             expected_fingerprint = next(iter(manifest_fingerprints))
             if selected_fingerprint != expected_fingerprint:
                 raise ValueError(
@@ -739,12 +825,19 @@ def main() -> None:
             "selected_clips": len(names),
             "step2_config": str(step2_config_path),
             "step2_checkpoint": str(step2_checkpoint),
+            "step2_checkpoint_fingerprint": selected_fingerprint,
             "audio_feature_dir": str(audio_feat_dir),
             "causal_codecs": {
                 key: str(value) for key, value in codec_paths.items()
             },
+            "causal_codec_fingerprints": {
+                key: sha256_file(value) for key, value in codec_paths.items()
+            },
             "canonicalize_raw_root": canonicalize_raw_root,
             "math_mode": math_mode,
+            "visual_motion_root": str(
+                (output_dir / "visual_motion").resolve()
+            ),
             "protocols": {
                 "anchor_substitution": (
                     "GT non-anchor tokens retained; isolates sparse-anchor damage."

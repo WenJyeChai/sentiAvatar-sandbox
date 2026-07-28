@@ -192,3 +192,25 @@ Use the same validation clips and deterministic validation schedule when
 comparing the two runs. Primary comparisons are validation anchor CE,
 per-gap-bin CE, generated-anchor FID, and frozen-Step-2 performance under the
 same externally supplied schedules.
+
+## Portable teacher/causal evaluation
+
+Use:
+
+`motion_generation/notebooks/evaluate_step1_stage1_teacher_causal_step2.ipynb`
+
+The notebook accepts any one or more local `LABEL=CHECKPOINT` selections. It
+exports each checkpoint independently so the teacher and causal student do not
+need to exist on the same server. Every `<label>/` result bundle contains:
+
+- teacher-forced and generated-history Stage 1 metrics;
+- the deterministic supplied gap schedule and its SHA-256 fingerprint;
+- matched GT and generated-anchor rollout caches;
+- frozen-Step-2 likelihood and decoded-motion metrics;
+- anchor-substitution and Step-2-infilling FID inputs;
+- complete decoded body/hand motions for synchronized rendering.
+
+Copy the complete `<label>/` bundle from one server to the other and register
+it in the notebook's `COPIED_BUNDLES` mapping. Comparison is rejected unless
+the selected clip list, supplied schedule, frozen Step 2 weights, and all four
+causal body codecs have matching fingerprints.

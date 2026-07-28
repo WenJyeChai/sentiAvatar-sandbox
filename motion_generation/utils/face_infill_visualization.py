@@ -207,6 +207,110 @@ def _rmse(reference: np.ndarray, candidate: np.ndarray) -> float:
 
 
 @torch.no_grad()
+def prepare_exported_full_clip_comparison(
+    *,
+    name: str,
+    motion_variants: Mapping[
+        str, Mapping[str, np.ndarray] | str | Path
+    ],
+    anchor_times: Sequence[int],
+    template_bvh: Path,
+    device: torch.device,
+    fps: int = 20,
+    reference_label: str = "Raw GT",
+) -> FullClipFaceInfillComparison:
+    """Prepare a visual comparison from portable motion-evaluation exports.
+
+    ``evaluate_step1_adaptive_motion.py`` writes complete body/left/right
+    dictionaries under ``visual_motion``.  This helper deliberately has no
+    dependency on either Step 1 checkpoint or Step 2, allowing exports from
+    different servers to be rendered together after copying the small result
+    bundles.
+    """
+
+    if reference_label not in motion_variants:
+        raise KeyError(f"Reference variant {reference_label!r} is missing")
+    if len(motion_variants) < 2:
+        raise ValueError("At least two visual motion variants are required")
+    times = tuple(int(value) for value in anchor_times)
+    if len(times) < 2 or times[0] != 0 or any(
+        right <= left for left, right in zip(times[:-1], times[1:])
+    ):
+        raise ValueError("anchor_times must be strictly increasing from zero")
+
+    motions: Dict[str, Mapping[str, np.ndarray]] = {}
+    for label, value in motion_variants.items():
+        if isinstance(value, (str, Path)):
+            path = Path(value)
+            if not path.is_file():
+                raise FileNotFoundError(f"Missing {label} visual motion: {path}")
+            loaded = load_motion_dict(path)
+        else:
+            loaded = dict(value)
+        missing = sorted({"body", "left", "right"}.difference(loaded))
+        if missing:
+            raise KeyError(f"{label} motion is missing fields: {missing}")
+        motions[str(label)] = {
+            key: np.asarray(loaded[key], dtype=np.float32)
+            for key in ("body", "left", "right")
+        }
+
+    frames = min(
+        len(value[key])
+        for value in motions.values()
+        for key in ("body", "left", "right")
+    )
+    if frames < 2:
+        raise ValueError(f"Not enough aligned frames for {name}")
+    motions = {
+        label: {
+            key: np.asarray(value[key][:frames], dtype=np.float32)
+            for key in ("body", "left", "right")
+        }
+        for label, value in motions.items()
+    }
+    positions = _motion_positions(
+        motions,
+        template_bvh=Path(template_bvh),
+        device=device,
+    )
+    body_features = {
+        label: np.asarray(value["body"], dtype=np.float32)
+        for label, value in motions.items()
+    }
+    reference = body_features[reference_label]
+    metrics = {
+        label: {
+            "body_rmse": (
+                0.0
+                if label == reference_label
+                else _rmse(reference, body_features[label])
+            )
+        }
+        for label in motions
+    }
+
+    token_length = int(times[-1]) + 1
+    token_generated = np.ones(token_length, dtype=bool)
+    token_generated[list(times)] = False
+    frame_to_token = np.minimum(
+        np.floor(np.arange(frames) * token_length / frames).astype(np.int64),
+        token_length - 1,
+    )
+    return FullClipFaceInfillComparison(
+        name=str(name),
+        gap=0,
+        fps=int(fps),
+        source_token_frames=token_length,
+        positions=positions,
+        faces={},
+        body_features=body_features,
+        metrics=metrics,
+        generated_mask=token_generated[frame_to_token],
+    )
+
+
+@torch.no_grad()
 def prepare_face_infill_visual_comparison(
     record: EvalWindowRecord,
     models: Mapping[str, tuple[Any, InfillModelSpec]],
@@ -880,8 +984,13 @@ def plot_tiled_full_clip_summary(
     if heatmap is not None:
         fig.colorbar(heatmap, ax=fig.axes, fraction=0.012, pad=0.01, label="coefficient")
     generated_fraction = float(np.mean(comparison.generated_mask))
+    schedule = (
+        f"tiled gap={comparison.gap} token frames"
+        if comparison.gap > 0
+        else "supplied gap schedule"
+    )
     fig.suptitle(
-        f"{comparison.name} | tiled gap={comparison.gap} token frames | "
+        f"{comparison.name} | {schedule} | "
         f"{comparison.frames / comparison.fps:.1f}s | generated={generated_fraction:.1%}",
         fontsize=13,
         y=0.995,
@@ -1186,8 +1295,13 @@ def save_tiled_full_clip_video(
     def update(frame_idx: int):
         generated = bool(comparison.generated_mask[frame_idx])
         region = "GENERATED" if generated else "anchor/context"
+        schedule = (
+            f"tiled gap={comparison.gap}"
+            if comparison.gap > 0
+            else "supplied gap schedule"
+        )
         title.set_text(
-            f"{comparison.name} | tiled gap={comparison.gap} | "
+            f"{comparison.name} | {schedule} | "
             f"{frame_idx / comparison.fps:.2f}s | {region}"
         )
         artists = [title, current_line]
