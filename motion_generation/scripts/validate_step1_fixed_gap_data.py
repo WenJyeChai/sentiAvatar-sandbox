@@ -30,6 +30,7 @@ from scripts.train_step1_multipart_fixed_gap3 import (  # noqa: E402
     validate_frozen_step2_guidance_config,
     validate_paths,
     validate_provided_gap_config,
+    validate_step2_history_config,
 )
 from models.step1_mimi_planner import load_text_map, read_split_names  # noqa: E402
 from utils.adaptive_anchor_tokens import (  # noqa: E402
@@ -78,6 +79,10 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
     gap_counts = Counter()
     annotation_patterns = Counter()
     step2_guidance_gaps = Counter()
+    step2_history_interval_counts: list[int] = []
+    step2_history_frame_counts: list[int] = []
+    step2_history_available_frame_counts: list[int] = []
+    step2_history_corrupted_token_counts: list[int] = []
     errors = []
     audio_input_representation = str(
         getattr(dataset, "audio_input_representation", "fused_frame")
@@ -130,6 +135,18 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
                     item["anchor_times"][1:],
                 )
             ]
+            supervised_tokens = sum(
+                slot >= 0 for slot in item["target_slots"]
+            )
+            expected_supervised_tokens = (
+                max(0, len(item["anchor_times"]) - 1) * 16
+            )
+            if supervised_tokens != expected_supervised_tokens:
+                raise ValueError(
+                    "Only the planned 16-ID anchors may receive CE: "
+                    f"{supervised_tokens} supervised positions != "
+                    f"{expected_supervised_tokens}"
+                )
             guidance_gap = None
             if "step2_guidance_gap" in item:
                 guidance_gap = int(item["step2_guidance_gap"])
@@ -147,7 +164,7 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
             audio_vocabulary_token_position_counts.append(
                 vocabulary_audio_positions
             )
-            target_counts.append(sum(slot >= 0 for slot in item["target_slots"]))
+            target_counts.append(supervised_tokens)
             prefix_counts.append(
                 sum(bool(value) for value in item["bidirectional_prefix_mask"])
             )
@@ -155,6 +172,18 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
             gap_counts.update(item_gaps)
             if guidance_gap is not None:
                 step2_guidance_gaps[guidance_gap] += 1
+            step2_history_interval_counts.append(
+                int(item.get("step2_history_intervals", 0))
+            )
+            step2_history_frame_counts.append(
+                int(item.get("step2_history_frames", 0))
+            )
+            step2_history_available_frame_counts.append(
+                int(item.get("step2_history_available_frames", 0))
+            )
+            step2_history_corrupted_token_counts.append(
+                int(item.get("step2_history_corrupted_tokens", 0))
+            )
         except Exception as exc:  # collect multiple data failures in one audit
             if len(errors) < max_reported_errors:
                 errors.append({"name": name, "error": f"{type(exc).__name__}: {exc}"})
@@ -183,6 +212,18 @@ def validate_split(dataset, split_name: str, max_reported_errors: int) -> dict:
         "step2_guidance_gap_counts": {
             str(key): value for key, value in sorted(step2_guidance_gaps.items())
         },
+        "step2_history_intervals": percentile_summary(
+            step2_history_interval_counts
+        ),
+        "step2_history_frames": percentile_summary(
+            step2_history_frame_counts
+        ),
+        "step2_history_available_frames": percentile_summary(
+            step2_history_available_frame_counts
+        ),
+        "step2_history_corrupted_tokens": percentile_summary(
+            step2_history_corrupted_token_counts
+        ),
     }
 
 
@@ -199,6 +240,7 @@ def main() -> None:
         num_epochs=int(training.get("num_train_epochs", 10)),
     )
     provided_gap = validate_provided_gap_config(config)
+    step2_history = validate_step2_history_config(config)
     if adaptive_gap["enabled"] and provided_gap["enabled"]:
         raise ValueError(
             "adaptive_gap and provided_gap_training are mutually exclusive"
@@ -208,6 +250,7 @@ def main() -> None:
     added = ensure_step1_special_tokens(
         tokenizer,
         include_structured_text=data_config.get("text_serialization") == "structured_fields",
+        include_step2_history=bool(step2_history["register_tokens"]),
     )
     print(f"Tokenizer controls added in-memory: {len(added)}")
     added_audio = []
@@ -234,6 +277,7 @@ def main() -> None:
         adaptive_gap=adaptive_gap,
         provided_gap=provided_gap,
         frozen_step2_guidance=frozen_step2_guidance,
+        step2_history=step2_history,
     )
     eval_dataset = build_dataset(
         eval_names,
@@ -246,6 +290,7 @@ def main() -> None:
         adaptive_gap=adaptive_gap,
         provided_gap=provided_gap,
         frozen_step2_guidance=frozen_step2_guidance,
+        step2_history=step2_history,
     )
     report = {
         "config": str(args.config.resolve()),
@@ -257,7 +302,12 @@ def main() -> None:
             else 0
         ),
         "audio_vocabulary_tokens_added_in_memory": len(added_audio),
-        "provided_gap_training": provided_gap,
+        "provided_gap_training": json.loads(
+            json.dumps(provided_gap, default=str)
+        ),
+        "step2_history": json.loads(
+            json.dumps(step2_history, default=str)
+        ),
     }
     if adaptive_gap["enabled"]:
         report["adaptive_phases"] = []

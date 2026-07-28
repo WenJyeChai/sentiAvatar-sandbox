@@ -36,6 +36,10 @@ from utils.adaptive_anchor_tokens import (  # noqa: E402
     EXPRESSION_TOKEN,
     GAP_TOKENS,
     MIMI_FRAME_TOKEN,
+    MOTION_HISTORY_FRAME_TOKEN,
+    STEP2_HISTORY_END_TOKEN,
+    STEP2_HISTORY_MASK_TOKENS,
+    STEP2_HISTORY_START_TOKEN,
     TRANSCRIPT_TOKEN,
     body_global_id,
     body_token,
@@ -59,6 +63,11 @@ from utils.step1_condition_alignment import (  # noqa: E402
     counterfactual_likelihood_loss,
 )
 from utils.step1_adaptive_schedule import parse_curriculum  # noqa: E402
+from utils.step1_step2_history import (  # noqa: E402
+    cache_path as step2_history_cache_path,
+    load_step2_history_cache,
+    save_step2_history_cache,
+)
 
 
 @pytest.fixture(scope="module")
@@ -230,6 +239,236 @@ def test_prefix_lm_mask_has_bidirectional_prefix_and_causal_plan():
     assert allowed[4].tolist() == [True, True, True, True, True, False]
     # Padding queries keep valid causal keys to avoid an all-masked SDPA row.
     assert allowed[5].tolist() == [True, True, True, True, True, False]
+
+
+def test_gt_boundary_step2_history_is_dense_causal_context_only(
+    tmp_path: Path,
+):
+    tokenizer = AutoTokenizer.from_pretrained(
+        PROJECT_DIR / "checkpoints" / "llm",
+        local_files_only=True,
+    )
+    ensure_step1_special_tokens(
+        tokenizer,
+        include_structured_text=True,
+        include_step2_history=True,
+    )
+    name = "session/step2_history"
+    motion_dir, audio_dir, dense_tokens, _ = _write_synthetic_clip(
+        tmp_path,
+        name,
+    )
+    anchors = (0, 8, 16, 24, 32, 35)
+    interval_frames = []
+    for interval_index, (left, right) in enumerate(
+        zip(anchors[:-1], anchors[1:])
+    ):
+        gap = gap_from_anchor_times(left, right)
+        predicted = np.asarray(
+            [
+                [
+                    (300 + 19 * interval_index + 7 * frame + slot) % 512
+                    for slot in range(16)
+                ]
+                for frame in range(gap)
+            ],
+            dtype=np.int64,
+        )
+        interval_frames.append(
+            np.concatenate(
+                [
+                    predicted,
+                    np.asarray(dense_tokens[right], dtype=np.int64)[None],
+                ],
+                axis=0,
+            )
+        )
+    cache_root = tmp_path / "history_cache"
+    history_path = step2_history_cache_path(cache_root, name)
+    save_step2_history_cache(
+        history_path,
+        name=name,
+        token_frames=len(dense_tokens),
+        anchor_times=anchors,
+        interval_frames=interval_frames,
+        schedule_seed=42,
+        step2_checkpoint_fingerprint="unit-test",
+    )
+    loaded = load_step2_history_cache(
+        history_path,
+        dense_motion_tokens=dense_tokens,
+    )
+    assert loaded.anchor_times == anchors
+
+    dataset = Step1ProvidedGapDataset(
+        [name],
+        tokenizer=tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "dense history"},
+        min_gap=3,
+        max_gap=15,
+        resample_each_epoch=False,
+        seed_mode="observed",
+        sequence_layout="full_audio_prefix",
+        provided_schedule_cache_dir=cache_root,
+        step2_history_cache_dir=cache_root,
+        step2_history_min_frames=1,
+        step2_history_max_frames=15,
+    )
+    item = dataset[0]
+    assert item["anchor_times"] == anchors
+    assert item["step2_history_intervals"] == len(anchors) - 2
+    assert 1 * (len(anchors) - 2) <= item["step2_history_frames"]
+    assert item["step2_history_frames"] <= 15 * (len(anchors) - 2)
+    assert sum(slot >= 0 for slot in item["target_slots"]) == (
+        len(anchors) - 1
+    ) * BODY_SLOT_COUNT
+
+    start_id = tokenizer.convert_tokens_to_ids(STEP2_HISTORY_START_TOKEN)
+    end_id = tokenizer.convert_tokens_to_ids(STEP2_HISTORY_END_TOKEN)
+    frame_id = tokenizer.convert_tokens_to_ids(MOTION_HISTORY_FRAME_TOKEN)
+    start_positions = [
+        index
+        for index, token_id in enumerate(item["input_ids"])
+        if token_id == start_id
+    ]
+    end_positions = [
+        index
+        for index, token_id in enumerate(item["input_ids"])
+        if token_id == end_id
+    ]
+    assert len(start_positions) == len(end_positions) == len(anchors) - 2
+    assert item["input_ids"].count(frame_id) == item["step2_history_frames"]
+    for interval_index, (start, end) in enumerate(
+        zip(start_positions, end_positions)
+    ):
+        assert all(
+            slot == -1 for slot in item["target_slots"][start : end + 1]
+        )
+        assert all(
+            label == IGNORE_INDEX
+            for label in item["motion_local_labels"][start : end + 1]
+        )
+        last_frame_marker = max(
+            position
+            for position in range(start, end)
+            if item["input_ids"][position] == frame_id
+        )
+        endpoint = [
+            parse_body_token(tokenizer.convert_ids_to_tokens(token_id))[1]
+            for token_id in item["input_ids"][
+                last_frame_marker + 1 : last_frame_marker + 1 + BODY_SLOT_COUNT
+            ]
+        ]
+        assert endpoint == dense_tokens[anchors[interval_index + 1]]
+
+    control = Step1ProvidedGapDataset(
+        [name],
+        tokenizer=tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "dense history"},
+        min_gap=3,
+        max_gap=15,
+        resample_each_epoch=False,
+        seed_mode="observed",
+        sequence_layout="full_audio_prefix",
+        provided_schedule_cache_dir=cache_root,
+    )[0]
+    assert control["anchor_times"] == item["anchor_times"]
+    assert start_id not in control["input_ids"]
+    assert sum(slot >= 0 for slot in control["target_slots"]) == sum(
+        slot >= 0 for slot in item["target_slots"]
+    )
+
+
+def test_step2_history_corruption_preserves_gt_endpoint(tmp_path: Path):
+    tokenizer = AutoTokenizer.from_pretrained(
+        PROJECT_DIR / "checkpoints" / "llm",
+        local_files_only=True,
+    )
+    ensure_step1_special_tokens(
+        tokenizer,
+        include_structured_text=True,
+        include_step2_history=True,
+    )
+    name = "session/corrupt_step2_history"
+    motion_dir, audio_dir, dense_tokens, _ = _write_synthetic_clip(
+        tmp_path,
+        name,
+    )
+    anchors = (0, 8, 16, 24, 32, 35)
+    interval_frames = []
+    for left, right in zip(anchors[:-1], anchors[1:]):
+        gap = gap_from_anchor_times(left, right)
+        missing = np.full((gap, BODY_SLOT_COUNT), 123, dtype=np.int64)
+        interval_frames.append(
+            np.concatenate(
+                [missing, np.asarray(dense_tokens[right])[None]],
+                axis=0,
+            )
+        )
+    cache_root = tmp_path / "history_cache"
+    save_step2_history_cache(
+        step2_history_cache_path(cache_root, name),
+        name=name,
+        token_frames=len(dense_tokens),
+        anchor_times=anchors,
+        interval_frames=interval_frames,
+        schedule_seed=42,
+        step2_checkpoint_fingerprint="unit-test",
+    )
+    item = Step1ProvidedGapDataset(
+        [name],
+        tokenizer=tokenizer,
+        motion_token_dir=motion_dir,
+        mimi_token_dir=audio_dir,
+        text_map={name: "corrupt history"},
+        min_gap=3,
+        max_gap=15,
+        resample_each_epoch=False,
+        seed_mode="observed",
+        sequence_layout="full_audio_prefix",
+        provided_schedule_cache_dir=cache_root,
+        step2_history_cache_dir=cache_root,
+        step2_history_min_frames=15,
+        step2_history_max_frames=15,
+        step2_history_corruption_probability=1.0,
+        step2_history_corruption_rate_min=1.0,
+        step2_history_corruption_rate_max=1.0,
+        step2_history_mask_weight=1.0,
+        step2_history_same_slot_replace_weight=0.0,
+        step2_history_previous_hold_weight=0.0,
+        step2_history_preserve_current_endpoint=True,
+    )[0]
+    mask_ids = {
+        tokenizer.convert_tokens_to_ids(token)
+        for token in STEP2_HISTORY_MASK_TOKENS
+    }
+    assert item["step2_history_corrupted_tokens"] > 0
+    assert any(token_id in mask_ids for token_id in item["input_ids"])
+    end_id = tokenizer.convert_tokens_to_ids(STEP2_HISTORY_END_TOKEN)
+    frame_id = tokenizer.convert_tokens_to_ids(MOTION_HISTORY_FRAME_TOKEN)
+    for interval_index, end in enumerate(
+        index
+        for index, token_id in enumerate(item["input_ids"])
+        if token_id == end_id
+    ):
+        marker = max(
+            position
+            for position in range(end)
+            if item["input_ids"][position] == frame_id
+        )
+        endpoint_ids = item["input_ids"][
+            marker + 1 : marker + 1 + BODY_SLOT_COUNT
+        ]
+        assert not any(token_id in mask_ids for token_id in endpoint_ids)
+        endpoint = [
+            parse_body_token(tokenizer.convert_ids_to_tokens(token_id))[1]
+            for token_id in endpoint_ids
+        ]
+        assert endpoint == dense_tokens[anchors[interval_index + 1]]
 
 
 def test_dataset_and_collator_build_one_step2_guidance_window(

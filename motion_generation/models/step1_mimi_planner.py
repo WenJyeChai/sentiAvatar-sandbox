@@ -39,11 +39,15 @@ from utils.adaptive_anchor_tokens import (
     EXPRESSION_TOKEN,
     GAP_TOKENS,
     MIMI_FRAME_TOKEN,
+    MOTION_HISTORY_FRAME_TOKEN,
     MOTION_END_TOKEN,
     MOTION_START_TOKEN,
     NANO_AUDIO_CARDINALITY,
     NANO_AUDIO_CODEBOOKS,
     SEED_TOKEN_BY_MODE,
+    STEP2_HISTORY_END_TOKEN,
+    STEP2_HISTORY_MASK_TOKENS,
+    STEP2_HISTORY_START_TOKEN,
     STEP1_ROLE_TOKEN,
     TRANSCRIPT_TOKEN,
     audio_token_id_table,
@@ -61,6 +65,13 @@ from utils.step1_adaptive_schedule import (
     phase_for_epoch,
     random_curriculum_schedule,
     random_uniform_schedule,
+)
+from utils.step1_step2_history import (
+    Step2HistoryCache,
+    cache_path as step2_history_cache_path,
+    deterministic_uint64,
+    deterministic_unit_interval,
+    load_step2_history_cache,
 )
 
 
@@ -253,6 +264,10 @@ class Step1Sequence:
     step2_guidance_gap: Optional[int]
     step2_guidance_motion_tokens: Optional[list[list[int]]]
     step2_guidance_audio_features: Optional[np.ndarray]
+    step2_history_intervals: int
+    step2_history_frames: int
+    step2_history_available_frames: int
+    step2_history_corrupted_tokens: int
 
 
 class Step1FixedGapDataset(Dataset):
@@ -302,6 +317,18 @@ class Step1FixedGapDataset(Dataset):
         step2_guidance_resample: bool = False,
         step2_guidance_min_anchor_group: int = 0,
         step2_guidance_required_gap: Optional[int] = None,
+        provided_schedule_cache_dir: Optional[Path] = None,
+        step2_history_cache_dir: Optional[Path] = None,
+        step2_history_min_frames: int = 1,
+        step2_history_max_frames: int = 15,
+        step2_history_resample_each_epoch: bool = False,
+        step2_history_corruption_probability: float = 0.0,
+        step2_history_corruption_rate_min: float = 0.05,
+        step2_history_corruption_rate_max: float = 0.15,
+        step2_history_mask_weight: float = 0.5,
+        step2_history_same_slot_replace_weight: float = 0.3,
+        step2_history_previous_hold_weight: float = 0.2,
+        step2_history_preserve_current_endpoint: bool = True,
     ) -> None:
         if seed_mode not in {"observed", "previous", "neutral", "mixed_known", "mixed_all"}:
             raise ValueError(
@@ -413,6 +440,75 @@ class Step1FixedGapDataset(Dataset):
             if step2_guidance_required_gap is not None
             else None
         )
+        self.provided_schedule_cache_dir = (
+            Path(provided_schedule_cache_dir)
+            if provided_schedule_cache_dir is not None
+            else None
+        )
+        self.step2_history_cache_dir = (
+            Path(step2_history_cache_dir)
+            if step2_history_cache_dir is not None
+            else None
+        )
+        if (
+            self.step2_history_cache_dir is not None
+            and self.provided_schedule_cache_dir is not None
+            and self.step2_history_cache_dir.resolve()
+            != self.provided_schedule_cache_dir.resolve()
+        ):
+            raise ValueError(
+                "Step 2 history and supplied schedule must use the same cache root"
+            )
+        self.step2_history_min_frames = int(step2_history_min_frames)
+        self.step2_history_max_frames = int(step2_history_max_frames)
+        self.step2_history_resample_each_epoch = bool(
+            step2_history_resample_each_epoch
+        )
+        if not (
+            1
+            <= self.step2_history_min_frames
+            <= self.step2_history_max_frames
+            <= 15
+        ):
+            raise ValueError(
+                "Step 2 history length must satisfy 1 <= min <= max <= 15"
+            )
+        self.step2_history_corruption_probability = float(
+            step2_history_corruption_probability
+        )
+        self.step2_history_corruption_rate_min = float(
+            step2_history_corruption_rate_min
+        )
+        self.step2_history_corruption_rate_max = float(
+            step2_history_corruption_rate_max
+        )
+        if not 0 <= self.step2_history_corruption_probability <= 1:
+            raise ValueError(
+                "Step 2 history corruption probability must be in [0,1]"
+            )
+        if not (
+            0
+            <= self.step2_history_corruption_rate_min
+            <= self.step2_history_corruption_rate_max
+            <= 1
+        ):
+            raise ValueError(
+                "Step 2 history corruption rates must satisfy 0 <= min <= max <= 1"
+            )
+        self.step2_history_corruption_weights = (
+            float(step2_history_mask_weight),
+            float(step2_history_same_slot_replace_weight),
+            float(step2_history_previous_hold_weight),
+        )
+        if any(value < 0 for value in self.step2_history_corruption_weights) or (
+            sum(self.step2_history_corruption_weights) <= 0
+        ):
+            raise ValueError(
+                "Step 2 history corruption weights must have a positive total"
+            )
+        self.step2_history_preserve_current_endpoint = bool(
+            step2_history_preserve_current_endpoint
+        )
         if self.step2_guidance_min_anchor_group < 0:
             raise ValueError(
                 "step2_guidance_min_anchor_group must be non-negative"
@@ -443,6 +539,15 @@ class Step1FixedGapDataset(Dataset):
             *GAP_TOKENS,
             *SEED_TOKEN_BY_MODE.values(),
         }
+        if self.step2_history_cache_dir is not None:
+            tokens.update(
+                {
+                    STEP2_HISTORY_START_TOKEN,
+                    STEP2_HISTORY_END_TOKEN,
+                    MOTION_HISTORY_FRAME_TOKEN,
+                    *STEP2_HISTORY_MASK_TOKENS,
+                }
+            )
         if self.text_serialization == "structured_fields":
             tokens.update(
                 {
@@ -477,6 +582,178 @@ class Step1FixedGapDataset(Dataset):
         normal = tuple(gap for gap in gaps if gap >= 3)
         tail = gaps[-1] if gaps and gaps[-1] <= 2 else None
         return GapSchedule(anchor_times, {}, normal, tail, 0.0)
+
+    def _load_step2_history_cache(
+        self,
+        name: str,
+        motion_tokens: Sequence[Sequence[int]],
+    ) -> Optional[Step2HistoryCache]:
+        root = self.step2_history_cache_dir or self.provided_schedule_cache_dir
+        if root is None:
+            return None
+        cache = load_step2_history_cache(
+            step2_history_cache_path(root, name),
+            dense_motion_tokens=motion_tokens,
+        )
+        if cache.name != name.replace("\\", "/"):
+            raise ValueError(
+                f"Step 2 history cache name {cache.name!r} != {name!r}"
+            )
+        return cache
+
+    @staticmethod
+    def _schedule_from_step2_history_cache(
+        cache: Step2HistoryCache,
+    ) -> GapSchedule:
+        normal = tuple(gap for gap in cache.gaps if gap >= 3)
+        tail = (
+            cache.gaps[-1]
+            if cache.gaps and cache.gaps[-1] <= 2
+            else None
+        )
+        return GapSchedule(
+            anchor_times=cache.anchor_times,
+            soft_targets_by_left={},
+            normal_gaps=normal,
+            tail_gap=tail,
+            total_cost=0.0,
+        )
+
+    def _step2_history_suffix(
+        self,
+        *,
+        cache: Step2HistoryCache,
+        interval_index: int,
+        name: str,
+    ) -> tuple[list[list[Optional[int]]], int, int]:
+        """Return a recent suffix, corrupted deterministically for this epoch.
+
+        Cached intervals contain every Step 2 missing frame followed by the GT
+        right endpoint. The endpoint is the final unmarked motion frame and is
+        preserved by the first robustness experiment.
+        """
+
+        full = np.asarray(cache.interval(interval_index), dtype=np.int64)
+        available = len(full)
+        maximum = min(self.step2_history_max_frames, available)
+        minimum = min(self.step2_history_min_frames, maximum)
+        if maximum <= 0:
+            raise ValueError(
+                f"{name}: cached interval {interval_index} has no history frames"
+            )
+        sampling_epoch = self.epoch if self.step2_history_resample_each_epoch else 0
+        sampled_length = minimum + (
+            deterministic_uint64(
+                "step2-history-length",
+                self.random_seed,
+                sampling_epoch,
+                name,
+                interval_index,
+            )
+            % (maximum - minimum + 1)
+        )
+        suffix_start = available - int(sampled_length)
+        suffix: list[list[Optional[int]]] = [
+            [int(value) for value in frame]
+            for frame in full[suffix_start:]
+        ]
+
+        corrupt = (
+            self.step2_history_corruption_probability > 0
+            and deterministic_unit_interval(
+                "step2-history-corrupt-example",
+                self.random_seed,
+                sampling_epoch,
+                name,
+            )
+            < self.step2_history_corruption_probability
+        )
+        eligible_frames = len(suffix) - int(
+            self.step2_history_preserve_current_endpoint
+        )
+        eligible_tokens = max(0, eligible_frames) * BODY_SLOT_COUNT
+        if not corrupt or eligible_tokens == 0:
+            return suffix, available, 0
+
+        severity_position = deterministic_unit_interval(
+            "step2-history-corruption-rate",
+            self.random_seed,
+            sampling_epoch,
+            name,
+            interval_index,
+        )
+        rate = self.step2_history_corruption_rate_min + severity_position * (
+            self.step2_history_corruption_rate_max
+            - self.step2_history_corruption_rate_min
+        )
+        corrupt_count = min(
+            eligible_tokens,
+            max(1, int(math.floor(eligible_tokens * rate + 0.5))),
+        )
+        positions = sorted(
+            range(eligible_tokens),
+            key=lambda position: deterministic_uint64(
+                "step2-history-corruption-position",
+                self.random_seed,
+                sampling_epoch,
+                name,
+                interval_index,
+                position,
+            ),
+        )[:corrupt_count]
+        mask_weight, replace_weight, hold_weight = (
+            self.step2_history_corruption_weights
+        )
+        total_weight = mask_weight + replace_weight + hold_weight
+        mask_boundary = mask_weight / total_weight
+        replace_boundary = (mask_weight + replace_weight) / total_weight
+
+        for flat_position in positions:
+            frame_index, slot = divmod(flat_position, BODY_SLOT_COUNT)
+            operation = deterministic_unit_interval(
+                "step2-history-corruption-operation",
+                self.random_seed,
+                sampling_epoch,
+                name,
+                interval_index,
+                flat_position,
+            )
+            if operation < mask_boundary:
+                suffix[frame_index][slot] = None
+                continue
+            if operation < replace_boundary:
+                # Draw a plausible same-slot value from another Step 2 frame
+                # in the cached interval rather than from a uniform 512-way
+                # distribution.
+                candidates = [
+                    frame
+                    for frame in range(available)
+                    if frame != suffix_start + frame_index
+                ]
+                if not candidates:
+                    suffix[frame_index][slot] = None
+                    continue
+                donor = candidates[
+                    deterministic_uint64(
+                        "step2-history-same-slot-donor",
+                        self.random_seed,
+                        sampling_epoch,
+                        name,
+                        interval_index,
+                        flat_position,
+                    )
+                    % len(candidates)
+                ]
+                suffix[frame_index][slot] = int(full[donor, slot])
+                continue
+
+            source_frame = suffix_start + frame_index - 1
+            if source_frame >= 0:
+                suffix[frame_index][slot] = int(full[source_frame, slot])
+            else:
+                suffix[frame_index][slot] = None
+
+        return suffix, available, corrupt_count
 
     def __len__(self) -> int:
         return len(self.names)
@@ -711,6 +988,14 @@ class Step1FixedGapDataset(Dataset):
             "gap_loss_weight": sequence.gap_loss_weight,
             "normal_gaps": sequence.normal_gaps,
             "tail_gap": sequence.tail_gap,
+            "step2_history_intervals": sequence.step2_history_intervals,
+            "step2_history_frames": sequence.step2_history_frames,
+            "step2_history_available_frames": (
+                sequence.step2_history_available_frames
+            ),
+            "step2_history_corrupted_tokens": (
+                sequence.step2_history_corrupted_tokens
+            ),
         }
         if sequence.step2_guidance_anchor_group is not None:
             result.update(
@@ -749,7 +1034,15 @@ class Step1FixedGapDataset(Dataset):
                 f"motion={motion_duration:.4f}s, error={mismatch:.4f}s"
             )
 
-        schedule = self._anchor_schedule(name, motion_tokens)
+        step2_history_cache = self._load_step2_history_cache(
+            name,
+            motion_tokens,
+        )
+        schedule = (
+            self._schedule_from_step2_history_cache(step2_history_cache)
+            if step2_history_cache is not None
+            else self._anchor_schedule(name, motion_tokens)
+        )
         anchor_times = schedule.anchor_times
         audio_boundaries = causal_audio_boundaries(
             anchor_times,
@@ -869,6 +1162,54 @@ class Step1FixedGapDataset(Dataset):
                     motion_local_labels.append(int(target_anchor[slot]))
                     target_anchor_ids.append(int(anchor_group))
 
+        step2_history_intervals = 0
+        step2_history_frames = 0
+        step2_history_available_frames = 0
+        step2_history_corrupted_tokens = 0
+
+        def append_step2_history(
+            frames: Sequence[Sequence[Optional[int]]],
+        ) -> None:
+            append_control(STEP2_HISTORY_START_TOKEN)
+            for frame in frames:
+                if len(frame) != BODY_SLOT_COUNT:
+                    raise ValueError(
+                        f"{name}: Step 2 history frame has {len(frame)} slots"
+                    )
+                append_control(MOTION_HISTORY_FRAME_TOKEN)
+                for slot, local_id in enumerate(frame):
+                    if local_id is None:
+                        input_ids.append(
+                            self._single_token_ids[
+                                STEP2_HISTORY_MASK_TOKENS[slot]
+                            ]
+                        )
+                    else:
+                        token_id = self.tokenizer.convert_tokens_to_ids(
+                            body_token(slot, int(local_id))
+                        )
+                        if token_id is None:
+                            raise ValueError(
+                                f"Tokenizer is missing Step 2 history body "
+                                f"token for slot {slot}, id {local_id}"
+                            )
+                        input_ids.append(int(token_id))
+                    audio_codes.append(empty_audio.copy())
+                    target_slots.append(-1)
+                    motion_local_labels.append(IGNORE_INDEX)
+                    text_mask.append(0)
+                    expression_mask.append(0)
+                    action_mask.append(0)
+                    transcript_mask.append(0)
+                    bidirectional_prefix_mask.append(
+                        int(in_bidirectional_prefix)
+                    )
+                    audio_anchor_ids.append(-1)
+                    target_anchor_ids.append(-1)
+                    gap_target_probs.append([0.0] * len(GAP_TOKENS))
+                    gap_target_mask.append(0)
+            append_control(STEP2_HISTORY_END_TOKEN)
+
         audio_cursor = 0
         if full_audio_prefix:
             for frame_codes in audio_token_codes.T:
@@ -886,6 +1227,25 @@ class Step1FixedGapDataset(Dataset):
 
         generated_prefix_anchors = 0
         for anchor_index in range(1, len(anchor_times)):
+            if (
+                self.step2_history_cache_dir is not None
+                and anchor_index >= 2
+            ):
+                assert step2_history_cache is not None
+                (
+                    history_frames,
+                    available_frames,
+                    corrupted_tokens,
+                ) = self._step2_history_suffix(
+                    cache=step2_history_cache,
+                    interval_index=anchor_index - 2,
+                    name=name,
+                )
+                append_step2_history(history_frames)
+                step2_history_intervals += 1
+                step2_history_frames += len(history_frames)
+                step2_history_available_frames += available_frames
+                step2_history_corrupted_tokens += corrupted_tokens
             left_time = anchor_times[anchor_index - 1]
             target_time = anchor_times[anchor_index]
             gap = gap_from_anchor_times(left_time, target_time)
@@ -1029,6 +1389,10 @@ class Step1FixedGapDataset(Dataset):
             step2_guidance_audio_features=(
                 None if guidance is None else guidance[3]
             ),
+            step2_history_intervals=step2_history_intervals,
+            step2_history_frames=step2_history_frames,
+            step2_history_available_frames=step2_history_available_frames,
+            step2_history_corrupted_tokens=step2_history_corrupted_tokens,
         )
 
 
@@ -1312,6 +1676,22 @@ class Step1PlannerCollator:
                     -1 if example.get("tail_gap") is None else int(example["tail_gap"])
                     for example in examples
                 ],
+                dtype=torch.long,
+            ),
+            "step2_history_intervals": torch.tensor(
+                [int(example.get("step2_history_intervals", 0)) for example in examples],
+                dtype=torch.long,
+            ),
+            "step2_history_frames": torch.tensor(
+                [int(example.get("step2_history_frames", 0)) for example in examples],
+                dtype=torch.long,
+            ),
+            "step2_history_available_frames": torch.tensor(
+                [int(example.get("step2_history_available_frames", 0)) for example in examples],
+                dtype=torch.long,
+            ),
+            "step2_history_corrupted_tokens": torch.tensor(
+                [int(example.get("step2_history_corrupted_tokens", 0)) for example in examples],
                 dtype=torch.long,
             ),
         }

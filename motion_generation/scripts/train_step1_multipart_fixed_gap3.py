@@ -254,6 +254,7 @@ def data_config_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     data = section(config, "data")
     data["_audio_contract"] = audio_contract_from_config(config)
     data["_provided_gap_training"] = validate_provided_gap_config(config)
+    data["_step2_history"] = validate_step2_history_config(config)
     data["audio_input_representation"] = data["_audio_contract"][
         "input_representation"
     ]
@@ -291,10 +292,30 @@ def validate_provided_gap_config(
     supplied.setdefault("min_gap", 3)
     supplied.setdefault("max_gap", 15)
     supplied.setdefault("resample_each_epoch", True)
+    supplied.setdefault("schedule_cache_dir", None)
     supplied["distribution"] = str(supplied["distribution"])
     supplied["min_gap"] = int(supplied["min_gap"])
     supplied["max_gap"] = int(supplied["max_gap"])
     supplied["resample_each_epoch"] = bool(supplied["resample_each_epoch"])
+    if supplied["schedule_cache_dir"] is not None:
+        supplied["schedule_cache_dir"] = project_path(
+            supplied["schedule_cache_dir"]
+        )
+        if not supplied["schedule_cache_dir"].is_dir():
+            raise FileNotFoundError(
+                "Supplied-gap schedule cache is missing: "
+                f"{supplied['schedule_cache_dir']}"
+            )
+        if supplied["resample_each_epoch"]:
+            raise ValueError(
+                "A cached supplied-gap schedule requires "
+                "resample_each_epoch=false"
+            )
+        from utils.step1_step2_history import load_history_manifests
+
+        supplied["schedule_manifests"] = load_history_manifests(
+            supplied["schedule_cache_dir"]
+        )
     if supplied["distribution"] != "uniform":
         raise ValueError(
             "provided_gap_training currently supports only distribution=uniform"
@@ -305,6 +326,92 @@ def validate_provided_gap_config(
             "<= max_gap <= 15"
         )
     return supplied
+
+
+def validate_step2_history_config(
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    history = section(config, "step2_history")
+    history.setdefault("enabled", False)
+    history.setdefault("register_tokens", history["enabled"])
+    history.setdefault("cache_dir", None)
+    history.setdefault("min_frames", 1)
+    history.setdefault("max_frames", 15)
+    history["enabled"] = bool(history["enabled"])
+    history["register_tokens"] = bool(history["register_tokens"])
+    history["min_frames"] = int(history["min_frames"])
+    history["max_frames"] = int(history["max_frames"])
+    if not 1 <= history["min_frames"] <= history["max_frames"] <= 15:
+        raise ValueError(
+            "step2_history frame range must satisfy 1 <= min <= max <= 15"
+        )
+    if history["enabled"]:
+        if history["cache_dir"] is None:
+            raise ValueError("Enabled step2_history requires cache_dir")
+        history["cache_dir"] = project_path(history["cache_dir"])
+        if not history["cache_dir"].is_dir():
+            raise FileNotFoundError(
+                f"Step 2 history cache is missing: {history['cache_dir']}"
+            )
+        from utils.step1_step2_history import load_history_manifests
+
+        history["manifests"] = load_history_manifests(history["cache_dir"])
+    elif history["cache_dir"] is not None:
+        history["cache_dir"] = project_path(history["cache_dir"])
+
+    corruption = history.get("corruption", {})
+    if not isinstance(corruption, Mapping):
+        raise ValueError("step2_history.corruption must be a mapping")
+    corruption = dict(corruption)
+    corruption.setdefault("enabled", False)
+    corruption.setdefault("example_probability", 0.5)
+    corruption.setdefault("rate_min", 0.05)
+    corruption.setdefault("rate_max", 0.15)
+    corruption.setdefault("mask_weight", 0.5)
+    corruption.setdefault("same_slot_replace_weight", 0.3)
+    corruption.setdefault("previous_hold_weight", 0.2)
+    corruption.setdefault("preserve_current_endpoint", True)
+    corruption.setdefault("apply_to_eval", False)
+    corruption["enabled"] = bool(corruption["enabled"])
+    corruption["example_probability"] = float(
+        corruption["example_probability"]
+    )
+    corruption["rate_min"] = float(corruption["rate_min"])
+    corruption["rate_max"] = float(corruption["rate_max"])
+    corruption["mask_weight"] = float(corruption["mask_weight"])
+    corruption["same_slot_replace_weight"] = float(
+        corruption["same_slot_replace_weight"]
+    )
+    corruption["previous_hold_weight"] = float(
+        corruption["previous_hold_weight"]
+    )
+    corruption["preserve_current_endpoint"] = bool(
+        corruption["preserve_current_endpoint"]
+    )
+    corruption["apply_to_eval"] = bool(corruption["apply_to_eval"])
+    if not 0 <= corruption["example_probability"] <= 1:
+        raise ValueError(
+            "step2_history corruption example_probability must be in [0,1]"
+        )
+    if not 0 <= corruption["rate_min"] <= corruption["rate_max"] <= 1:
+        raise ValueError(
+            "step2_history corruption rates must satisfy 0 <= min <= max <= 1"
+        )
+    weights = (
+        corruption["mask_weight"],
+        corruption["same_slot_replace_weight"],
+        corruption["previous_hold_weight"],
+    )
+    if any(value < 0 for value in weights) or sum(weights) <= 0:
+        raise ValueError(
+            "step2_history corruption weights must have positive total"
+        )
+    if corruption["enabled"] and not history["enabled"]:
+        raise ValueError(
+            "step2_history corruption cannot be enabled without dense history"
+        )
+    history["corruption"] = corruption
+    return history
 
 
 def validate_adaptive_gap_config(
@@ -535,6 +642,7 @@ def build_model_and_tokenizer(
     audio_contract: Mapping[str, Any],
     text_serialization: str = "raw",
     planner_attention_mode: str = "causal",
+    include_step2_history_tokens: bool = False,
 ) -> tuple[MimiQwenPlanner, Any, list[str]]:
     if resume is not None:
         resume = resume.resolve()
@@ -547,6 +655,7 @@ def build_model_and_tokenizer(
         added = ensure_step1_special_tokens(
             tokenizer,
             include_structured_text=text_serialization == "structured_fields",
+            include_step2_history=include_step2_history_tokens,
         )
         if added:
             raise RuntimeError(f"Resume checkpoint is missing Step 1 controls: {added}")
@@ -645,6 +754,7 @@ def build_model_and_tokenizer(
         tokenizer,
         language_model,
         include_structured_text=text_serialization == "structured_fields",
+        include_step2_history=include_step2_history_tokens,
     )
     audio_token_ids: list[list[int]] = []
     if audio_contract["input_representation"] == "ordinary_tokens":
@@ -696,6 +806,7 @@ def build_dataset(
     adaptive_gap: Optional[Mapping[str, Any]] = None,
     provided_gap: Optional[Mapping[str, Any]] = None,
     frozen_step2_guidance: Optional[Mapping[str, Any]] = None,
+    step2_history: Optional[Mapping[str, Any]] = None,
 ) -> Step1FixedGapDataset:
     generated_anchor_dir_value = data_config.get("generated_anchor_dir") if training else None
     generated_anchor_dir = project_path(generated_anchor_dir_value) if generated_anchor_dir_value else None
@@ -720,6 +831,11 @@ def build_dataset(
         raw_provided = data_config.get("_provided_gap_training", {})
         provided_gap = (
             raw_provided if isinstance(raw_provided, Mapping) else {}
+        )
+    if step2_history is None:
+        raw_history = data_config.get("_step2_history", {})
+        step2_history = (
+            raw_history if isinstance(raw_history, Mapping) else {}
         )
     adaptive_enabled = bool(
         adaptive_gap is not None and adaptive_gap.get("enabled", False)
@@ -752,6 +868,11 @@ def build_dataset(
     guidance_enabled = bool(
         frozen_step2_guidance is not None
         and frozen_step2_guidance.get("enabled", False)
+    )
+    history_enabled = bool(step2_history.get("enabled", False))
+    history_corruption = dict(step2_history.get("corruption", {}))
+    corruption_enabled = bool(history_corruption.get("enabled", False)) and (
+        training or bool(history_corruption.get("apply_to_eval", False))
     )
     return dataset_class(
         names,
@@ -810,6 +931,36 @@ def build_dataset(
             frozen_step2_guidance.get("required_gap")
             if guidance_enabled
             else None
+        ),
+        provided_schedule_cache_dir=provided_gap.get("schedule_cache_dir"),
+        step2_history_cache_dir=(
+            step2_history.get("cache_dir") if history_enabled else None
+        ),
+        step2_history_min_frames=int(step2_history.get("min_frames", 1)),
+        step2_history_max_frames=int(step2_history.get("max_frames", 15)),
+        step2_history_resample_each_epoch=bool(training and history_enabled),
+        step2_history_corruption_probability=(
+            float(history_corruption.get("example_probability", 0.5))
+            if corruption_enabled
+            else 0.0
+        ),
+        step2_history_corruption_rate_min=float(
+            history_corruption.get("rate_min", 0.05)
+        ),
+        step2_history_corruption_rate_max=float(
+            history_corruption.get("rate_max", 0.15)
+        ),
+        step2_history_mask_weight=float(
+            history_corruption.get("mask_weight", 0.5)
+        ),
+        step2_history_same_slot_replace_weight=float(
+            history_corruption.get("same_slot_replace_weight", 0.3)
+        ),
+        step2_history_previous_hold_weight=float(
+            history_corruption.get("previous_hold_weight", 0.2)
+        ),
+        step2_history_preserve_current_endpoint=bool(
+            history_corruption.get("preserve_current_endpoint", True)
         ),
         **schedule_kwargs,
     )
@@ -1642,6 +1793,7 @@ def main() -> None:
     requested_epochs = int(training.get("num_train_epochs", 10))
     planner_context = planner_context_from_config(config)
     data_config = data_config_from_config(config)
+    step2_history = dict(data_config["_step2_history"])
     audio_contract = audio_contract_from_config(config)
     adaptive_gap = validate_adaptive_gap_config(
         config,
@@ -1670,12 +1822,14 @@ def main() -> None:
             bool(provided_gap["enabled"])
             and bool(provided_gap["resample_each_epoch"])
         )
+        or bool(step2_history["enabled"])
     ) and bool(
         data_config.get("persistent_workers", False)
     ):
         raise ValueError(
             "The configured training schedule changes at epoch boundaries; set "
-            "data.persistent_workers=false so workers receive the new epoch."
+            "data.persistent_workers=false so workers receive the new epoch "
+            "and deterministic history sampling."
         )
     generated_history = validate_generated_history_config(
         config,
@@ -1842,6 +1996,45 @@ def main() -> None:
                 "history_corruption is an isolated robustness experiment; "
                 f"disable: {', '.join(incompatible)}"
             )
+    if bool(step2_history["enabled"]):
+        incompatible = []
+        if bool(adaptive_gap["enabled"]):
+            incompatible.append("adaptive_gap")
+        if bool(generated_history["enabled"]):
+            incompatible.append("generated_history")
+        if bool(visited_state["enabled"]):
+            incompatible.append("visited_state_guidance")
+        if bool(frozen_step2_guidance["enabled"]):
+            incompatible.append("frozen_step2_guidance")
+        if bool(history_corruption["enabled"]):
+            incompatible.append("legacy sparse history_corruption")
+        if auxiliary_loss["type"] != "none":
+            incompatible.append("auxiliary_loss")
+        if bool(condition_alignment["enabled"]):
+            incompatible.append("condition_alignment")
+        if incompatible:
+            raise ValueError(
+                "Offline GT-boundary Step 2 history is an isolated anchor-CE "
+                f"experiment; disable: {', '.join(incompatible)}"
+            )
+        if not bool(provided_gap["enabled"]):
+            raise ValueError(
+                "Offline Step 2 history requires provided_gap_training"
+            )
+        schedule_root = provided_gap.get("schedule_cache_dir")
+        history_root = step2_history.get("cache_dir")
+        if schedule_root is None or Path(schedule_root).resolve() != Path(
+            history_root
+        ).resolve():
+            raise ValueError(
+                "Dense history and the supplied-gap schedule must use the "
+                "same offline cache directory"
+            )
+        if str(data_config.get("seed_mode", "observed")) != "observed":
+            raise ValueError(
+                "The controlled GT-boundary history experiment uses "
+                "data.seed_mode=observed"
+            )
     seed = int(training.get("seed", 42))
     seed_everything(seed, rank)
     resume = args.resume_from_checkpoint.resolve() if args.resume_from_checkpoint else None
@@ -1864,6 +2057,9 @@ def main() -> None:
         audio_contract=audio_contract,
         text_serialization=str(data_config.get("text_serialization", "raw")),
         planner_attention_mode=planner_context["attention_mode"],
+        include_step2_history_tokens=bool(
+            step2_history["register_tokens"]
+        ),
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1927,6 +2123,7 @@ def main() -> None:
         adaptive_gap=adaptive_gap,
         provided_gap=provided_gap,
         frozen_step2_guidance=frozen_step2_guidance,
+        step2_history=step2_history,
     )
     eval_dataset = build_dataset(
         eval_names,
@@ -1939,6 +2136,7 @@ def main() -> None:
         adaptive_gap=adaptive_gap,
         provided_gap=provided_gap,
         frozen_step2_guidance=frozen_step2_guidance,
+        step2_history=step2_history,
     )
     # Fail before DDP training if the serialization contract is broken.
     if len(train_dataset):
@@ -1955,6 +2153,15 @@ def main() -> None:
                         "input_representation"
                     ],
                     "supervised_tokens": sum(slot >= 0 for slot in first["target_slots"]),
+                    "step2_history_intervals": first[
+                        "step2_history_intervals"
+                    ],
+                    "step2_history_frames": first[
+                        "step2_history_frames"
+                    ],
+                    "step2_history_corrupted_tokens": first[
+                        "step2_history_corrupted_tokens"
+                    ],
                 },
             )
 
@@ -2094,6 +2301,34 @@ def main() -> None:
                 "Gap supervision:  disabled "
                 "(gap tokens are inputs; anchor CE is the sole planner loss)"
             )
+            if provided_gap.get("schedule_cache_dir") is not None:
+                print(
+                    "Supplied schedule:"
+                    f" {provided_gap['schedule_cache_dir']}"
+                )
+        if step2_history["enabled"]:
+            dense_corruption = step2_history["corruption"]
+            print(
+                "Step 2 history:    "
+                f"cache={step2_history['cache_dir']}, "
+                f"suffix_frames={step2_history['min_frames']}-"
+                f"{step2_history['max_frames']}, "
+                "boundary=GT, labels=ignored"
+            )
+            print(
+                "Dense corruption:  "
+                f"enabled={dense_corruption['enabled']}, "
+                f"examples={dense_corruption['example_probability']:.0%}, "
+                f"rate={dense_corruption['rate_min']:.0%}-"
+                f"{dense_corruption['rate_max']:.0%}, "
+                "preserve_endpoint="
+                f"{dense_corruption['preserve_current_endpoint']}"
+            )
+        elif step2_history["register_tokens"]:
+            print(
+                "Step 2 history:    disabled; tokens retained for a "
+                "vocabulary-matched sparse control"
+            )
         print(
             "Generated history: "
             f"enabled={bool(generated_history['enabled'])}, "
@@ -2195,6 +2430,10 @@ def main() -> None:
     )
     # Corrupted clips/anchors, cross-example donor anchors, previous copies.
     history_corruption_running = torch.zeros(
+        4, dtype=torch.float64, device=device
+    )
+    # Dense intervals/serialized frames/available frames/corrupted IDs.
+    dense_history_running = torch.zeros(
         4, dtype=torch.float64, device=device
     )
     run_start = time.perf_counter()
@@ -2314,6 +2553,10 @@ def main() -> None:
             generated_mask = torch.zeros(
                 inputs["input_ids"].shape[0], dtype=torch.bool, device=device
             )
+            if bool(step2_history["enabled"]):
+                generated_mask |= batch[
+                    "step2_history_corrupted_tokens"
+                ].gt(0).to(device=device, non_blocking=True)
             rollout_stats = GeneratedHistoryBatchStats()
             visited_stats = VisitedStateBatchStats()
             corruption_stats = HistoryCorruptionStats()
@@ -2610,6 +2853,14 @@ def main() -> None:
                 dtype=torch.float64,
                 device=device,
             )
+            dense_history_running += torch.stack(
+                [
+                    batch["step2_history_intervals"].sum(),
+                    batch["step2_history_frames"].sum(),
+                    batch["step2_history_available_frames"].sum(),
+                    batch["step2_history_corrupted_tokens"].sum(),
+                ]
+            ).to(device=device, dtype=torch.float64)
             if counterfactual_loss is not None and condition_gap is not None:
                 alignment_running[0] += (
                     counterfactual_loss.detach().to(torch.float64) * condition_examples
@@ -2664,6 +2915,10 @@ def main() -> None:
                 )
                 history_corruption_totals = reduce_sums(
                     history_corruption_running.clone(),
+                    distributed,
+                )
+                dense_history_totals = reduce_sums(
+                    dense_history_running.clone(),
                     distributed,
                 )
                 denominator = max(1.0, float(totals[2]))
@@ -2750,6 +3005,28 @@ def main() -> None:
                                 ),
                             }
                         )
+                    if float(dense_history_totals[0]) > 0:
+                        dense_intervals = float(dense_history_totals[0])
+                        dense_frames = float(dense_history_totals[1])
+                        train_metrics.update(
+                            {
+                                "step2_history/intervals": dense_intervals,
+                                "step2_history/mean_serialized_frames": (
+                                    dense_frames / dense_intervals
+                                ),
+                                "step2_history/mean_available_frames": (
+                                    float(dense_history_totals[2])
+                                    / dense_intervals
+                                ),
+                                "step2_history/corrupted_tokens": float(
+                                    dense_history_totals[3]
+                                ),
+                                "step2_history/corrupted_fraction_of_serialized": (
+                                    float(dense_history_totals[3])
+                                    / max(1.0, dense_frames * len(BODY_SLOTS))
+                                ),
+                            }
+                        )
                     if float(step2_guidance_totals[1]) > 0:
                         guidance_examples = max(
                             1.0, float(step2_guidance_totals[1])
@@ -2812,7 +3089,20 @@ def main() -> None:
                             }
                         )
                     if float(totals[split_offset + 5]) > 0:
-                        if corruption_curriculum_state is not None:
+                        if bool(step2_history["enabled"]):
+                            train_metrics.update(
+                                {
+                                    "train_dense_corrupted/loss": float(
+                                        totals[split_offset + 3]
+                                    )
+                                    / generated_count,
+                                    "train_dense_corrupted/slot_accuracy": float(
+                                        totals[split_offset + 4]
+                                    )
+                                    / generated_count,
+                                }
+                            )
+                        elif corruption_curriculum_state is not None:
                             train_metrics.update(
                                 {
                                     "train_corrupted/loss": float(
@@ -2860,6 +3150,7 @@ def main() -> None:
                         f"w_s2={current_step2_guidance_weight:.3f} "
                         f"p_gen={generated_probability:.3f} "
                         f"p_corrupt={current_corruption_probability:.3f} "
+                        f"p_dense={float(step2_history['corruption']['example_probability']) if step2_history['enabled'] and step2_history['corruption']['enabled'] else 0.0:.3f} "
                         f"p_visit={float(visited_state['probability']):.3f} "
                         f"lr={scheduler.get_last_lr()[0]:.3e} "
                         f"elapsed={time.perf_counter() - run_start:.1f}s"
@@ -2871,6 +3162,7 @@ def main() -> None:
                 step2_guidance_running.zero_()
                 visited_state_running.zero_()
                 history_corruption_running.zero_()
+                dense_history_running.zero_()
 
             if eval_steps > 0 and global_step % eval_steps == 0:
                 eval_metrics = evaluate(

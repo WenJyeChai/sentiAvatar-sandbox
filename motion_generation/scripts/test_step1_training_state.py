@@ -126,6 +126,7 @@ def test_provided_gap_training_defaults_and_uniform_contract() -> None:
         "min_gap": 3,
         "max_gap": 15,
         "resample_each_epoch": True,
+        "schedule_cache_dir": None,
     }
     supplied = validate_provided_gap_config(
         {

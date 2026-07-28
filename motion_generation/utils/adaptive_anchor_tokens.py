@@ -37,6 +37,12 @@ EXPRESSION_MISSING_TOKEN = "[expression_missing]"
 ACTION_TOKEN = "[action]"
 ACTION_MISSING_TOKEN = "[action_missing]"
 TRANSCRIPT_TOKEN = "[transcript]"
+STEP2_HISTORY_START_TOKEN = "[step2_history_start]"
+STEP2_HISTORY_END_TOKEN = "[step2_history_end]"
+MOTION_HISTORY_FRAME_TOKEN = "[motion_history_frame]"
+STEP2_HISTORY_MASK_TOKENS = tuple(
+    f"[step2_history_mask_{slot}]" for slot in range(BODY_SLOT_COUNT)
+)
 GAP_TOKENS = tuple(f"[gap_{gap}]" for gap in range(MAX_GAP + 1))
 
 STEP1_CONTROL_TOKENS = (
@@ -58,6 +64,13 @@ STRUCTURED_TEXT_TOKENS = (
     ACTION_TOKEN,
     ACTION_MISSING_TOKEN,
     TRANSCRIPT_TOKEN,
+)
+
+STEP2_HISTORY_TOKENS = (
+    STEP2_HISTORY_START_TOKEN,
+    STEP2_HISTORY_END_TOKEN,
+    MOTION_HISTORY_FRAME_TOKEN,
+    *STEP2_HISTORY_MASK_TOKENS,
 )
 
 SEED_TOKEN_BY_MODE = {
@@ -283,12 +296,15 @@ def ensure_step1_special_tokens(
     model: Any | None = None,
     *,
     include_structured_text: bool = False,
+    include_step2_history: bool = False,
 ) -> list[str]:
     """Add only missing Step 1 controls while preserving legacy special tokens."""
 
     required_tokens = STEP1_CONTROL_TOKENS
     if include_structured_text:
         required_tokens = (*required_tokens, *STRUCTURED_TEXT_TOKENS)
+    if include_step2_history:
+        required_tokens = (*required_tokens, *STEP2_HISTORY_TOKENS)
     missing = [token for token in required_tokens if tokenizer.convert_tokens_to_ids(token) is None]
     if missing:
         # Transformers 4.57 renamed ``additional_special_tokens`` to
