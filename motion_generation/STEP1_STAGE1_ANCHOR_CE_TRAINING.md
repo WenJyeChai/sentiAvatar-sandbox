@@ -285,3 +285,59 @@ same global batch 128 as the completed teacher pretraining. The prefix-LM
 generated rollout is intentionally microbatched one clip at a time because
 full-audio prefix lengths differ; it is substantially slower than the clean
 control.
+
+## Fast history-corruption post-training
+
+The online rollout implementation and configuration above remain available.
+The faster robustness experiment uses:
+
+`motion_generation/configs/step1_stage1_teacher_history_corruption_posttrain20.yaml`
+
+It performs no rollout and reads no generated cache. For selected training
+examples, it corrupts earlier supervised anchors while preserving the seed,
+the final anchor input, all text/audio/gaps, and every clean GT CE label:
+
+| Epochs | Corrupted examples | Eligible history anchors corrupted | Clean replay |
+|---|---:|---:|---:|
+| 1--4 | 20% | 20% | 80% |
+| 5--10 | 40% | 30% | 60% |
+| 11--20 | 60% | 40% | 40% |
+
+Seventy-five percent of replacements copy one complete valid 16-ID GT anchor
+from another example in the current batch. The remaining 25% copy the
+immediately preceding anchor, simulating frozen/repetitive history. Decisions
+are deterministic from the run seed, epoch, batch index, clip name and anchor
+index.
+
+One-GPU smoke test:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_stage1_teacher_history_corruption_posttrain20.yaml \
+  --init_from_checkpoint checkpoints/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab/best \
+  --max_train_clips 64 \
+  --max_eval_clips 32 \
+  --num_train_epochs 1 \
+  --max_train_steps 2 \
+  --output_dir checkpoints/step1_stage1_teacher_history_corruption_posttrain20_smoke
+```
+
+The header must report `History corruption: enabled=True`, three corruption
+phases and `Generated history: enabled=False`. Epoch 1 logs must show
+`p_corrupt=0.200`.
+
+Full four-GPU run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=4 --master_port=29518 \
+  motion_generation/scripts/train_step1_multipart_fixed_gap3.py \
+  --config motion_generation/configs/step1_stage1_teacher_history_corruption_posttrain20.yaml \
+  --init_from_checkpoint checkpoints/step1_stage1_anchor_ce_uniform_gap100_nano_q0q3_vocab/best
+```
+
+The run keeps per-device batch 32, global batch 128, learning rate `5e-6` and
+a fresh 20-epoch cosine schedule. Evaluate it with an uncached generated
+rollout; corrupted-history training metrics alone do not demonstrate recovery
+from the planner's actual mistakes.

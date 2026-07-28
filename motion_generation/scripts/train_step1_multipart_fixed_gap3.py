@@ -68,6 +68,12 @@ from utils.step1_self_forcing import (  # noqa: E402
     rollout_quality_metrics,
     validate_generated_labels,
 )
+from utils.step1_history_corruption import (  # noqa: E402
+    HistoryCorruptionStats,
+    apply_history_corruption,
+    deterministic_corruption_indices,
+    history_corruption_curriculum_state,
+)
 from utils.step1_condition_alignment import (  # noqa: E402
     ConditionCorruption,
     corrupt_audio_with_causal_past,
@@ -1322,6 +1328,76 @@ def validate_generated_history_config(
     return generated
 
 
+def validate_history_corruption_config(
+    config: Mapping[str, Any],
+    *,
+    num_epochs: int,
+) -> dict[str, Any]:
+    corruption = section(config, "history_corruption")
+    corruption.setdefault("enabled", False)
+    corruption.setdefault("donor_probability", 0.75)
+    corruption.setdefault("curriculum", [])
+    corruption["enabled"] = bool(corruption["enabled"])
+    corruption["donor_probability"] = float(
+        corruption["donor_probability"]
+    )
+    if not 0 <= corruption["donor_probability"] <= 1:
+        raise ValueError(
+            "history_corruption.donor_probability must be in [0,1]"
+        )
+
+    phases: list[dict[str, Any]] = []
+    for phase_index, raw_phase in enumerate(corruption["curriculum"]):
+        phase = {
+            "start_epoch": int(raw_phase["start_epoch"]),
+            "end_epoch": int(raw_phase["end_epoch"]),
+            "example_probability": float(
+                raw_phase["example_probability"]
+            ),
+            "anchor_probability": float(
+                raw_phase["anchor_probability"]
+            ),
+        }
+        if phase["start_epoch"] <= 0 or (
+            phase["end_epoch"] < phase["start_epoch"]
+        ):
+            raise ValueError(
+                f"history_corruption.curriculum[{phase_index}] has an "
+                "invalid epoch interval"
+            )
+        for key in ("example_probability", "anchor_probability"):
+            if not 0 <= phase[key] <= 1:
+                raise ValueError(
+                    f"history_corruption.curriculum[{phase_index}].{key} "
+                    "must be in [0,1]"
+                )
+        phases.append(phase)
+    phases.sort(key=lambda value: value["start_epoch"])
+    for phase_index, phase in enumerate(phases):
+        expected_start = (
+            1
+            if phase_index == 0
+            else phases[phase_index - 1]["end_epoch"] + 1
+        )
+        if phase["start_epoch"] != expected_start:
+            raise ValueError(
+                "history_corruption.curriculum phases must be contiguous and "
+                f"start at epoch 1; expected {expected_start}, got "
+                f"{phase['start_epoch']}"
+            )
+    if corruption["enabled"] and not phases:
+        raise ValueError(
+            "Enabled history_corruption requires a curriculum"
+        )
+    if phases and phases[-1]["end_epoch"] < num_epochs:
+        raise ValueError(
+            "history_corruption.curriculum does not cover the requested "
+            f"{num_epochs} epochs"
+        )
+    corruption["curriculum"] = phases
+    return corruption
+
+
 def validate_visited_state_config(config: Mapping[str, Any]) -> dict[str, Any]:
     visited = section(config, "visited_state_guidance")
     visited.setdefault("enabled", False)
@@ -1605,6 +1681,10 @@ def main() -> None:
         config,
         num_epochs=requested_epochs,
     )
+    history_corruption = validate_history_corruption_config(
+        config,
+        num_epochs=requested_epochs,
+    )
     visited_state = validate_visited_state_config(config)
     auxiliary_loss = validate_auxiliary_loss_config(config)
     condition_alignment = validate_condition_alignment_config(config)
@@ -1741,6 +1821,27 @@ def main() -> None:
             "Generic generated_history and local visited_state_guidance are "
             "mutually exclusive"
         )
+    if bool(history_corruption["enabled"]):
+        incompatible = []
+        if bool(generated_history["enabled"]):
+            incompatible.append("generated_history")
+        if bool(visited_state["enabled"]):
+            incompatible.append("visited_state_guidance")
+        if bool(frozen_step2_guidance["enabled"]):
+            incompatible.append("frozen_step2_guidance")
+        if auxiliary_loss["type"] != "none":
+            incompatible.append("auxiliary_loss")
+        if bool(condition_alignment["enabled"]):
+            incompatible.append("condition_alignment")
+        if data_config.get("generated_anchor_dir") or float(
+            data_config.get("generated_prefix_probability", 0.0)
+        ) > 0:
+            incompatible.append("legacy generated-prefix cache")
+        if incompatible:
+            raise ValueError(
+                "history_corruption is an isolated robustness experiment; "
+                f"disable: {', '.join(incompatible)}"
+            )
     seed = int(training.get("seed", 42))
     seed_everything(seed, rank)
     resume = args.resume_from_checkpoint.resolve() if args.resume_from_checkpoint else None
@@ -2013,6 +2114,20 @@ def main() -> None:
                 f"full_prefix={phase['full_prefix_probability']:.0%}"
             )
         print(
+            "History corruption: "
+            f"enabled={bool(history_corruption['enabled'])}, "
+            f"donor_probability={history_corruption['donor_probability']:.2f}"
+        )
+        for phase_index, phase in enumerate(
+            history_corruption["curriculum"]
+        ):
+            print(
+                f"Corruption phase {phase_index}: epochs "
+                f"{phase['start_epoch']}-{phase['end_epoch']}, "
+                f"examples={phase['example_probability']:.0%}, "
+                f"history_anchors={phase['anchor_probability']:.0%}"
+            )
+        print(
             "Visited state:     "
             f"enabled={bool(visited_state['enabled'])}, "
             f"probability={visited_state['probability']}, "
@@ -2077,6 +2192,10 @@ def main() -> None:
     # Visited clips, rolled anchors/tokens/correct, depth-1/depth-2 clips.
     visited_state_running = torch.zeros(
         6, dtype=torch.float64, device=device
+    )
+    # Corrupted clips/anchors, cross-example donor anchors, previous copies.
+    history_corruption_running = torch.zeros(
+        4, dtype=torch.float64, device=device
     )
     run_start = time.perf_counter()
 
@@ -2197,6 +2316,55 @@ def main() -> None:
             )
             rollout_stats = GeneratedHistoryBatchStats()
             visited_stats = VisitedStateBatchStats()
+            corruption_stats = HistoryCorruptionStats()
+            corruption_curriculum_state = (
+                history_corruption_curriculum_state(
+                    epoch + 1,
+                    history_corruption["curriculum"],
+                )
+                if bool(history_corruption["enabled"])
+                else None
+            )
+            current_corruption_probability = (
+                corruption_curriculum_state.example_probability
+                if corruption_curriculum_state is not None
+                else 0.0
+            )
+            if corruption_curriculum_state is not None:
+                corruption_indices = deterministic_corruption_indices(
+                    batch["names"],
+                    current_corruption_probability,
+                    seed=seed,
+                    epoch=epoch,
+                    batch_index=batch_index,
+                )
+                if corruption_indices:
+                    unwrapped = (
+                        model.module
+                        if isinstance(model, DistributedDataParallel)
+                        else model
+                    )
+                    (
+                        corrupted_input_ids,
+                        corrupted_rows,
+                        corruption_stats,
+                    ) = apply_history_corruption(
+                        inputs,
+                        batch["names"],
+                        corruption_indices,
+                        motion_token_ids=unwrapped.motion_token_ids,
+                        anchor_probability=(
+                            corruption_curriculum_state.anchor_probability
+                        ),
+                        donor_probability=float(
+                            history_corruption["donor_probability"]
+                        ),
+                        seed=seed,
+                        epoch=epoch,
+                        batch_index=batch_index,
+                    )
+                    inputs["input_ids"] = corrupted_input_ids
+                    generated_mask |= corrupted_rows
             if generated_indices:
                 generated_mask[generated_indices] = True
                 unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
@@ -2432,6 +2600,16 @@ def main() -> None:
                 dtype=torch.float64,
                 device=device,
             )
+            history_corruption_running += torch.tensor(
+                (
+                    corruption_stats.clips,
+                    corruption_stats.anchors,
+                    corruption_stats.donor_anchors,
+                    corruption_stats.previous_copy_anchors,
+                ),
+                dtype=torch.float64,
+                device=device,
+            )
             if counterfactual_loss is not None and condition_gap is not None:
                 alignment_running[0] += (
                     counterfactual_loss.detach().to(torch.float64) * condition_examples
@@ -2482,6 +2660,10 @@ def main() -> None:
                 )
                 visited_state_totals = reduce_sums(
                     visited_state_running.clone(),
+                    distributed,
+                )
+                history_corruption_totals = reduce_sums(
+                    history_corruption_running.clone(),
                     distributed,
                 )
                 denominator = max(1.0, float(totals[2]))
@@ -2539,6 +2721,32 @@ def main() -> None:
                                 ),
                                 "curriculum/full_prefix_probability": (
                                     generated_curriculum_state.full_prefix_probability
+                                ),
+                            }
+                        )
+                    if corruption_curriculum_state is not None:
+                        train_metrics.update(
+                            {
+                                "history_corruption/phase": (
+                                    corruption_curriculum_state.phase_index
+                                ),
+                                "history_corruption/example_probability": (
+                                    corruption_curriculum_state.example_probability
+                                ),
+                                "history_corruption/anchor_probability": (
+                                    corruption_curriculum_state.anchor_probability
+                                ),
+                                "history_corruption/clips": float(
+                                    history_corruption_totals[0]
+                                ),
+                                "history_corruption/anchors": float(
+                                    history_corruption_totals[1]
+                                ),
+                                "history_corruption/donor_anchors": float(
+                                    history_corruption_totals[2]
+                                ),
+                                "history_corruption/previous_copy_anchors": float(
+                                    history_corruption_totals[3]
                                 ),
                             }
                         )
@@ -2604,12 +2812,32 @@ def main() -> None:
                             }
                         )
                     if float(totals[split_offset + 5]) > 0:
-                        train_metrics.update(
-                            {
-                                "train_generated/loss": float(totals[split_offset + 3]) / generated_count,
-                                "train_generated/slot_accuracy": float(totals[split_offset + 4]) / generated_count,
-                            }
-                        )
+                        if corruption_curriculum_state is not None:
+                            train_metrics.update(
+                                {
+                                    "train_corrupted/loss": float(
+                                        totals[split_offset + 3]
+                                    )
+                                    / generated_count,
+                                    "train_corrupted/slot_accuracy": float(
+                                        totals[split_offset + 4]
+                                    )
+                                    / generated_count,
+                                }
+                            )
+                        else:
+                            train_metrics.update(
+                                {
+                                    "train_generated/loss": float(
+                                        totals[split_offset + 3]
+                                    )
+                                    / generated_count,
+                                    "train_generated/slot_accuracy": float(
+                                        totals[split_offset + 4]
+                                    )
+                                    / generated_count,
+                                }
+                            )
                     if float(totals[split_offset + 8]) > 0:
                         train_metrics.update(
                             {
@@ -2631,6 +2859,7 @@ def main() -> None:
                         f"step2={train_metrics.get('step2_guidance/loss', 0.0):.5f} "
                         f"w_s2={current_step2_guidance_weight:.3f} "
                         f"p_gen={generated_probability:.3f} "
+                        f"p_corrupt={current_corruption_probability:.3f} "
                         f"p_visit={float(visited_state['probability']):.3f} "
                         f"lr={scheduler.get_last_lr()[0]:.3e} "
                         f"elapsed={time.perf_counter() - run_start:.1f}s"
@@ -2641,6 +2870,7 @@ def main() -> None:
                 alignment_running.zero_()
                 step2_guidance_running.zero_()
                 visited_state_running.zero_()
+                history_corruption_running.zero_()
 
             if eval_steps > 0 and global_step % eval_steps == 0:
                 eval_metrics = evaluate(
