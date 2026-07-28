@@ -65,6 +65,7 @@ from utils.adaptive_anchor_tokens import (  # noqa: E402
     gap_from_anchor_times,
 )
 from utils.inference_math import configure_strict_inference_math  # noqa: E402
+from utils.step1_gap_bins import GAP_BINS  # noqa: E402
 from utils.step1_planner_evaluation import (  # noqa: E402
     evaluate_rollouts,
     greedy_rollout_batch,
@@ -280,6 +281,76 @@ def summarize_by_gap(
     return rows
 
 
+def summarize_by_gap_bin(
+    *,
+    label: str,
+    gaps: np.ndarray,
+    targets: np.ndarray,
+    predictions: np.ndarray,
+    negative_log_likelihood: np.ndarray | None = None,
+) -> list[dict[str, Any]]:
+    """Aggregate Stage 1 target-anchor quality into the shared gap bins."""
+
+    gaps = np.asarray(gaps, dtype=np.int64)
+    targets = np.asarray(targets, dtype=np.int64)
+    predictions = np.asarray(predictions, dtype=np.int64)
+    if targets.shape != predictions.shape or targets.shape[1:] != (
+        BODY_SLOT_COUNT,
+    ):
+        raise ValueError(
+            "Gap-bin targets/predictions must share shape [N,16]"
+        )
+    if len(gaps) != len(targets):
+        raise ValueError("Gap-bin vector does not match anchor count")
+    if negative_log_likelihood is not None:
+        negative_log_likelihood = np.asarray(
+            negative_log_likelihood, dtype=np.float64
+        )
+        if negative_log_likelihood.shape != targets.shape:
+            raise ValueError(
+                "Gap-bin negative log likelihood must match targets"
+            )
+
+    rows: list[dict[str, Any]] = []
+    for specification in GAP_BINS:
+        selected = (gaps >= specification.minimum) & (
+            gaps <= specification.maximum
+        )
+        if not bool(selected.any()):
+            continue
+        correct = predictions[selected] == targets[selected]
+        row: dict[str, Any] = {
+            "checkpoint": label,
+            "gap_bin": specification.label,
+            "gap_bin_order": specification.order,
+            "main_gap_bin": specification.main_bin,
+            "gap_min": specification.minimum,
+            "gap_max": specification.maximum,
+            "mean_gap": float(gaps[selected].mean()),
+            "anchors": int(selected.sum()),
+            "tokens": int(correct.size),
+            "accuracy": float(correct.mean()),
+        }
+        for quantizer in range(4):
+            slots = [
+                slot
+                for slot, slot_specification in enumerate(BODY_SLOTS)
+                if slot_specification.quantizer == quantizer
+            ]
+            row[f"q{quantizer}_accuracy"] = float(
+                correct[:, slots].mean()
+            )
+        if negative_log_likelihood is not None:
+            row["cross_entropy"] = float(
+                negative_log_likelihood[selected].mean()
+            )
+            row["perplexity"] = float(
+                np.exp(min(50.0, row["cross_entropy"]))
+            )
+        rows.append(row)
+    return rows
+
+
 def per_clip_rollout_rows(
     label: str,
     results,
@@ -413,9 +484,11 @@ def main() -> None:
     teacher_rows: list[dict[str, Any]] = []
     teacher_slot_rows: list[dict[str, Any]] = []
     teacher_gap_rows: list[dict[str, Any]] = []
+    teacher_gap_bin_rows: list[dict[str, Any]] = []
     rollout_rows: list[dict[str, Any]] = []
     rollout_slot_rows: list[dict[str, Any]] = []
     rollout_gap_rows: list[dict[str, Any]] = []
+    rollout_gap_bin_rows: list[dict[str, Any]] = []
     rollout_horizon_rows: list[dict[str, Any]] = []
     rollout_clip_rows: list[dict[str, Any]] = []
     schedule_manifest: list[dict[str, Any]] | None = None
@@ -581,8 +654,27 @@ def main() -> None:
                 negative_log_likelihood=teacher["negative_log_likelihood"],
             )
         )
+        teacher_gap_bin_rows.extend(
+            summarize_by_gap_bin(
+                label=label,
+                gaps=gaps_array,
+                targets=teacher["labels"],
+                predictions=teacher["predictions"],
+                negative_log_likelihood=teacher[
+                    "negative_log_likelihood"
+                ],
+            )
+        )
         rollout_gap_rows.extend(
             summarize_by_gap(
+                label=label,
+                gaps=gaps_array,
+                targets=measured["labels"],
+                predictions=measured["predictions"],
+            )
+        )
+        rollout_gap_bin_rows.extend(
+            summarize_by_gap_bin(
                 label=label,
                 gaps=gaps_array,
                 targets=measured["labels"],
@@ -638,11 +730,13 @@ def main() -> None:
     teacher_df = pd.DataFrame(teacher_rows).sort_values("cross_entropy")
     teacher_slots_df = pd.DataFrame(teacher_slot_rows)
     teacher_gaps_df = pd.DataFrame(teacher_gap_rows)
+    teacher_gap_bins_df = pd.DataFrame(teacher_gap_bin_rows)
     rollout_df = pd.DataFrame(rollout_rows).sort_values(
         "accuracy", ascending=False
     )
     rollout_slots_df = pd.DataFrame(rollout_slot_rows)
     rollout_gaps_df = pd.DataFrame(rollout_gap_rows)
+    rollout_gap_bins_df = pd.DataFrame(rollout_gap_bin_rows)
     rollout_horizon_df = pd.DataFrame(rollout_horizon_rows)
     rollout_clips_df = pd.DataFrame(rollout_clip_rows)
     for filename, frame in (
@@ -650,9 +744,11 @@ def main() -> None:
         ("stage1_teacher_forced.csv", teacher_df),
         ("stage1_teacher_forced_per_slot.csv", teacher_slots_df),
         ("stage1_teacher_forced_by_gap.csv", teacher_gaps_df),
+        ("stage1_teacher_forced_by_gap_bin.csv", teacher_gap_bins_df),
         ("stage1_generated_rollout.csv", rollout_df),
         ("stage1_generated_rollout_per_slot.csv", rollout_slots_df),
         ("stage1_generated_rollout_by_gap.csv", rollout_gaps_df),
+        ("stage1_generated_rollout_by_gap_bin.csv", rollout_gap_bins_df),
         ("stage1_generated_rollout_horizon.csv", rollout_horizon_df),
         ("stage1_generated_rollout_per_clip.csv", rollout_clips_df),
     ):
@@ -670,6 +766,15 @@ def main() -> None:
         "supplied_gap_distribution": str(first_supplied["distribution"]),
         "supplied_gap_range": [min_gap, max_gap],
         "duration_contract": "offline_known_motion_token_length",
+        "gap_bins": [
+            {
+                "label": value.label,
+                "minimum": value.minimum,
+                "maximum": value.maximum,
+                "main_gap_bin": value.main_bin,
+            }
+            for value in GAP_BINS
+        ],
         "frozen_step2_cost_manifests": [
             {
                 "checkpoint": str(step2_checkpoint),
@@ -695,6 +800,8 @@ def main() -> None:
         "contracts": records(contracts_df),
         "teacher_forced": records(teacher_df),
         "generated_rollout": records(rollout_df),
+        "teacher_forced_by_gap_bin": records(teacher_gap_bins_df),
+        "generated_rollout_by_gap_bin": records(rollout_gap_bins_df),
         "rollout_caches": condition_paths,
     }
     atomic_write_json(output_dir / "stage1_evaluation_report.json", report)
@@ -703,6 +810,10 @@ def main() -> None:
     print(teacher_df.to_string(index=False))
     print("\nGenerated-history rollout comparison")
     print(rollout_df.to_string(index=False))
+    print("\nTeacher-forced Stage 1 by gap bin")
+    print(teacher_gap_bins_df.to_string(index=False))
+    print("\nGenerated-history Stage 1 by gap bin")
+    print(rollout_gap_bins_df.to_string(index=False))
     print(f"\nSchedule SHA-256: {schedule_hash}")
     print(f"Step 2 SHA-256:    {step2_fingerprint}")
     print(f"Wrote portable Stage 1 bundle: {output_dir}")

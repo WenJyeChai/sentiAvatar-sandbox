@@ -215,6 +215,33 @@ it in the notebook's `COPIED_BUNDLES` mapping. Comparison is rejected unless
 the selected clip list, supplied schedule, frozen Step 2 weights, and all four
 causal body codecs have matching fingerprints.
 
+### Supplied-gap evaluation bins
+
+The same supplied schedule can be summarized without changing or retraining
+the Stage 1 checkpoint:
+
+| Report group | Supplied gaps | Role |
+|---|---:|---|
+| EOS tail | 0--2 | Short final remainder; report separately |
+| Small | 3--6 | Main evaluation |
+| Medium | 7--10 | Main evaluation |
+| Large | 11--15 | Main evaluation |
+
+`evaluate_step1_stage1_supplied_gap.py` writes teacher-forced and
+generated-history anchor accuracy/CE both per exact gap and per group.
+`evaluate_step1_adaptive_motion.py` writes:
+
+- `step2_c2f_summary_by_gap_bin.csv`: frozen-Step-2 likelihood under GT and
+  generated endpoints;
+- `step2_endpoint_penalty_by_gap_bin.csv`: the generated-endpoint minus
+  GT-endpoint CE/accuracy penalty within each group;
+- `decoded_metrics_summary_by_gap_bin.csv`: missing-region token accuracy and
+  decoded motion errors for each group.
+
+Step 2 CE and accuracy are aggregated from interval sums and token counts, not
+by averaging interval means. Whole-clip FID remains a single overall result
+because a clip generally contains intervals from several gap groups.
+
 ## Twenty-epoch generated-history post-training
 
 The completed teacher checkpoint was trained for 50 clean-history epochs with

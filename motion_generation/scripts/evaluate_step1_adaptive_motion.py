@@ -51,6 +51,7 @@ from scripts.cache_step2_interval_costs import (  # noqa: E402
 )
 from scripts.train_audio_mask_multipart import load_sequences  # noqa: E402
 from utils.inference_math import configure_strict_inference_math  # noqa: E402
+from utils.step1_gap_bins import GAP_BINS, supplied_gap_bin  # noqa: E402
 from utils.multipart_motion import (  # noqa: E402
     PART_ORDER,
     canonicalize_body_root,
@@ -398,6 +399,256 @@ def summarize_step2_c2f_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def annotate_gap_bins(frame: pd.DataFrame) -> pd.DataFrame:
+    """Attach the shared EOS/small/medium/large bin contract."""
+
+    output = frame.copy()
+    if output.empty:
+        output["gap_bin"] = pd.Series(dtype="object")
+        output["gap_bin_order"] = pd.Series(dtype="int64")
+        output["main_gap_bin"] = pd.Series(dtype="bool")
+        return output
+    if "gap" not in output.columns:
+        raise ValueError("Step 2 interval metrics do not contain a gap column")
+    specifications = [
+        supplied_gap_bin(int(value)) for value in output["gap"].tolist()
+    ]
+    output["gap_bin"] = [value.label for value in specifications]
+    output["gap_bin_order"] = [value.order for value in specifications]
+    output["main_gap_bin"] = [value.main_bin for value in specifications]
+    return output
+
+
+def summarize_step2_c2f_by_gap_bin(frame: pd.DataFrame) -> pd.DataFrame:
+    """Token-weighted Step 2 likelihood for each endpoint condition/bin."""
+
+    if frame.empty:
+        return pd.DataFrame()
+    required = {"gap_bin", "gap_bin_order", "main_gap_bin"}
+    if not required.issubset(frame.columns):
+        frame = annotate_gap_bins(frame)
+    rows = []
+    group_columns = [
+        "condition",
+        "gap_bin_order",
+        "gap_bin",
+        "main_gap_bin",
+    ]
+    for keys, values in frame.groupby(group_columns, sort=False):
+        condition, order, label, main_bin = keys
+        token_count = int(values["token_count"].sum())
+        row: dict[str, Any] = {
+            "condition": str(condition),
+            "gap_bin_order": int(order),
+            "gap_bin": str(label),
+            "main_gap_bin": bool(main_bin),
+            "clips": int(values["name"].nunique()),
+            "intervals": len(values),
+            "mean_gap": float(values["gap"].mean()),
+            "missing_token_frames": int(values["gap"].sum()),
+            "tokens": token_count,
+            "cross_entropy": (
+                float(values["ce_sum"].sum()) / token_count
+                if token_count
+                else float("nan")
+            ),
+            "accuracy": (
+                float(values["correct"].sum()) / token_count
+                if token_count
+                else float("nan")
+            ),
+        }
+        row["perplexity"] = float(np.exp(row["cross_entropy"]))
+        for stage in range(4):
+            stage_count = int(values[f"q{stage}_token_count"].sum())
+            row[f"q{stage}_cross_entropy"] = (
+                float(values[f"q{stage}_ce_sum"].sum()) / stage_count
+                if stage_count
+                else float("nan")
+            )
+            row[f"q{stage}_accuracy"] = (
+                float(values[f"q{stage}_correct"].sum()) / stage_count
+                if stage_count
+                else float("nan")
+            )
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(
+        ["condition", "gap_bin_order"]
+    )
+
+
+def endpoint_penalty_by_gap_bin(
+    summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """Generated-endpoint penalty relative to supplied-gap GT endpoints."""
+
+    columns = [
+        "condition",
+        "gt_condition",
+        "gap_bin_order",
+        "gap_bin",
+        "main_gap_bin",
+        "intervals",
+        "mean_gap",
+        "gt_cross_entropy",
+        "generated_cross_entropy",
+        "delta_cross_entropy",
+        "perplexity_ratio_generated_over_gt",
+        "gt_accuracy",
+        "generated_accuracy",
+        "delta_accuracy",
+        *[
+            f"q{stage}_{metric}"
+            for stage in range(4)
+            for metric in ("delta_cross_entropy", "delta_accuracy")
+        ],
+    ]
+    if summary.empty:
+        return pd.DataFrame(columns=columns)
+    gt_conditions = [
+        value
+        for value in summary["condition"].unique()
+        if str(value).startswith("supplied_gap")
+        and str(value).endswith("_gt_anchors")
+    ]
+    if len(gt_conditions) != 1:
+        return pd.DataFrame(columns=columns)
+    gt_condition = gt_conditions[0]
+    gt = summary[summary["condition"] == gt_condition].set_index(
+        "gap_bin"
+    )
+    rows = []
+    for condition, values in summary.groupby("condition", sort=False):
+        if condition == gt_condition:
+            continue
+        for _, value in values.iterrows():
+            label = str(value["gap_bin"])
+            if label not in gt.index:
+                continue
+            reference = gt.loc[label]
+            if isinstance(reference, pd.DataFrame):
+                raise ValueError(
+                    f"GT Step 2 summary contains duplicate bin {label}"
+                )
+            delta_ce = float(
+                value["cross_entropy"] - reference["cross_entropy"]
+            )
+            row = {
+                "condition": str(condition),
+                "gt_condition": str(gt_condition),
+                "gap_bin_order": int(value["gap_bin_order"]),
+                "gap_bin": label,
+                "main_gap_bin": bool(value["main_gap_bin"]),
+                "intervals": int(value["intervals"]),
+                "mean_gap": float(value["mean_gap"]),
+                "gt_cross_entropy": float(reference["cross_entropy"]),
+                "generated_cross_entropy": float(value["cross_entropy"]),
+                "delta_cross_entropy": delta_ce,
+                "perplexity_ratio_generated_over_gt": float(
+                    np.exp(min(50.0, delta_ce))
+                ),
+                "gt_accuracy": float(reference["accuracy"]),
+                "generated_accuracy": float(value["accuracy"]),
+                "delta_accuracy": float(
+                    value["accuracy"] - reference["accuracy"]
+                ),
+            }
+            for stage in range(4):
+                row[f"q{stage}_delta_cross_entropy"] = float(
+                    value[f"q{stage}_cross_entropy"]
+                    - reference[f"q{stage}_cross_entropy"]
+                )
+                row[f"q{stage}_delta_accuracy"] = float(
+                    value[f"q{stage}_accuracy"]
+                    - reference[f"q{stage}_accuracy"]
+                )
+            rows.append(row)
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["condition", "gap_bin_order"]
+    )
+
+
+def summarize_decoded_intervals_by_gap_bin(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Aggregate missing-region token and decoded errors by gap bin."""
+
+    if frame.empty:
+        return pd.DataFrame()
+    rows = []
+    groups = [
+        "condition",
+        "gap_bin_order",
+        "gap_bin",
+        "main_gap_bin",
+    ]
+    for keys, values in frame.groupby(groups, sort=False):
+        condition, order, label, main_bin = keys
+        token_count = int(values["missing_token_count"].sum())
+        q0_count = int(values["missing_q0_count"].sum())
+        row: dict[str, Any] = {
+            "condition": str(condition),
+            "gap_bin_order": int(order),
+            "gap_bin": str(label),
+            "main_gap_bin": bool(main_bin),
+            "clips": int(values["name"].nunique()),
+            "intervals": len(values),
+            "mean_gap": float(values["gap"].mean()),
+            "missing_token_frames": int(values["gap"].sum()),
+            "decoded_motion_frames": int(values["motion_frames"].sum()),
+            "missing_token_accuracy": (
+                float(values["missing_token_correct"].sum())
+                / token_count
+                if token_count
+                else float("nan")
+            ),
+            "missing_q0_accuracy": (
+                float(values["missing_q0_correct"].sum()) / q0_count
+                if q0_count
+                else float("nan")
+            ),
+        }
+        for prefix in ("codec_relative", "raw_gt"):
+            mae_values = values[f"{prefix}_mae"].to_numpy(
+                dtype=np.float64
+            )
+            motion_weights = values["motion_frames"].to_numpy(
+                dtype=np.float64
+            )
+            row[f"{prefix}_mae"] = float(
+                np.average(mae_values, weights=motion_weights)
+            )
+            for derivative_order, metric in (
+                (0, "rmse"),
+                (1, "velocity_rmse"),
+                (2, "acceleration_rmse"),
+                (3, "jerk_rmse"),
+            ):
+                metric_values = values[
+                    f"{prefix}_{metric}"
+                ].to_numpy(dtype=np.float64)
+                weights = np.maximum(
+                    motion_weights - derivative_order, 0
+                )
+                valid = np.isfinite(metric_values) & (weights > 0)
+                row[f"{prefix}_{metric}"] = (
+                    float(
+                        np.sqrt(
+                            np.average(
+                                np.square(metric_values[valid]),
+                                weights=weights[valid],
+                            )
+                        )
+                    )
+                    if bool(valid.any())
+                    else float("nan")
+                )
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(
+        ["condition", "gap_bin_order"]
+    )
+
+
 def prepare_motion_root(root: Path, conditions: Sequence[str]) -> None:
     clean_output_files(root / "motions" / "raw_gt", "gt")
     for condition in ("causal_codec_reconstruction", *conditions):
@@ -444,7 +695,7 @@ def export_motion_conditions(
     device: torch.device,
     output_dir: Path,
     canonicalize_raw_root: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     anchor_root = output_dir / "anchor_substitution"
     step2_root = output_dir / "step2_infilled"
     visual_root = output_dir / "visual_motion"
@@ -463,6 +714,7 @@ def export_motion_conditions(
         clean_visual_motion_dir(directory)
     manifest_rows = []
     metric_rows = []
+    interval_metric_rows = []
     for clip_index, name in enumerate(names):
         dense = dense_by_name[name]
         anchor_tokens = {
@@ -602,6 +854,73 @@ def export_motion_conditions(
                             rollout_by_condition[condition][name],
                         )
                     )
+                    result = rollout_by_condition[condition][name]
+                    token_to_motion = (
+                        len(decoded_codec["body"]) / max(1, len(dense))
+                    )
+                    for left, right in zip(
+                        result.anchor_times[:-1],
+                        result.anchor_times[1:],
+                    ):
+                        gap = int(right - left - 1)
+                        if gap <= 0:
+                            continue
+                        token_slice = slice(int(left) + 1, int(right))
+                        token_correct = (
+                            token_values[condition][token_slice]
+                            == dense[token_slice]
+                        )
+                        motion_start = int(
+                            round((int(left) + 1) * token_to_motion)
+                        )
+                        motion_end = int(
+                            round(int(right) * token_to_motion)
+                        )
+                        motion_start = min(target_len, motion_start)
+                        motion_end = min(target_len, motion_end)
+                        if motion_end <= motion_start:
+                            continue
+                        specification = supplied_gap_bin(gap)
+                        interval_row = {
+                            "name": name,
+                            "condition": condition,
+                            "left_idx": int(left),
+                            "right_idx": int(right),
+                            "gap": gap,
+                            "gap_bin_order": specification.order,
+                            "gap_bin": specification.label,
+                            "main_gap_bin": specification.main_bin,
+                            "motion_frames": motion_end - motion_start,
+                            "missing_token_count": int(
+                                token_correct.size
+                            ),
+                            "missing_token_correct": int(
+                                token_correct.sum()
+                            ),
+                            "missing_q0_count": int(
+                                token_correct[:, [0, 4, 8, 12]].size
+                            ),
+                            "missing_q0_correct": int(
+                                token_correct[
+                                    :, [0, 4, 8, 12]
+                                ].sum()
+                            ),
+                            **decoded_feature_metrics(
+                                decoded_codec["body"][
+                                    motion_start:motion_end
+                                ],
+                                motion["body"][motion_start:motion_end],
+                                prefix="codec_relative",
+                            ),
+                            **decoded_feature_metrics(
+                                raw_gt["body"][
+                                    motion_start:motion_end
+                                ],
+                                motion["body"][motion_start:motion_end],
+                                prefix="raw_gt",
+                            ),
+                        }
+                        interval_metric_rows.append(interval_row)
                 metric_rows.append(row)
         manifest_rows.append(
             {
@@ -615,7 +934,11 @@ def export_motion_conditions(
         )
         if (clip_index + 1) % 25 == 0:
             print(f"decoded/exported {clip_index + 1}/{len(names)} clips", flush=True)
-    return pd.DataFrame(manifest_rows), pd.DataFrame(metric_rows)
+    return (
+        pd.DataFrame(manifest_rows),
+        pd.DataFrame(metric_rows),
+        pd.DataFrame(interval_metric_rows),
+    )
 
 
 def compute_protocol_fid(
@@ -771,14 +1094,30 @@ def main() -> None:
                 predictions=predictions,
                 prediction_index=prediction_index,
             )
-        step2_metrics = pd.DataFrame(step2_metric_rows)
+        step2_metrics = annotate_gap_bins(
+            pd.DataFrame(step2_metric_rows)
+        )
         step2_summary = summarize_step2_c2f_metrics(step2_metrics)
+        step2_gap_bin_summary = summarize_step2_c2f_by_gap_bin(
+            step2_metrics
+        )
+        endpoint_gap_bin_penalty = endpoint_penalty_by_gap_bin(
+            step2_gap_bin_summary
+        )
         step2_metrics.to_csv(
             output_dir / "step2_c2f_metrics_per_interval.csv",
             index=False,
         )
         step2_summary.to_csv(
             output_dir / "step2_c2f_summary.csv",
+            index=False,
+        )
+        step2_gap_bin_summary.to_csv(
+            output_dir / "step2_c2f_summary_by_gap_bin.csv",
+            index=False,
+        )
+        endpoint_gap_bin_penalty.to_csv(
+            output_dir / "step2_endpoint_penalty_by_gap_bin.csv",
             index=False,
         )
         del model
@@ -794,7 +1133,11 @@ def main() -> None:
             for part in PART_ORDER
         }
         codecs = load_part_codecs(codec_paths, device, part_order=PART_ORDER)
-        manifest, decoded_metrics = export_motion_conditions(
+        (
+            manifest,
+            decoded_metrics,
+            decoded_interval_metrics,
+        ) = export_motion_conditions(
             names=names,
             conditions=conditions,
             dense_by_name=dense_by_name,
@@ -810,6 +1153,10 @@ def main() -> None:
         decoded_metrics.to_csv(
             output_dir / "decoded_metrics_per_clip.csv", index=False
         )
+        decoded_interval_metrics.to_csv(
+            output_dir / "decoded_metrics_per_interval.csv",
+            index=False,
+        )
         decoded_summary = (
             decoded_metrics.groupby(["protocol", "condition"], as_index=False)
             .mean(numeric_only=True)
@@ -817,6 +1164,13 @@ def main() -> None:
         )
         decoded_summary.to_csv(
             output_dir / "decoded_metrics_summary.csv", index=False
+        )
+        decoded_gap_bin_summary = summarize_decoded_intervals_by_gap_bin(
+            decoded_interval_metrics
+        )
+        decoded_gap_bin_summary.to_csv(
+            output_dir / "decoded_metrics_summary_by_gap_bin.csv",
+            index=False,
         )
         contract = {
             "schema": "sentiavatar.step1_adaptive_motion_eval.v1",
@@ -851,6 +1205,14 @@ def main() -> None:
                     "hard q0-to-q3 prefixes."
                 ),
             },
+            "gap_bins": [
+                {
+                    "label": value.label,
+                    "range": [value.minimum, value.maximum],
+                    "main_gap_bin": value.main_bin,
+                }
+                for value in GAP_BINS
+            ],
         }
         contract_path.write_text(
             json.dumps(contract, indent=2), encoding="utf-8"
@@ -873,11 +1235,44 @@ def main() -> None:
             if step2_summary_path.is_file()
             else pd.DataFrame()
         )
+        step2_gap_bin_path = (
+            output_dir / "step2_c2f_summary_by_gap_bin.csv"
+        )
+        step2_gap_bin_summary = (
+            pd.read_csv(step2_gap_bin_path)
+            if step2_gap_bin_path.is_file()
+            else pd.DataFrame()
+        )
+        endpoint_gap_bin_path = (
+            output_dir / "step2_endpoint_penalty_by_gap_bin.csv"
+        )
+        endpoint_gap_bin_penalty = (
+            pd.read_csv(endpoint_gap_bin_path)
+            if endpoint_gap_bin_path.is_file()
+            else pd.DataFrame()
+        )
+        decoded_gap_bin_path = (
+            output_dir / "decoded_metrics_summary_by_gap_bin.csv"
+        )
+        decoded_gap_bin_summary = (
+            pd.read_csv(decoded_gap_bin_path)
+            if decoded_gap_bin_path.is_file()
+            else pd.DataFrame()
+        )
 
     if args.export_only:
         if not step2_summary.empty:
             print("\nFrozen Step 2 C2F likelihood")
             print(step2_summary.to_string(index=False))
+        if not step2_gap_bin_summary.empty:
+            print("\nFrozen Step 2 C2F likelihood by gap bin")
+            print(step2_gap_bin_summary.to_string(index=False))
+        if not endpoint_gap_bin_penalty.empty:
+            print("\nGenerated-endpoint penalty by gap bin")
+            print(endpoint_gap_bin_penalty.to_string(index=False))
+        if not decoded_gap_bin_summary.empty:
+            print("\nDecoded missing-region quality by gap bin")
+            print(decoded_gap_bin_summary.to_string(index=False))
         print(f"Motion export complete: {output_dir}")
         return
     for stat_name in ("mean.pt", "std.pt"):
@@ -912,6 +1307,15 @@ def main() -> None:
         "step2_c2f": json.loads(
             step2_summary.to_json(orient="records")
         ),
+        "step2_c2f_by_gap_bin": json.loads(
+            step2_gap_bin_summary.to_json(orient="records")
+        ),
+        "endpoint_penalty_by_gap_bin": json.loads(
+            endpoint_gap_bin_penalty.to_json(orient="records")
+        ),
+        "decoded_by_gap_bin": json.loads(
+            decoded_gap_bin_summary.to_json(orient="records")
+        ),
         "fid": json.loads(fid.to_json(orient="records")),
     }
     (output_dir / "adaptive_motion_report.json").write_text(
@@ -921,6 +1325,15 @@ def main() -> None:
     if not step2_summary.empty:
         print("\nFrozen Step 2 C2F likelihood")
         print(step2_summary.to_string(index=False))
+    if not step2_gap_bin_summary.empty:
+        print("\nFrozen Step 2 C2F likelihood by gap bin")
+        print(step2_gap_bin_summary.to_string(index=False))
+    if not endpoint_gap_bin_penalty.empty:
+        print("\nGenerated-endpoint penalty by gap bin")
+        print(endpoint_gap_bin_penalty.to_string(index=False))
+    if not decoded_gap_bin_summary.empty:
+        print("\nDecoded missing-region quality by gap bin")
+        print(decoded_gap_bin_summary.to_string(index=False))
     print("\nAdaptive motion FID")
     print(fid.to_string(index=False))
     print(f"\nWrote adaptive motion outputs: {output_dir}")
